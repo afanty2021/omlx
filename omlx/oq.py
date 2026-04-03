@@ -556,74 +556,6 @@ def _build_quant_plan(
         total_bits_f += delta
         current_bpw = next_bpw
 
-    # Dense model MLP asymmetry: gate/down → base+1, up → base-1
-    # Inspired by unsloth Dynamic 2.0: SiLU gate and residual down_proj need
-    # protection, while up_proj (linear multiplicand) tolerates lower bits.
-    # Budget-approximately-neutral: 2 tensors boosted, 1 reduced.
-    _VALID_BITS_SET = {2, 3, 4, 5, 6, 8}
-    if is_dense and base_bits >= 3:
-        reduce_bits = max(base_bits - 1, 2)
-        boost_bits = base_bits + 1
-        while boost_bits not in _VALID_BITS_SET and boost_bits < 8:
-            boost_bits += 1
-        can_asymmetry = (
-            reduce_bits in _VALID_BITS_SET
-            and reduce_bits < base_bits
-            and boost_bits in _VALID_BITS_SET
-            and boost_bits > base_bits
-        )
-        if can_asymmetry:
-            # Pass 1: reduce up_proj → free budget
-            for path, shape in named_shapes.items():
-                if path in boost_map:
-                    continue
-                if "up_proj" not in path or "gate" in path:
-                    continue
-                if _extract_layer_index(path) < 0:
-                    continue
-                pred = universal_quant_predicate(
-                    path, module, {**config, "_oq_boost_map": {}}, oq_level
-                )
-                if pred is False:
-                    continue
-                cand_gs = _gs_for_mode(reduce_bits, _OQ_DEFAULT_GROUP_SIZE)
-                cand_mode = _mode_for_bits(reduce_bits)
-                old_cost = _tensor_quantized_bytes(
-                    shape, base_bits, base_group_size, base_mode
-                )
-                new_cost = _tensor_quantized_bytes(shape, reduce_bits, cand_gs, cand_mode)
-                delta = 8 * (new_cost - old_cost)  # negative
-                boost_map[path] = {"bits": reduce_bits, "group_size": cand_gs, "mode": cand_mode}
-                total_bits_f += delta
-                current_bpw = total_bits_f / total_params
-
-            # Pass 2: boost gate/down_proj → use freed budget (with cap check)
-            for path, shape in named_shapes.items():
-                if path in boost_map:
-                    continue
-                if not any(p in path for p in ("gate_proj", "down_proj", "wo")):
-                    continue
-                if _extract_layer_index(path) < 0:
-                    continue
-                pred = universal_quant_predicate(
-                    path, module, {**config, "_oq_boost_map": {}}, oq_level
-                )
-                if pred is False:
-                    continue
-                cand_gs = _gs_for_mode(boost_bits, _OQ_DEFAULT_GROUP_SIZE)
-                cand_mode = _mode_for_bits(boost_bits)
-                old_cost = _tensor_quantized_bytes(
-                    shape, base_bits, base_group_size, base_mode
-                )
-                new_cost = _tensor_quantized_bytes(shape, boost_bits, cand_gs, cand_mode)
-                delta = 8 * (new_cost - old_cost)
-                next_bpw = (total_bits_f + delta) / total_params
-                if next_bpw > hard_cap_bpw:
-                    continue
-                boost_map[path] = {"bits": boost_bits, "group_size": cand_gs, "mode": cand_mode}
-                total_bits_f += delta
-                current_bpw = next_bpw
-
     # Sensitivity-based greedy boost: boost tensors from their current bits
     # (which may already be elevated by the protection floor) using remaining
     # budget up to hard_cap_bpw.
@@ -1414,7 +1346,7 @@ def quantize_oq_streaming(
     )
 
 
-_CLIP_NUM_SAMPLES = 128
+_CLIP_NUM_SAMPLES = 512
 _CLIP_SEQ_LENGTH = 512
 _CLIP_N_GRID = 20
 _CLIP_MAX_SHRINK = 0.5
@@ -1906,7 +1838,10 @@ def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
     n = X.shape[1]
     H = (X.T @ X).astype(mx.float32)
     diag_mean = mx.diag(H).mean()
-    H = H + damp * diag_mean * mx.eye(n)
+    # Absolute floor prevents singular matrix when activations are near-zero
+    # (e.g. down_proj input after SiLU gating kills entire dimensions)
+    damp_value = mx.maximum(damp * diag_mean, mx.array(1e-6))
+    H = H + damp_value * mx.eye(n)
     mx.eval(H)
     L = mx.linalg.cholesky(H, stream=mx.cpu)
     I = mx.eye(n)
@@ -1930,6 +1865,66 @@ def _gptq_compute_hessian(X: Any, damp: float = 0.01) -> tuple:
         mx.eval(Hinv)
 
     return H, Hinv
+
+
+def _compute_per_expert_hessians(
+    captured_value: Any, captured_indices: Any, num_experts: int,
+    damp: float = 0.01, min_tokens: int = 64,
+) -> list:
+    """Compute per-expert Hessian inverse from SwitchLinear captured data.
+
+    SwitchLinear's mx.gather_mm flattens inputs to (batch*seq*top_k, 1, dim)
+    with 1D indices (batch*seq*top_k,). Each entry is a single token-expert
+    pair. We group by expert ID to compute per-expert Hessians.
+
+    Args:
+        captured_value: SwitchLinear captured input, typically
+            (N, 1, hidden_dim) or (N, hidden_dim) from gather_mm.
+        captured_indices: Expert IDs, 1D (N,) or multi-dim with last=top_k.
+        num_experts: Total number of experts.
+        damp: Dampening factor for Cholesky.
+        min_tokens: Minimum tokens per expert; below this use identity (RTN).
+
+    Returns:
+        List of num_experts Hinv matrices, each (hidden_dim, hidden_dim).
+    """
+    import numpy as _np
+
+    x_np = _np.array(captured_value.astype(mx.float32).reshape(-1, captured_value.shape[-1]))
+    idx_np = _np.array(captured_indices.reshape(-1))
+    in_dim = x_np.shape[1]
+
+    hinvs = []
+    identity_count = 0
+    token_min, token_max = float("inf"), 0
+    for e in range(num_experts):
+        mask = idx_np == e
+        n_tokens = int(mask.sum())
+        token_min = min(token_min, n_tokens)
+        token_max = max(token_max, n_tokens)
+
+        if n_tokens < min_tokens:
+            hinvs.append(mx.eye(in_dim))
+            identity_count += 1
+            continue
+
+        expert_x = mx.array(x_np[mask])
+        expert_damp = damp if n_tokens >= in_dim else damp * (in_dim / max(n_tokens, 1))
+        try:
+            _, Hinv_e = _gptq_compute_hessian(expert_x, damp=expert_damp)
+            mx.eval(Hinv_e)
+            hinvs.append(Hinv_e)
+        except Exception:
+            hinvs.append(mx.eye(in_dim))
+            identity_count += 1
+        del expert_x
+
+    logger.debug(
+        f"  per-expert Hessian: {num_experts} experts, "
+        f"min={token_min} max={token_max} tokens, "
+        f"{identity_count} identity fallbacks"
+    )
+    return hinvs
 
 
 def _compute_group_params(group_slice: Any, bits: int, group_size: int):
@@ -2089,7 +2084,8 @@ def _gptq_quantize_experts_batched(
 
     Args:
         w_3d: Fused expert weights (num_experts, out_dim, in_dim) float32.
-        Hinv: Inverse Hessian (in_dim, in_dim) float32.
+        Hinv: Inverse Hessian — either shared (in_dim, in_dim) or
+              per-expert (num_experts, in_dim, in_dim) float32.
         bits: Target quantization bits.
         group_size: Quantization group size.
         mode: Quantization mode (only "affine" fully supported).
@@ -2101,6 +2097,11 @@ def _gptq_quantize_experts_batched(
     num_experts, out_dim, in_dim = w_3d.shape
     W = mx.array(w_3d)  # (E, O, I)
     n_bins = 2**bits - 1
+
+    # Normalize Hinv to 3D: (E, in_dim, in_dim)
+    # broadcast_to creates a lazy view — no memory copy for shared case
+    if Hinv.ndim == 2:
+        Hinv = mx.broadcast_to(Hinv[None], (num_experts, in_dim, in_dim))
 
     for g_start in range(0, in_dim, group_size):
         g_end = min(g_start + group_size, in_dim)
@@ -2126,7 +2127,7 @@ def _gptq_quantize_experts_batched(
             for i in range(c_start, c_end):
                 col = group_cols[i]  # (E, O)
                 k = g_start + i
-                d = mx.maximum(Hinv[k, k], mx.array(1e-6))
+                d = mx.maximum(Hinv[:, k, k], mx.array(1e-6))[:, None]  # (E, 1)
 
                 # Analytical qdq matching mx.quantize affine mode
                 col_3d = col[:, :, None]  # (E, O, 1) for broadcasting
@@ -2136,7 +2137,7 @@ def _gptq_quantize_experts_batched(
                 )
                 qc = (scales * q + biases).squeeze(-1)  # (E, O)
 
-                err = (col - qc) / d  # (E, O)
+                err = (col - qc) / d  # (E, O) / (E, 1) = (E, O)
                 chunk_errs.append(err)
                 err_list.append(err)
 
@@ -2144,8 +2145,8 @@ def _gptq_quantize_experts_batched(
                 remaining_in_chunk = c_end - i - 1
                 if remaining_in_chunk > 0:
                     remaining = mx.stack(group_cols[i + 1:c_end], axis=2)
-                    hinv_row = Hinv[k, g_start + i + 1:g_start + c_end]
-                    remaining = remaining - err[:, :, None] * hinv_row[None, None, :]
+                    hinv_row = Hinv[:, k, g_start + i + 1:g_start + c_end]  # (E, remaining)
+                    remaining = remaining - err[:, :, None] * hinv_row[:, None, :]
                     group_cols[i + 1:c_end] = [
                         remaining[:, :, j] for j in range(remaining_in_chunk)
                     ]
@@ -2157,9 +2158,9 @@ def _gptq_quantize_experts_batched(
             if remaining_in_group > 0 and chunk_errs:
                 E_chunk = mx.stack(chunk_errs, axis=2)  # (E, O, chunk)
                 H_cross = Hinv[
-                    g_start + c_start:g_start + c_end,
+                    :, g_start + c_start:g_start + c_end,
                     g_start + c_end:g_end,
-                ]  # (chunk, remaining)
+                ]  # (E, chunk, remaining)
                 remaining_stack = mx.stack(group_cols[c_end:], axis=2)
                 remaining_stack = remaining_stack - E_chunk @ H_cross
                 group_cols[c_end:] = [
@@ -2177,7 +2178,7 @@ def _gptq_quantize_experts_batched(
         # Cross-group compensation
         if g_end < in_dim:
             err_mat = mx.stack(err_list, axis=2)  # (E, O, g_size)
-            cross = err_mat @ Hinv[g_start:g_end, g_end:]  # (E, O, remaining)
+            cross = err_mat @ Hinv[:, g_start:g_end, g_end:]  # (E, O, remaining)
             W = mx.concatenate(
                 [W[:, :, :g_end], W[:, :, g_end:] - cross], axis=2,
             )
@@ -2244,6 +2245,7 @@ def _run_gptq(
         # (e.g. gate_proj and up_proj both fed by layernorm output) get
         # identical Hessians, so compute once and reuse.
         _hinv_cache: dict[int, Any] = {}
+        _gptq_modified: dict[int, tuple] = {}  # id(module) → (bits, gs, mode)
         boost_map = config.get("_oq_boost_map") or {}
 
         for path, module in tree_flatten(
@@ -2307,6 +2309,7 @@ def _run_gptq(
                 w_f32, Hinv, bits, gs, mode, block_size=32,
             )
             module.weight = w_opt.astype(w.dtype)
+            _gptq_modified[id(module)] = (bits, gs, mode)
             mx.eval(module.weight)
             del w_f32, w_opt
             layer_opt += 1
@@ -2346,12 +2349,15 @@ def _run_gptq(
             if not expert_targets:
                 continue
 
-            # Get MLP input for Hessian
+            # Get MLP input and routing indices for Hessian
             mlp_input = None
+            expert_indices = None
             for path_key in captured:
                 if "gate" in path_key or "up" in path_key or "down" in path_key:
-                    mlp_input = captured[path_key].value
-                    break
+                    if mlp_input is None:
+                        mlp_input = captured[path_key].value
+                    if expert_indices is None and captured[path_key].indices is not None:
+                        expert_indices = captured[path_key].indices
             if mlp_input is None:
                 norm = getattr(block, "post_attention_layernorm", None)
                 if norm is not None:
@@ -2359,10 +2365,46 @@ def _run_gptq(
             if mlp_input is None:
                 continue
 
+            # Shared Hessian (always computed as fallback)
             mlp_flat = mlp_input.astype(mx.float32).reshape(-1, mlp_input.shape[-1])
             mx.eval(mlp_flat)
             _, Hinv_mlp = _gptq_compute_hessian(mlp_flat)
             del mlp_flat
+
+            # Per-expert Hessians from SwitchLinear captured data.
+            # SwitchLinear's gather_mm flattens inputs to (N, 1, dim) with
+            # 1D indices (N,) where N = batch*seq*top_k. We use these
+            # directly — value and indices are already aligned per token-expert pair.
+            hinv_per_expert = None
+            hinv_per_expert_down = None
+            num_exp_detect = max(
+                (t.weight.shape[0] for _, _, t in expert_targets
+                 if hasattr(t, "weight") and t.weight.ndim == 3),
+                default=0,
+            )
+            if num_exp_detect > 0:
+                # gate/up: use captured gate_proj or up_proj (same MLP input)
+                for pk in captured:
+                    if ("gate_proj" in pk or "up_proj" in pk) and captured[pk].indices is not None:
+                        hinv_per_expert = _compute_per_expert_hessians(
+                            captured[pk].value, captured[pk].indices, num_exp_detect,
+                        )
+                        logger.info(
+                            f"  L{layer_idx}: per-expert Hessian computed "
+                            f"({num_exp_detect} experts)"
+                        )
+                        break
+
+                # down_proj: use captured down_proj (post-activation input)
+                for pk in captured:
+                    if "down_proj" in pk and captured[pk].indices is not None:
+                        hinv_per_expert_down = _compute_per_expert_hessians(
+                            captured[pk].value, captured[pk].indices, num_exp_detect,
+                        )
+                        logger.info(
+                            f"  L{layer_idx}: per-expert down_proj Hessian computed"
+                        )
+                        break
 
             for target_type, proj_name, target_ref in expert_targets:
                 if target_type == "module":
@@ -2374,12 +2416,21 @@ def _run_gptq(
                 num_experts = w_3d.shape[0]
                 expert_in_dim = w_3d.shape[2]
 
-                # Hessian for this projection's input dim
+                # Select Hessian source per projection type
+                active_hinv_list = None
+                if proj_name in ("down_proj", "w2") and hinv_per_expert_down is not None:
+                    if len(hinv_per_expert_down) == num_experts:
+                        active_hinv_list = hinv_per_expert_down
+                elif hinv_per_expert is not None and expert_in_dim == mlp_input.shape[-1]:
+                    active_hinv_list = hinv_per_expert
+
+                # Shared fallback
                 if expert_in_dim != Hinv_mlp.shape[0]:
                     Hinv_exp = mx.eye(expert_in_dim)
                 else:
                     Hinv_exp = Hinv_mlp
 
+                _hinv_mode = "per-expert" if active_hinv_list else "shared"
                 _batch_info = (
                     f", batch={expert_batch_size}"
                     if expert_batch_size > 0 and num_experts > expert_batch_size
@@ -2387,13 +2438,11 @@ def _run_gptq(
                 )
                 logger.debug(
                     f"  L{layer_idx}: GPTQ {proj_name} ({num_experts} experts, "
-                    f"{w_3d.shape[1]}x{expert_in_dim}) @ {base_bits}bit{_batch_info}"
+                    f"{w_3d.shape[1]}x{expert_in_dim}) @ {base_bits}bit "
+                    f"[{_hinv_mode}]{_batch_info}"
                 )
 
-                # Sub-batched GPTQ: split large expert tensors to reduce
-                # peak memory (e.g. 256 experts → 8 batches of 32).
-                # Each sub-batch uses the same shared Hessian; results are
-                # identical to processing all experts at once.
+                # Sub-batched GPTQ with per-expert or shared Hessian
                 _t0 = _time.time()
                 _SUB_BATCH = expert_batch_size
                 if _SUB_BATCH > 0 and num_experts > _SUB_BATCH:
@@ -2401,25 +2450,41 @@ def _run_gptq(
                     for sb_start in range(0, num_experts, _SUB_BATCH):
                         sb_end = min(sb_start + _SUB_BATCH, num_experts)
                         sub_w = w_3d[sb_start:sb_end].astype(mx.float32)
+
+                        if active_hinv_list is not None:
+                            Hinv_sub = mx.stack(
+                                active_hinv_list[sb_start:sb_end], axis=0,
+                            )
+                        else:
+                            Hinv_sub = Hinv_exp
+
                         sub_opt = _gptq_quantize_experts_batched(
-                            sub_w, Hinv_exp,
+                            sub_w, Hinv_sub,
                             base_bits, base_gs, base_mode,
                         )
                         sub_results.append(sub_opt.astype(w_3d.dtype))
                         mx.eval(sub_results[-1])
                         del sub_w, sub_opt
+                        if isinstance(Hinv_sub, mx.array) and Hinv_sub.ndim == 3:
+                            del Hinv_sub
                         mx.synchronize()
                         mx.clear_cache()
                     new_3d = mx.concatenate(sub_results, axis=0)
                     mx.eval(new_3d)
                     del sub_results
                 else:
+                    if active_hinv_list is not None:
+                        Hinv_full = mx.stack(active_hinv_list, axis=0)
+                    else:
+                        Hinv_full = Hinv_exp
                     new_3d = _gptq_quantize_experts_batched(
-                        w_3d.astype(mx.float32), Hinv_exp,
+                        w_3d.astype(mx.float32), Hinv_full,
                         base_bits, base_gs, base_mode,
                     )
                     new_3d = new_3d.astype(w_3d.dtype)
                     mx.eval(new_3d)
+                    if isinstance(Hinv_full, mx.array) and Hinv_full.ndim == 3:
+                        del Hinv_full
                 _elapsed = _time.time() - _t0
 
                 # Measure MSE improvement (sample 4 experts)
@@ -2447,6 +2512,7 @@ def _run_gptq(
 
                 if target_type == "module":
                     target_ref.weight = new_3d
+                    _gptq_modified[id(target_ref)] = (base_bits, base_gs, base_mode)
                 else:
                     container, attr_name = target_ref
                     setattr(container, attr_name, new_3d)
@@ -2458,6 +2524,7 @@ def _run_gptq(
                 mx.clear_cache()
 
             del Hinv_mlp
+            del hinv_per_expert, hinv_per_expert_down
 
         if layer_opt > 0:
             optimized_count += layer_opt
@@ -2466,10 +2533,37 @@ def _run_gptq(
             )
 
         del captured
+
+        # QDQ only GPTQ-modified weights for inter-layer forward: simulate
+        # quantized inference to prevent activation drift that corrupts MoE
+        # routing in later layers. Non-modified modules (router, norms) keep
+        # their original precision to match inference behavior.
+        _saved_weights = {}
+        for path, module in tree_flatten(
+            block.leaf_modules(), is_leaf=nn.Module.is_module
+        ):
+            mid = id(module)
+            if mid not in _gptq_modified:
+                continue
+            bits_m, gs_m, mode_m = _gptq_modified[mid]
+            w = module.weight
+            if w.shape[-1] % gs_m != 0:
+                continue
+            _saved_weights[mid] = (module, w)
+            module.weight = _qdq_weight_only(w, bits_m, gs_m, mode_m).astype(w.dtype)
+
+        if _saved_weights:
+            mx.eval(*[m.weight for m, _ in _saved_weights.values()])
+
         out = _forward_layer(block, inputs, layer_mask, position_ids)
         if out is not None:
             inputs = out
         mx.eval(inputs)
+
+        for module, w_orig in _saved_weights.values():
+            module.weight = w_orig
+        del _saved_weights, _gptq_modified
+
         mx.synchronize()
         mx.clear_cache()
 

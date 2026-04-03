@@ -59,14 +59,16 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (7f7a04c)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@7f7a04ce20337996da335ab17cdfee0ba51d6610",
+    # mlx-vlm from commit (9db27b5)
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@9db27b589663c82cc1aefcc3f21ac5751fafdad2",
     "Pillow>=9.0.0",
-    # Grammar-constrained decoding for structured output
-    "xgrammar>=0.1.32",
 ]
 
 [project.optional-dependencies]
+grammar = [
+    # Grammar-constrained decoding for structured output (requires torch ~2GB)
+    "xgrammar>=0.1.32",
+]
 mcp = [
     "mcp>=1.0.0",
 ]
@@ -118,6 +120,13 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+
+[tool.uv]
+# mlx-lm is pinned to a git commit; override transitive pins
+# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+override-dependencies = [
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+]
 
 [tool.black]
 line-length = 88

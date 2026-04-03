@@ -56,6 +56,7 @@ def _make_mock_pool(tts_engine=None, model_id: str = "qwen3-tts") -> MagicMock:
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
+    pool.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
     return pool
 
 
@@ -239,6 +240,174 @@ class TestTTSEndpointErrors:
             json={"input": "No model specified"},
         )
         assert response.status_code >= 400
+
+
+# ---------------------------------------------------------------------------
+# TestTTSModelAliasResolution
+# ---------------------------------------------------------------------------
+
+
+class TestTTSModelAliasResolution:
+    """Verify that audio endpoints resolve model aliases (#489)."""
+
+    def test_speech_resolves_alias(self):
+        """POST /v1/audio/speech with alias resolves to real model ID."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-TTS-12Hz-1.7B-Base-bf16")
+        # Configure alias resolution on the pool
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        )
+
+        mock_settings_manager = MagicMock()
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = mock_settings_manager
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/speech",
+                    json={"model": "qwen3-tts", "input": "Hello"},
+                )
+                assert response.status_code == 200
+                # Verify pool.get_engine was called with the resolved ID
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+                )
+
+    def test_speech_direct_model_id(self):
+        """POST /v1/audio/speech with direct model ID works without alias."""
+        from omlx.server import app
+
+        _ensure_audio_routes(app)
+
+        mock_pool = _make_mock_pool(model_id="Qwen3-TTS-12Hz-1.7B-Base-bf16")
+        mock_pool.resolve_model_id = MagicMock(
+            return_value="Qwen3-TTS-12Hz-1.7B-Base-bf16"
+        )
+
+        with patch("omlx.server._server_state") as mock_state:
+            mock_state.engine_pool = mock_pool
+            mock_state.global_settings = None
+            mock_state.process_memory_enforcer = None
+            mock_state.hf_downloader = None
+            mock_state.ms_downloader = None
+            mock_state.mcp_manager = None
+            mock_state.api_key = None
+            mock_state.settings_manager = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/v1/audio/speech",
+                    json={
+                        "model": "Qwen3-TTS-12Hz-1.7B-Base-bf16",
+                        "input": "Hello",
+                    },
+                )
+                assert response.status_code == 200
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
+                )
+
+
+# ---------------------------------------------------------------------------
+# TestTTSVoiceRouting — unit tests for voice/instruct parameter dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestTTSVoiceRouting:
+    """Verify that the voice value is routed to the correct generate() kwarg."""
+
+    @pytest.fixture
+    def _run_synthesize(self):
+        """Helper: run TTSEngine.synthesize and return the kwargs passed to generate()."""
+        import asyncio
+        from omlx.engine.tts import TTSEngine
+
+        def _run(generate_sig_params, voice_value=None, instructions_value=None):
+            engine = TTSEngine("test-model")
+
+            # Build a mock model whose generate() has the requested signature
+            mock_model = MagicMock()
+            import inspect
+            sig_params = {
+                "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            }
+            for p in generate_sig_params:
+                sig_params[p] = inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+            mock_model.generate = MagicMock()
+            mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
+            mock_model.generate.return_value = []  # no audio chunks
+
+            engine._model = mock_model
+
+            try:
+                asyncio.run(engine.synthesize(
+                    "Hello", voice=voice_value, instructions=instructions_value,
+                ))
+            except RuntimeError:
+                pass  # "no audio output" is expected with empty generate
+
+            return mock_model.generate.call_args
+
+        return _run
+
+    def test_customvoice_routes_to_voice(self, _run_synthesize):
+        """Model with both params: voice goes to voice only, not instruct."""
+        call = _run_synthesize(["voice", "instruct"], voice_value="Vivian")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "Vivian"
+        assert "instruct" not in kwargs
+
+    def test_voicedesign_routes_to_instruct(self, _run_synthesize):
+        """Model with only 'instruct' param: value goes to instruct."""
+        call = _run_synthesize(["instruct"], voice_value="female, calm, slow")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("instruct") == "female, calm, slow"
+        assert "voice" not in kwargs
+
+    def test_voice_only_model(self, _run_synthesize):
+        """Model with only 'voice' param (e.g. Kokoro): value goes to voice."""
+        call = _run_synthesize(["voice"], voice_value="af_heart")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "af_heart"
+
+    def test_voice_none_skips_routing(self, _run_synthesize):
+        """voice=None should not add voice or instruct kwargs."""
+        call = _run_synthesize(["voice", "instruct"], voice_value=None)
+        kwargs = call.kwargs if call else {}
+        assert "voice" not in kwargs
+        assert "instruct" not in kwargs
+
+    def test_instructions_routes_to_instruct(self, _run_synthesize):
+        """instructions value should be routed to the instruct kwarg."""
+        call = _run_synthesize(
+            ["voice", "instruct"],
+            instructions_value="female, calm, slow",
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("instruct") == "female, calm, slow"
+        assert "voice" not in kwargs
+
+    def test_voice_and_instructions_both_passed(self, _run_synthesize):
+        """CustomVoice: voice→voice kwarg, instructions→instruct kwarg."""
+        call = _run_synthesize(
+            ["voice", "instruct"],
+            voice_value="Vivian",
+            instructions_value="female, calm, slow",
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("voice") == "Vivian"
+        assert kwargs.get("instruct") == "female, calm, slow"
 
 
 # ---------------------------------------------------------------------------

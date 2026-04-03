@@ -15,28 +15,27 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import sys
 
 
 def _has_cli_overrides(args) -> bool:
-    """Check if CLI args contain non-default values that should be saved."""
-    # model_dir: default=None (don't save None)
+    """Check if CLI args contain non-default values that should be saved.
+
+    All argparse defaults are None, so `is not None` means the user
+    explicitly passed the flag on the command line.
+    """
     if hasattr(args, "model_dir") and args.model_dir is not None:
         return True
-    # port: default=8000
-    if hasattr(args, "port") and args.port != 8000:
+    if hasattr(args, "port") and args.port is not None:
         return True
-    # max_model_memory: default="auto"
-    if hasattr(args, "max_model_memory") and args.max_model_memory != "auto":
+    if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
         return True
-    # max_process_memory: default=None (don't save None)
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
-    # host: default="127.0.0.1"
-    if hasattr(args, "host") and args.host != "127.0.0.1":
+    if hasattr(args, "host") and args.host is not None:
         return True
-    # log_level: default="info"
-    if hasattr(args, "log_level") and args.log_level != "info":
+    if hasattr(args, "log_level") and args.log_level is not None:
         return True
     return False
 
@@ -122,6 +121,13 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+
+    # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
+    # On Metal/MLX crashes (#511, #520), this dumps all Python thread
+    # tracebacks to the server log before the process terminates.
+    crash_log_path = log_dir / "crash.log"
+    _crash_file = open(crash_log_path, "a")
+    faulthandler.enable(file=_crash_file, all_threads=True)
 
     # Validate settings
     errors = settings.validate()
@@ -332,6 +338,7 @@ def launch_command(args):
     # Fetch model limits from server
     context_window = None
     max_tokens = None
+    model_type = None
     try:
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
@@ -339,6 +346,7 @@ def launch_command(args):
                 if m["id"] == model:
                     context_window = m.get("max_context_window")
                     max_tokens = m.get("max_tokens")
+                    model_type = m.get("model_type")
                     break
     except Exception:
         pass
@@ -354,6 +362,7 @@ def launch_command(args):
         tools_profile=tools_profile,
         context_window=context_window,
         max_tokens=max_tokens,
+        model_type=model_type,
     )
 
 

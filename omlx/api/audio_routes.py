@@ -25,6 +25,12 @@ router = APIRouter()
 # Maximum upload size for audio files (100 MB).
 MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
 
+# Video container extensions that should be routed through ffmpeg decoding.
+# mlx-audio only recognises audio-specific extensions (m4a, aac, ogg, opus),
+# so we remap video containers to .m4a before handing off. ffmpeg detects the
+# actual format from file content, not the extension.
+_VIDEO_CONTAINERS = {".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi"}
+
 
 # ---------------------------------------------------------------------------
 # Engine pool accessor — patched in tests via omlx.api.audio_routes._get_engine_pool
@@ -44,6 +50,17 @@ def _get_engine_pool():
     if pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
     return pool
+
+
+def _resolve_model(model_id: str) -> str:
+    """Resolve a model alias to its real model ID.
+
+    Delegates to the same resolve_model_id used by LLM/chat endpoints,
+    ensuring audio endpoints handle aliases consistently.
+    """
+    from omlx.server import resolve_model_id
+
+    return resolve_model_id(model_id) or model_id
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -89,6 +106,7 @@ async def create_transcription(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
+    model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
@@ -108,8 +126,12 @@ async def create_transcription(
             detail=f"Model '{model}' is not a speech-to-text model",
         )
 
-    # Save uploaded file to a temp path so the engine can open it by path
+    # Save uploaded file to a temp path so the engine can open it by path.
+    # Remap video container extensions to .m4a so mlx-audio routes them
+    # through ffmpeg instead of miniaudio (which can't decode containers).
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    if suffix.lower() in _VIDEO_CONTAINERS:
+        suffix = ".m4a"
     tmp_path = None
     try:
         content = await _read_upload(file)
@@ -151,15 +173,16 @@ async def create_speech(request: AudioSpeechRequest):
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
 
     pool = _get_engine_pool()
+    resolved_model = _resolve_model(request.model)
 
     # Load the engine via pool
     try:
-        engine = await pool.get_engine(request.model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{request.model}' not found. Available: {avail}",
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -167,7 +190,7 @@ async def create_speech(request: AudioSpeechRequest):
     if not isinstance(engine, TTSEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{request.model}' is not a text-to-speech model",
+            detail=f"Model '{resolved_model}' is not a text-to-speech model",
         )
 
     try:
@@ -175,6 +198,7 @@ async def create_speech(request: AudioSpeechRequest):
             request.input,
             voice=request.voice,
             speed=request.speed,
+            instructions=request.instructions,
         )
     except HTTPException:
         raise
@@ -199,6 +223,7 @@ async def process_audio(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
+    model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
@@ -218,8 +243,12 @@ async def process_audio(
             detail=f"Model '{model}' is not a speech-to-speech / audio processing model",
         )
 
-    # Save uploaded file to a temp path so the engine can open it by path
+    # Save uploaded file to a temp path so the engine can open it by path.
+    # Remap video container extensions to .m4a so mlx-audio routes them
+    # through ffmpeg instead of miniaudio (which can't decode containers).
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    if suffix.lower() in _VIDEO_CONTAINERS:
+        suffix = ".m4a"
     tmp_path = None
     try:
         content = await _read_upload(file)

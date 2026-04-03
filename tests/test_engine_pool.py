@@ -411,6 +411,62 @@ class TestVLMFallback:
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a")
 
+    @pytest.mark.asyncio
+    async def test_force_lm_fallback_to_vlm_on_start_failure(
+        self, small_mock_model_dir
+    ):
+        """Test that force_lm failure for VLM model falls back to VLMBatchedEngine."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Force model-a to be VLM type
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        # BatchedEngine (force_lm) fails on start
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock(
+            side_effect=TypeError(
+                "ModelArgs.__init__() missing 1 required positional argument: "
+                "'tie_word_embeddings'"
+            )
+        )
+        mock_batched_engine.stop = AsyncMock()
+
+        # VLMBatchedEngine succeeds
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        ), patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ):
+            await pool._load_engine("model-a", force_lm=True)
+
+        # Should have fallen back to VLM
+        assert entry.model_type == "vlm"
+        assert entry.engine_type == "vlm"
+        assert entry.engine is mock_vlm_engine
+
+    @pytest.mark.asyncio
+    async def test_force_lm_no_fallback_for_non_vlm(self, small_mock_model_dir):
+        """Test that force_lm failure for non-VLM model still raises."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        assert entry.engine_type == "batched"  # LLM, not VLM
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
+        ), pytest.raises(Exception, match="Load failed"):
+            await pool._load_engine("model-a", force_lm=True)
+
 
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
@@ -656,6 +712,7 @@ class TestEnginePoolTTL:
         entry = pool._entries["model-a"]
         entry.engine = MagicMock(spec=[])
         entry.engine.stop = AsyncMock()
+        entry.engine.has_active_requests = MagicMock(return_value=False)
         entry.last_access = 100.0  # Old access time
         pool._current_model_memory = entry.estimated_size
         return pool
@@ -727,16 +784,9 @@ class TestEnginePoolTTL:
         """Test that TTL does not unload model with active requests."""
         pool = pool_with_loaded_model
 
-        # Mock a BatchedEngine with active requests
+        # Mock an engine that reports active requests
         mock_engine = MagicMock()
-        mock_engine_core = MagicMock()
-        mock_inner = MagicMock()
-        mock_inner._output_collectors = {"req1": MagicMock()}
-        mock_engine_core.engine = mock_inner
-        mock_engine._engine = mock_engine_core
-
-        from omlx.engine import BatchedEngine
-        mock_engine.__class__ = BatchedEngine
+        mock_engine.has_active_requests.return_value = True
 
         pool._entries["model-a"].engine = mock_engine
 
@@ -751,6 +801,118 @@ class TestEnginePoolTTL:
         assert expired == []
         # last_access should be refreshed
         assert pool._entries["model-a"].last_access == 200.0
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):
+        """Test that TTL does not unload VLM engine with active requests."""
+        pool = pool_with_loaded_model
+
+        mock_engine = MagicMock()
+        mock_engine.has_active_requests.return_value = True
+
+        pool._entries["model-a"].engine = mock_engine
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].last_access == 200.0
+
+    @pytest.mark.asyncio
+    async def test_ttl_skips_non_streaming_with_active_requests(
+        self, pool_with_loaded_model
+    ):
+        """Test that TTL does not unload non-streaming engine with active requests."""
+        pool = pool_with_loaded_model
+
+        mock_engine = MagicMock()
+        mock_engine.has_active_requests.return_value = True
+
+        pool._entries["model-a"].engine = mock_engine
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["model-a"].last_access == 200.0
+
+
+class TestHasActiveRequests:
+    """Tests for has_active_requests() on engine types."""
+
+    def test_base_non_streaming_engine_active_count(self):
+        """Test BaseNonStreamingEngine active request tracking."""
+        from omlx.engine.base import BaseNonStreamingEngine
+
+        class DummyEngine(BaseNonStreamingEngine):
+            @property
+            def model_name(self):
+                return "dummy"
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+            def get_stats(self):
+                return {}
+
+        engine = DummyEngine()
+        assert engine.has_active_requests() is False
+
+        with engine._active_lock:
+            engine._active_count += 1
+        assert engine.has_active_requests() is True
+
+        with engine._active_lock:
+            engine._active_count -= 1
+        assert engine.has_active_requests() is False
+
+    def test_batched_engine_has_active_requests(self):
+        """Test BatchedEngine.has_active_requests() via _output_collectors."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._engine = None
+        assert engine.has_active_requests() is False
+
+        # Simulate engine with active collectors
+        mock_engine_core = MagicMock()
+        mock_inner = MagicMock()
+        mock_inner._output_collectors = {"req1": MagicMock()}
+        mock_engine_core.engine = mock_inner
+        engine._engine = mock_engine_core
+        assert engine.has_active_requests() is True
+
+        # Empty collectors
+        mock_inner._output_collectors = {}
+        assert engine.has_active_requests() is False
+
+    def test_vlm_engine_has_active_requests(self):
+        """Test VLMBatchedEngine.has_active_requests() via _output_collectors."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._engine = None
+        assert engine.has_active_requests() is False
+
+        mock_engine_core = MagicMock()
+        mock_inner = MagicMock()
+        mock_inner._output_collectors = {"req1": MagicMock()}
+        mock_engine_core.engine = mock_inner
+        engine._engine = mock_engine_core
+        assert engine.has_active_requests() is True
 
 
 class TestResolveModelId:

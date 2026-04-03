@@ -43,6 +43,7 @@ class TTSEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             **kwargs: Additional model-specific parameters
         """
+        super().__init__()
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
@@ -116,6 +117,7 @@ class TTSEngine(BaseNonStreamingEngine):
         text: str,
         voice: Optional[str] = None,
         speed: float = 1.0,
+        instructions: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -125,6 +127,7 @@ class TTSEngine(BaseNonStreamingEngine):
             text: Input text to synthesize
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
+            instructions: Optional voice description for instruct-capable models
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -150,15 +153,19 @@ class TTSEngine(BaseNonStreamingEngine):
                 "text": text,
                 "verbose": False,
             }
+            import inspect
+            gen_params = inspect.signature(model.generate).parameters
             if voice is not None:
-                # VoiceDesign models expect voice description in 'instruct',
-                # not 'voice'. Detect by checking if generate() accepts 'instruct'.
-                import inspect
-                gen_params = inspect.signature(model.generate).parameters
-                if "instruct" in gen_params and voice != "default":
-                    gen_kwargs["instruct"] = voice
-                else:
+                # Route voice to the correct generate() kwarg.
+                # Models with 'voice' param (CustomVoice, Kokoro) get it as
+                # a speaker name. Models with only 'instruct' (non-Qwen TTS)
+                # get it as a voice description fallback.
+                if "voice" in gen_params:
                     gen_kwargs["voice"] = voice
+                elif "instruct" in gen_params:
+                    gen_kwargs["instruct"] = voice
+            if instructions is not None and "instruct" in gen_params:
+                gen_kwargs["instruct"] = instructions
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             gen_kwargs.update(kwargs)
@@ -178,17 +185,23 @@ class TTSEngine(BaseNonStreamingEngine):
             audio = np.concatenate(audio_chunks, axis=0)
             return _audio_to_wav_bytes(audio, int(sample_rate))
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), _synthesize_sync
-        )
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _synthesize_sync
+            )
 
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-            self._model_name, elapsed, len(result),
-        )
-        return result
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "TTS synthesize done: model=%s, %.2fs, %d bytes output",
+                self._model_name, elapsed, len(result),
+            )
+            return result
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
