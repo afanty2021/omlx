@@ -118,6 +118,31 @@ def is_qwen3_model(model_name: str) -> bool:
     return "qwen3" in model_lower or "Qwen3" in model_name
 
 
+def is_mistral_model(model_name: str) -> bool:
+    """
+    Check if the model is a Mistral model that needs fix_mistral_regex.
+
+    Mistral-Small and some other Mistral models have a known tokenizer
+    regex issue that requires the fix_mistral_regex=True flag.
+
+    Also includes Qwen3.5-Claude models which use Mistral-based tokenizers.
+
+    Args:
+        model_name: The model name or path.
+
+    Returns:
+        True if the model needs the mistral regex fix.
+    """
+    model_lower = model_name.lower()
+    # Check for Mistral-Small variants and other affected Mistral models
+    # Also includes Qwen3.5-Claude models which use Mistral tokenizers
+    return (
+        "mistral-small" in model_lower or
+        "mistral" in model_lower or
+        "qwen3.5" in model_lower and "claude" in model_lower
+    )
+
+
 def get_tokenizer_config(
     model_name: str,
     trust_remote_code: bool = False,
