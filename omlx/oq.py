@@ -97,6 +97,7 @@ def universal_quant_predicate(
         or tc.get("num_local_experts")
         or config.get("num_experts")
         or tc.get("num_experts", 0)
+        or 0
     )
     hidden_size = config.get("hidden_size") or tc.get("hidden_size", 0)
     is_moe = num_experts > 0
@@ -198,10 +199,7 @@ def universal_quant_predicate(
             return bits(5)
 
     if "shared_expert" in path and not path.endswith("shared_expert_gate"):
-        if "gate_proj" in path or "up_proj" in path:
-            return bits(6)
-        if "down_proj" in path:
-            return bits(5)
+        return bits(8)
 
     if num_experts >= 512 and hidden_size >= 4096:
         if "gate_proj" in path and "shared_expert" not in path:
@@ -937,7 +935,7 @@ def _build_model_sanitizer(config: dict):
 
             def _vlm_sanitize(weights):
                 class _Proxy:
-                    pass
+                    audio_tower = None
                 proxy = _Proxy()
                 proxy.config = model_config
                 w = model_module.Model.sanitize(proxy, weights)

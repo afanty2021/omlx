@@ -125,7 +125,7 @@ class TestUniversalQuantPredicate:
             "model.layers.0.mlp.shared_expert.gate_proj", module, moe_config
         )
         assert isinstance(result, dict)
-        assert result["bits"] == 6
+        assert result["bits"] == 8
 
     def test_512_expert_gate_proj_floor(self, large_moe_config, module):
         result = universal_quant_predicate(
@@ -266,6 +266,18 @@ class TestUniversalQuantPredicate:
             "model.layers.10.mlp.experts.0.down_proj", module, vlm_config
         )
         assert result is True  # routed expert → base bits
+
+    def test_null_num_experts_dense_model(self, module):
+        """Gemma 4 dense models have explicit num_experts: null in config."""
+        config = {
+            "num_hidden_layers": 60,
+            "hidden_size": 6144,
+            "text_config": {"num_experts": None},
+        }
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.q_proj", module, config
+        )
+        assert result is True  # should not crash on None > 0
 
 
 # =============================================================================

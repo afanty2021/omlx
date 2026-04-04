@@ -29,8 +29,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.1",
-    # mlx-lm from latest commit (564281f)
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    # mlx-lm from latest commit (4469ad4)
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # transformers version aligned with mlx-lm requirement
@@ -59,8 +59,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (43b9b20)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@43b9b2078b7027e7622f34a434b2d94aada7eaad",
+    # mlx-vlm from commit (90732bd) - optimized TurboQuant Metal kernels (0.85-1.90x baseline)
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@90732bdee6a361ae5003b180dc3c1b17b9d01a80",
     "Pillow>=9.0.0",
 ]
 
@@ -125,7 +125,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@564281f",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4469ad4",
 ]
 
 [tool.black]
