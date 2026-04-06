@@ -1064,7 +1064,7 @@ def init_server(
             logger.info("Generated and saved new auth secret key")
         from .admin.auth import init_auth
 
-        init_auth(global_settings.auth.secret_key)
+        init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
@@ -3125,6 +3125,12 @@ async def create_anthropic_message(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
         )
+
+    # Apply model-specific message extraction (e.g. Gemma 4 converts
+    # role=tool messages into tool_responses on assistant turns).
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
 
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
