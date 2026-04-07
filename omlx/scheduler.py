@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
-    GenerationBatch,
+    # GenerationBatch,  # TODO: Not available in current mlx-lm 0.31.2
     SequenceStateMachine,
     generation_stream,
 )
@@ -114,34 +114,37 @@ class _PrefillAbortedError(Exception):
 # (constrain NEXT token) but can't know which token was just sampled.
 # After _original_step returns, self._next_tokens holds the freshly sampled
 # tokens.  We eval them synchronously and accept in grammar processors.
+#
+# TEMPORARILY DISABLED: GenerationBatch not available in mlx-lm 0.31.2
+# TODO: Re-enable when mlx-lm adds GenerationBatch back or alternative is found
 # ---------------------------------------------------------------------------
-_original_generation_batch_step = GenerationBatch._step
-
-def _patched_generation_batch_step(self):
-    result = _original_generation_batch_step(self)
-
-    # self._next_tokens contains the just-sampled tokens (async eval pending).
-    # We need to accept them NOW so the next __call__ fills the correct bitmask.
-    if any(self.logits_processors):
-        from .api.grammar import GrammarConstraintProcessor
-
-        has_grammar = any(
-            isinstance(p, GrammarConstraintProcessor)
-            for procs in self.logits_processors
-            for p in procs
-        )
-        if has_grammar:
-            # Force eval of the sampled tokens so we can read them.
-            mx.eval(self._next_tokens)
-            sampled = self._next_tokens.tolist()
-            for e in range(len(self.uids)):
-                for proc in self.logits_processors[e]:
-                    if isinstance(proc, GrammarConstraintProcessor):
-                        proc.accept_token(sampled[e])
-
-    return result
-
-GenerationBatch._step = _patched_generation_batch_step
+# _original_generation_batch_step = GenerationBatch._step
+#
+# def _patched_generation_batch_step(self):
+#     result = _original_generation_batch_step(self)
+#
+#     # self._next_tokens contains the just-sampled tokens (async eval pending).
+#     # We need to accept them NOW so the next __call__ fills the correct bitmask.
+#     if any(self.logits_processors):
+#         from .api.grammar import GrammarConstraintProcessor
+#
+#         has_grammar = any(
+#             isinstance(p, GrammarConstraintProcessor)
+#             for procs in self.logits_processors
+#             for p in procs
+#         )
+#         if has_grammar:
+#             # Force eval of the sampled tokens so we can read them.
+#             mx.eval(self._next_tokens)
+#             sampled = self._next_tokens.tolist()
+#             for e in range(len(self.uids)):
+#                 for proc in self.logits_processors[e]:
+#                     if isinstance(proc, GrammarConstraintProcessor):
+#                         proc.accept_token(sampled[e])
+#
+#     return result
+#
+# GenerationBatch._step = _patched_generation_batch_step
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
