@@ -125,3 +125,11 @@ scripts/client.py
 scripts/quick_test.sh
 scripts/start_server.sh
 scripts/test_connection.sh
+
+# Graphify output directory
+graphify-out/
+
+# User-specific configuration files
+.graphify_python
+GITHUB_ISSUE_TEMPLATE.md
+hfd.sh
