@@ -209,8 +209,8 @@ def _build_audio_detection_sets():
     except Exception:
         logger.debug("mlx-audio not available — using static audio detection sets")
         # Static fallback so model discovery still works without mlx-audio
-        _stt = {"whisper", "qwen3_asr", "parakeet"}
-        _tts = {"qwen3_tts", "kokoro", "chatterbox", "vibevoice", "vibevoice_streaming"}
+        _stt = {"whisper", "qwen3_asr", "parakeet", "qwen2_audio"}
+        _tts = {"qwen3_tts", "kokoro", "chatterbox", "vibevoice", "vibevoice_streaming", "kugelaudio", "audiodit"}
         _sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
         return _stt, _tts, _sts
 
@@ -225,6 +225,7 @@ AUDIO_STT_ARCHITECTURES = {
     "WhisperForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "ParakeetForCTC",
+    "Qwen2AudioForConditionalGeneration",
 }
 
 AUDIO_TTS_ARCHITECTURES = {
@@ -233,6 +234,7 @@ AUDIO_TTS_ARCHITECTURES = {
     "ChatterboxForConditionalGeneration",
     "VibeVoiceForConditionalGeneration",
     "VibeVoiceStreamingForConditionalGenerationInference",
+    "KugelAudioForConditionalGeneration",
 }
 
 AUDIO_STS_ARCHITECTURES = {
@@ -387,8 +389,17 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     # Check for VLM: architectures field
+    # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
+    # architecture name but strip vision_config and vision weights.
+    # For model families known to have text-only variants, require vision_config.
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
+            if normalized_type in VLM_MODEL_TYPES and "vision_config" not in config:
+                logger.info(
+                    f"Architecture '{arch}' is a VLM architecture but no vision_config "
+                    "found — treating as LLM (text-only quant)"
+                )
+                break
             return "vlm"
 
     # Check for VLM: model_type field (only if vision capabilities are present)
