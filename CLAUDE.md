@@ -1,7 +1,7 @@
 # oMLX - Mac 优化的 LLM 推理引擎
 
-> 最后更新：2026-04-08
-> 当前版本：0.3.5.dev1
+> 最后更新：2026-04-10
+> 当前版本：0.3.5.dev2
 > 上游仓库：https://github.com/jundot/omlx
 
 ## 项目概述
@@ -265,29 +265,42 @@ python build.py --skip-venv
 python build.py --dmg-only
 ```
 
-## 最近上游变更（2026-04-08）
+## 最近上游变更（2026-04-10）
 
 ### 最新提交
 
-1. **0ed21a1** - fix: remove _oq_non_quantizable set from output config before json.dump (#647)
-2. **31de11f** - formula: bump to 0.3.5.dev1
-3. **ebafe05** - fix: sync mlx-lm override commit to match main dep and venvstacks
-4. **0103c2b** - bump version to 0.3.5.dev1
-5. **e5ea858** - fix: bundle spacy en_core_web_sm for Kokoro TTS in DMG build (#590)
-6. **d745c31** - feat: add seed parameter for reproducible generation (#640)
-7. **9905b8b** - fix: skip quantizing modules without to_quantized() in oQ streaming (#625)
-8. **dfd9c00** - fix: use activeTheme for navbar theme picker styling in auto mode
-9. **f41c8d7** - fix: add missing TTS/STT/STS deps to audio extra (#590)
-10. **4e63ae2** - Merge pull request #621 from Stv-X/auto-color-scheme
+1. **ce1e517** - fix: add enable_thinking param to code benchmark run() overrides
+2. **3ed1057** - bump version to 0.3.5.dev2
+3. **4e1ee97** - fix(vlm): simplify decode_model condition and lazy-wrap caches
+4. **7316ffa** - fix(vlm): use mlx-lm decode model for batch=1, 2x VLM generation speed (#688)
+5. **dc19bfa** - fix: use dry_run for accurate download progress and skip redundant pytorch files (#623)
+6. **01ed21c** - feat: add thinking mode toggle to intelligence benchmark
+7. **9cf33ce** - fix: detect text-only quants of VLM models as LLM (#622)
+8. **6fb2188** - fix: add keepalive to /v1/embeddings to prevent client timeouts (#641)
+9. **69c0590** - Merge pull request #676 from ethannortharc/feat/voice-clone-tts
+10. **5b0a0a8** - fix: handle TypeError from think_start_id for non-thinking models
+11. **9a0de65** - fix: add IME composition guard to remaining keydown.enter handlers
+12. **6200453** - fix: prevent Enter from sending message during CJK IME composition (#656)
+13. **3cb1347** - fix: clear Metal buffer cache after VLM vision encoding (#667)
+14. **2cdbfbf** - fix: handle exceptions in SSE keepalive wrapper to prevent incomplete chunked response (#677)
+15. **618d664** - bump mlx-audio to 5175326 (v0.4.3) and add new audio model types
+16. **7a4f30d** - fix: handle image_url content parts correctly in message extraction (#671)
+17. **ef224e8** - fix: log warning when tool call markers are stripped after parsing failure
+18. **92f8a5e** - fix: extract_harmony_messages crashes on plain dict messages (#683)
+19. **610796d** - fix: add keepalive for non-streaming requests to prevent client timeouts
+20. **24153a5** - fix: clear Metal buffer cache between non-streaming engine requests (#684)
 
 ### 重要变更
 
-- **版本更新**：升级到 0.3.5.dev1
-- **mlx-lm 同步**：同步 mlx-lm 覆盖提交以匹配主依赖和 venvstacks
-- **oQ 量化修复**：跳过没有 to_quantized() 的模块量化
-- **音频支持**：修复音频额外依赖（TTS/STT/STS）
-- **主题支持**：添加自动主题模式和系统外观同步
-- **可重现生成**：添加 seed 参数支持
+- **版本更新**：升级到 0.3.5.dev2
+- **VLM 性能提升**：batch=1 时使用 mlx-lm decode 模型，生成速度提升 2 倍 (#688)
+- **音频模型扩展**：新增语音克隆 TTS 功能，升级 mlx-audio 到 v0.4.3 (#676)
+- **思维模式**：智能基准测试添加思维模式切换功能
+- **IME 输入法支持**：修复 CJK 输入法组合时误发送消息问题 (#656)
+- **Metal 缓存优化**：在 VLM 视觉编码和非流式请求后清理 Metal 缓存 (#667, #684)
+- **超时修复**：为嵌入和非流式请求添加 keepalive 防止客户端超时 (#641, #610796d)
+- **SSE 稳定性**：改进 SSE keepalive 包装器的异常处理 (#677)
+- **模型检测**：纯文本量化的 VLM 模型现在被正确识别为 LLM (#622)
 
 ## 工作流程
 
