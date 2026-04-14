@@ -1,7 +1,7 @@
 # oMLX - Mac 优化的 LLM 推理引擎
 
-> 最后更新：2026-04-14
-> 当前版本：0.3.5.dev2
+> 最后更新：2026-04-15
+> 当前版本：v0.3.5-rc1
 > 上游仓库：https://github.com/jundot/omlx
 
 ## 项目概述
@@ -282,51 +282,49 @@ python build.py --skip-venv
 python build.py --dmg-only
 ```
 
-## 最近上游变更（2026-04-14）
+## 最近上游变更（2026-04-15）
 
 ### 最新提交
 
-1. **edb7244** - feat: add DFlash speculative decoding engine 🚀
-2. **ce1e517** - fix: add enable_thinking param to code benchmark run() overrides
-3. **3ed1057** - bump version to 0.3.5.dev2
-3. **4e1ee97** - fix(vlm): simplify decode_model condition and lazy-wrap caches
-4. **7316ffa** - fix(vlm): use mlx-lm decode model for batch=1, 2x VLM generation speed (#688)
-5. **dc19bfa** - fix: use dry_run for accurate download progress and skip redundant pytorch files (#623)
-6. **01ed21c** - feat: add thinking mode toggle to intelligence benchmark
-7. **9cf33ce** - fix: detect text-only quants of VLM models as LLM (#622)
-8. **6fb2188** - fix: add keepalive to /v1/embeddings to prevent client timeouts (#641)
-9. **69c0590** - Merge pull request #676 from ethannortharc/feat/voice-clone-tts
-10. **5b0a0a8** - fix: handle TypeError from think_start_id for non-thinking models
-11. **9a0de65** - fix: add IME composition guard to remaining keydown.enter handlers
-12. **6200453** - fix: prevent Enter from sending message during CJK IME composition (#656)
-13. **3cb1347** - fix: clear Metal buffer cache after VLM vision encoding (#667)
-14. **2cdbfbf** - fix: handle exceptions in SSE keepalive wrapper to prevent incomplete chunked response (#677)
-15. **618d664** - bump mlx-audio to 5175326 (v0.4.3) and add new audio model types
-16. **7a4f30d** - fix: handle image_url content parts correctly in message extraction (#671)
-17. **ef224e8** - fix: log warning when tool call markers are stripped after parsing failure
-18. **92f8a5e** - fix: extract_harmony_messages crashes on plain dict messages (#683)
-19. **610796d** - fix: add keepalive for non-streaming requests to prevent client timeouts
-20. **24153a5** - fix: clear Metal buffer cache between non-streaming engine requests (#684)
+1. **b125bfc** - formula: bump to v0.3.5-rc1
+2. **62c8f5f** - fix: remove false-positive RotatingKVCache stale offset warning
+3. **fd55ab3** - bump version to 0.3.5
+4. **95ea04a** - fix: address PR review — safer restore, consistent model detection
+5. **fec8dc0** - fix: rename colliding params for Gemma 4
+6. **6fa0a77** - fix: enrich Gemma 4 tool parameter descriptions
+7. **8baa0af** - docs: add DFlash-MLX integration guide
+8. **6b1029c** - fix(benchmark): skip batch test for DFlashEngine (#759)
+9. **aca2de1** - fix: remove VoiceDesign hasattr routing from TTS engine
+10. **b2b03b3** - test: add unit tests for cache probe endpoint (#720)
+11. **3b4feb9** - feat(admin): add cache probe endpoint for prompt prefix lookup (#720)
+12. **ccbf09e** - feat: allow skip API key verification on any host
+13. **a34615e** - fix: verify actual Metal memory release before updating pool tracking
+14. **5373256** - fix: add parse_json_output to responses API and streaming endpoints
+15. **f378c9b** - fix(packaging): skip pip-stripped interpreters in _find_target_python
+16. **4928761** - fix: cache inspect.signature for embedding input remapping
+17. **1b60a90** - fix: enable_thinking toggle precedence + add tests
+18. **e6f2626** - feat: add dedicated Enable Thinking toggle with auto-detection (#748)
+19. **a4d17be** - fix(app): add reopen and termination delegate methods (#725)
+20. **ed289d7** - bump mlx-vlm to 3472132, remove dead gemma4 patch, fix 14 stale tests
 
 ### 重要变更
 
-- **DFlash 推测解码引擎** 🚀：新增基于块扩散的推测解码引擎，实现 3-4 倍更快的贪婪解码
-  - 集成 dflash-mlx 作为实验性引擎选项
-  - 支持草稿模型配置和量化
-  - 管理面板添加实验功能切换和草稿模型选择器
-  - 自动回退到 BatchedEngine/VLMBatchedEngine 用于长上下文
-  - 温度采样支持
-  - 流式分词器用于正确的 CJK/UTF-8 处理
-  - 生成指标日志（tok/s、接受率、周期数）
-- **版本更新**：升级到 0.3.5.dev2
-- **VLM 性能提升**：batch=1 时使用 mlx-lm decode 模型，生成速度提升 2 倍 (#688)
-- **音频模型扩展**：新增语音克隆 TTS 功能，升级 mlx-audio 到 v0.4.3 (#676)
-- **思维模式**：智能基准测试添加思维模式切换功能
-- **IME 输入法支持**：修复 CJK 输入法组合时误发送消息问题 (#656)
-- **Metal 缓存优化**：在 VLM 视觉编码和非流式请求后清理 Metal 缓存 (#667, #684)
-- **超时修复**：为嵌入和非流式请求添加 keepalive 防止客户端超时 (#641, #610796d)
-- **SSE 稳定性**：改进 SSE keepalive 包装器的异常处理 (#677)
-- **模型检测**：纯文本量化的 VLM 模型现在被正确识别为 LLM (#622)
+- **版本更新**：升级到 v0.3.5-rc1（候选发布版本）
+- **RotatingKVCache 优化**：移除虚假的 stale offset 警告，改进 specprefill system_end 计算
+- **Gemma 4 支持**：修复参数冲突问题，丰富工具参数描述
+- **DFlash-MLX 集成指南**：新增完整的集成文档
+- **缓存探测端点**：管理面板新增提示前缀查找功能 (#720)
+- **思维模式切换**：新增专用 Enable Thinking 切换按钮，支持自动检测 (#748)
+- **API 密钥验证**：允许在任何主机上跳过 API 密钥验证
+- **Metal 内存管理**：验证实际的 Metal 内存释放后再更新池跟踪
+- **JSON 输出解析**：为响应 API 和流式端点添加 parse_json_output
+- **mlx-vlm 更新**：升级到 3472132 版本，修复 14 个过时测试
+- **应用委托方法**：添加重新打开和终止委托方法 (#725)
+- **TurboQuantKV 优化**：
+  - 添加 TurboQuantKVCache.merge monkey-patch 支持
+  - 改进 mRoPE 实现，使用 PromptProcessingBatch.prompt
+  - 修复 burst-completion bug (#557)
+  - 添加 _apply_turboquant_kv_empty 方法
 
 ## 工作流程
 
