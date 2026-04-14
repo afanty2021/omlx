@@ -37,6 +37,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
+    compute_per_image_hashes,
     extract_images_from_messages,
 )
 from ..utils.tokenizer import get_tokenizer_config
@@ -91,7 +92,6 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
 }
 
 _video_processor_patched = False
-_gemma4_batched_decode_patched = False
 
 
 def _patch_video_processor_bug():
@@ -119,257 +119,6 @@ def _patch_video_processor_bug():
         _video_processor_patched = True
     except (ImportError, AttributeError):
         pass
-
-
-def _patch_gemma4_batched_decode():
-    """Patch mlx-vlm's gemma4 model for correct batched decode.
-
-    mlx-vlm's gemma4 reads shared KVs via cache.state which breaks in
-    batched mode. This patch replaces it with mlx-lm's approach: explicit
-    shared_kv/offset passing through intermediates[].
-
-    Also patches ProportionalRoPE to handle per-element array offsets
-    needed for batched decode with different prompt lengths.
-    """
-    global _gemma4_batched_decode_patched
-    if _gemma4_batched_decode_patched:
-        return
-
-    try:
-        from mlx_vlm.models.gemma4.language import (
-            Attention,
-            DecoderLayer,
-            Gemma4TextModel,
-            LanguageModel,
-            scaled_dot_product_attention,
-        )
-        from mlx_vlm.models.gemma4.rope_utils import ProportionalRoPE
-
-        # ── 1. Patch ProportionalRoPE for per-element array offsets ──
-
-        _orig_rope = ProportionalRoPE.__call__
-
-        def _patched_rope(self, x, offset=0):
-            if isinstance(offset, mx.array) and offset.size > 1:
-                parts = []
-                for i in range(offset.size):
-                    parts.append(
-                        _orig_rope(self, x[i : i + 1], offset=int(offset[i].item()))
-                    )
-                return mx.concatenate(parts, axis=0)
-            return _orig_rope(self, x, offset=offset)
-
-        ProportionalRoPE.__call__ = _patched_rope
-
-        # ── 2. Patch Attention.__call__ to pass shared_kv/offset ──
-
-        def _patched_attn(self, x, mask=None, cache=None, shared_kv=None, offset=None):
-            B, L, _ = x.shape
-
-            queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
-            queries = self.q_norm(queries)
-
-            if shared_kv is not None:
-                keys, values = shared_kv
-            else:
-                if offset is None:
-                    offset = cache.offset if cache is not None else 0
-
-                keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
-                if self.use_k_eq_v:
-                    values = keys
-                else:
-                    values = self.v_proj(x).reshape(
-                        B, L, self.n_kv_heads, self.head_dim
-                    )
-
-                keys = self.k_norm(keys)
-                values = self.v_norm(values)
-                values = values.transpose(0, 2, 1, 3)
-
-                keys = keys.transpose(0, 2, 1, 3)
-                keys = self.rope(keys, offset=offset)
-
-                if cache is not None:
-                    keys, values = cache.update_and_fetch(keys, values)
-
-            queries = queries.transpose(0, 2, 1, 3)
-            queries = self.rope(queries, offset=offset)
-
-            if mask is not None and isinstance(mask, mx.array):
-                if mask.shape[-1] != keys.shape[-2]:
-                    mask = mask[..., -keys.shape[-2] :]
-
-            output = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, scale=self.scale, mask=mask
-            )
-            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return self.o_proj(output), (keys, values), offset
-
-        Attention.__call__ = _patched_attn
-
-        # ── 3. Patch DecoderLayer.__call__ to propagate shared_kv/offset ──
-
-        def _patched_layer(
-            self, x, mask=None, cache=None, per_layer_input=None,
-            shared_kv=None, offset=None,
-        ):
-            import mlx.nn as nn
-
-            residual = x
-            h = self.input_layernorm(x)
-            h, shared_kv, offset = self.self_attn(
-                h, mask, cache, shared_kv=shared_kv, offset=offset
-            )
-            h = self.post_attention_layernorm(h)
-            h = residual + h
-
-            residual = h
-            if self.enable_moe:
-                h1 = self.pre_feedforward_layernorm(h)
-                h1 = self.mlp(h1)
-                h1 = self.post_feedforward_layernorm_1(h1)
-                top_k_indices, top_k_weights = self.router(h)
-                h2 = self.pre_feedforward_layernorm_2(h)
-                h2 = self.experts(h2, top_k_indices, top_k_weights)
-                h2 = self.post_feedforward_layernorm_2(h2)
-                h = h1 + h2
-            else:
-                h = self.pre_feedforward_layernorm(h)
-                h = self.mlp(h)
-
-            h = self.post_feedforward_layernorm(h)
-            h = residual + h
-
-            if (
-                self.per_layer_input_gate is not None
-                and self.per_layer_projection is not None
-                and self.post_per_layer_input_norm is not None
-                and per_layer_input is not None
-            ):
-                residual = h
-                gate = self.per_layer_input_gate(h)
-                gate = nn.gelu_approx(gate)
-                gate = mx.multiply(gate, per_layer_input)
-                gate = self.per_layer_projection(gate)
-                gate = self.post_per_layer_input_norm(gate)
-                h = residual + gate
-
-            if self.layer_scalar is not None:
-                h = h * self.layer_scalar
-
-            return h, shared_kv, offset
-
-        DecoderLayer.__call__ = _patched_layer
-
-        # ── 4. Patch the model's layer loop for intermediates-based KV sharing ──
-
-        from mlx_vlm.models.gemma4.language import Gemma4TextModel
-
-        def _patched_model_call(
-            self, inputs=None, inputs_embeds=None, mask=None, cache=None,
-            per_layer_inputs=None, **kwargs,
-        ):
-            # Embed tokens (same as original Gemma4TextModel)
-            if inputs_embeds is None:
-                h = self.embed_tokens(inputs)
-                h = h * self.embed_scale
-            else:
-                h = inputs_embeds
-
-            # Per-layer input processing
-            if self.hidden_size_per_layer_input:
-                if inputs is not None and per_layer_inputs is None:
-                    per_layer_inputs = self.get_per_layer_inputs(inputs)
-                elif per_layer_inputs is not None:
-                    target_len = h.shape[1]
-                    if per_layer_inputs.shape[1] != target_len:
-                        cache_offset = next(
-                            (
-                                int(c.offset) if not isinstance(c.offset, mx.array)
-                                else int(c.offset.max().item())
-                                for c in (cache or [])
-                                if c is not None and hasattr(c, "offset")
-                            ),
-                            0,
-                        )
-                        max_start = max(per_layer_inputs.shape[1] - target_len, 0)
-                        start = min(cache_offset, max_start)
-                        per_layer_inputs = per_layer_inputs[:, start : start + target_len]
-                if per_layer_inputs is not None or inputs is not None:
-                    per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
-
-            # Build previous_kvs mapping if not cached
-            if not hasattr(self, "_previous_kvs"):
-                self._previous_kvs = list(range(len(self.layers)))
-                num_shared = getattr(
-                    self, "first_kv_shared_layer_idx", len(self.layers)
-                )
-                if num_shared < len(self.layers):
-                    kvs_by_type = {}
-                    for i in range(num_shared):
-                        kvs_by_type[self.layers[i].layer_type] = i
-                    for j in range(num_shared, len(self.layers)):
-                        lt = self.layers[j].layer_type
-                        if lt in kvs_by_type:
-                            self._previous_kvs[j] = kvs_by_type[lt]
-
-            if cache is None:
-                cache = [None] * getattr(
-                    self, "first_kv_shared_layer_idx", len(self.layers)
-                )
-
-            from mlx_lm.models.base import create_attention_mask
-
-            if mask is None:
-                full_idx = getattr(self, "first_full_cache_idx", 0)
-                slide_idx = getattr(self, "first_sliding_cache_idx", 0)
-                global_mask = create_attention_mask(
-                    h,
-                    cache[full_idx] if full_idx < len(cache) else None,
-                )
-                sliding_window_mask = create_attention_mask(
-                    h,
-                    cache[slide_idx] if slide_idx < len(cache) else None,
-                    window_size=getattr(self, "window_size", None),
-                )
-
-            intermediates = [(None, None)] * len(self.layers)
-            for i, layer in enumerate(self.layers):
-                c = cache[self.layer_idx_to_cache_idx[i]]
-                is_global = layer.layer_type == "full_attention"
-
-                local_mask = mask
-                if mask is None and is_global:
-                    local_mask = global_mask
-                elif mask is None:
-                    local_mask = sliding_window_mask
-
-                per_layer_input = None
-                if per_layer_inputs is not None:
-                    per_layer_input = per_layer_inputs[:, :, i, :]
-
-                kvs, offset = intermediates[self._previous_kvs[i]]
-
-                h, kvs, offset = layer(
-                    h,
-                    local_mask,
-                    c,
-                    per_layer_input=per_layer_input,
-                    shared_kv=kvs,
-                    offset=offset,
-                )
-
-                intermediates[i] = (kvs, offset)
-
-            return self.norm(h)
-
-        Gemma4TextModel.__call__ = _patched_model_call
-
-        _gemma4_batched_decode_patched = True
-        logger.debug("Applied Gemma 4 batched decode patch")
-    except (ImportError, AttributeError) as e:
-        logger.debug("Gemma 4 batched decode patch failed: %s", e)
 
 
 # Models that only support a single image per request
@@ -655,6 +404,9 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                    self._model_settings, "turboquant_skip_last", True
+                )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -686,7 +438,11 @@ class VLMBatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            self._engine.engine.close()
+            if hasattr(self._engine, 'engine') and self._engine.engine is not None:
+                try:
+                    self._engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
         if self._vision_cache is not None:
             self._vision_cache.close()
             self._vision_cache = None
@@ -787,7 +543,7 @@ class VLMBatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         num_images: int,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
         """Format VLM messages with image tokens on image-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
@@ -805,8 +561,9 @@ class VLMBatchedEngine(BaseEngine):
         remaining_images = num_images
         assigned_fallback_images = False
         formatted_messages: list[dict[str, Any]] = []
+        image_message_ranges: list[tuple[int, int]] = []
 
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 msg = {"role": "user", "content": str(msg)}
 
@@ -829,6 +586,9 @@ class VLMBatchedEngine(BaseEngine):
                     remaining_images = 0
                     assigned_fallback_images = True
 
+            if msg_num_images > 0:
+                image_message_ranges.append((idx, msg_num_images))
+
             formatted_messages.append(
                 get_message_json(
                     model_type,
@@ -841,7 +601,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
             )
 
-        return formatted_messages
+        return formatted_messages, image_message_ranges
 
     def _compute_vision_features(
         self, pixel_values: Any, extra_model_inputs: dict
@@ -906,13 +666,69 @@ class VLMBatchedEngine(BaseEngine):
         # Unsupported model: skip caching
         return None
 
+    def _split_vision_features(
+        self,
+        features: mx.array,
+        num_images: int,
+        extra_model_inputs: dict,
+    ) -> Optional[List[mx.array]]:
+        """Split batched vision features into per-image tensors for caching.
+
+        Returns a list of per-image feature tensors, or None if the model
+        architecture does not support splitting.
+        """
+        if num_images <= 1:
+            return [features]
+
+        model_type = self.model_type or ""
+
+        # Gemma4 / LLaVA: batch dimension = number of images
+        if features.ndim >= 3 and features.shape[0] == num_images:
+            return [features[i : i + 1] for i in range(num_images)]
+
+        # Qwen: flat (total_merged_tokens, dim) → split using grid_thw
+        if model_type in _QWEN_VISION_MODELS and features.ndim == 2:
+            grid_thw = extra_model_inputs.get("image_grid_thw")
+            if grid_thw is None:
+                return None
+            spatial_merge_size = getattr(
+                self._vlm_model.vision_tower, "spatial_merge_size", 2
+            )
+            merge_sq = spatial_merge_size ** 2
+            per_image_tokens = []
+            for i in range(num_images):
+                t, h, w = int(grid_thw[i, 0]), int(grid_thw[i, 1]), int(grid_thw[i, 2])
+                per_image_tokens.append((t * h * w) // merge_sq)
+            if sum(per_image_tokens) != features.shape[0]:
+                logger.debug(
+                    "Per-image token count mismatch: expected %d, got %d",
+                    sum(per_image_tokens),
+                    features.shape[0],
+                )
+                return None
+            result = []
+            offset = 0
+            for count in per_image_tokens:
+                result.append(features[offset : offset + count])
+                offset += count
+            return result
+
+        return None
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
         images: list[Any],
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
-    ) -> Tuple[List[int], Optional[mx.array], Optional[Dict[str, Any]], Optional[str]]:
+    ) -> Tuple[
+        List[int],
+        Optional[mx.array],
+        Optional[Dict[str, Any]],
+        Optional[str],
+        int,
+        List[Tuple[int, str]],
+    ]:
         """
         Run the full VLM preprocessing pipeline:
         1. Apply chat template with image placeholders
@@ -925,11 +741,21 @@ class VLMBatchedEngine(BaseEngine):
             images: List of PIL Image objects
 
         Returns:
-            Tuple of (token_ids, inputs_embeds, extra_kwargs, image_hash):
+            Tuple of (
+                token_ids,
+                inputs_embeds,
+                extra_kwargs,
+                image_hash,
+                image_cache_key_start,
+                image_cache_key_ranges,
+            ):
             - token_ids: List of token IDs for BatchGenerator
             - inputs_embeds: Merged vision+text embeddings (or None if text-only)
             - extra_kwargs: Model-specific kwargs for language model
             - image_hash: SHA256 hash of images for prefix cache
+            - image_cache_key_start: Token index where image-aware cache keying begins
+            - image_cache_key_ranges: Per-image-turn cache key boundaries with
+              cumulative image hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template
         from mlx_vlm.utils import prepare_inputs
@@ -948,7 +774,7 @@ class VLMBatchedEngine(BaseEngine):
         # Build per-message placeholders in oMLX so image-bearing turns always
         # receive image tokens, regardless of conversation history shape.
         try:
-            formatted_messages = self._format_messages_for_vlm_template(
+            formatted_messages, image_message_ranges = self._format_messages_for_vlm_template(
                 messages, num_images=num_images
             )
         except Exception as e:
@@ -964,6 +790,15 @@ class VLMBatchedEngine(BaseEngine):
                 num_images=num_images,
                 return_messages=True,
             )
+            image_message_ranges = []
+            for idx, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    continue
+                image_count = self._count_content_parts(
+                    msg.get("content"), {"image", "image_url", "input_image"}
+                )
+                if image_count > 0:
+                    image_message_ranges.append((idx, image_count))
 
         # Strip partial field from messages (VLM always uses add_generation_prompt=True)
         detect_and_strip_partial(formatted_messages)
@@ -1029,6 +864,65 @@ class VLMBatchedEngine(BaseEngine):
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
 
+        image_cache_key_start = 0
+        image_cache_key_ranges: list[Tuple[int, str]] = []
+        if image_message_ranges:
+            try:
+                prefix_template_kwargs = {
+                    "tokenize": False,
+                    "add_generation_prompt": False,
+                }
+                if self._enable_thinking is not None:
+                    prefix_template_kwargs["enable_thinking"] = self._enable_thinking
+                if tools:
+                    prefix_template_kwargs["tools"] = tools
+                if chat_template_kwargs:
+                    prefix_template_kwargs.update(chat_template_kwargs)
+
+                images_consumed = 0
+                for msg_idx, msg_num_images in image_message_ranges:
+                    prefix_messages = formatted_messages[:msg_idx]
+                    boundary_tokens = 0
+                    if prefix_messages:
+                        try:
+                            prefix_prompt = template_target.apply_chat_template(
+                                prefix_messages, **prefix_template_kwargs
+                            )
+                        except TypeError:
+                            local_kwargs = dict(prefix_template_kwargs)
+                            if chat_template_kwargs:
+                                for key in chat_template_kwargs:
+                                    local_kwargs.pop(key, None)
+                            local_kwargs.pop("enable_thinking", None)
+                            prefix_prompt = template_target.apply_chat_template(
+                                prefix_messages, **local_kwargs
+                            )
+                        prefix_inputs = prepare_inputs(
+                            self._processor,
+                            images=images[:images_consumed] if images_consumed > 0 else None,
+                            prompts=[prefix_prompt] if isinstance(prefix_prompt, str) else prefix_prompt,
+                        )
+                        prefix_ids = prefix_inputs["input_ids"]
+                        boundary_tokens = (
+                            len(prefix_ids[0].tolist())
+                            if prefix_ids.ndim > 1
+                            else len(prefix_ids.tolist())
+                        )
+
+                    images_consumed += msg_num_images
+                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
+
+                image_cache_key_start = image_cache_key_ranges[0][0]
+            except Exception:
+                logger.debug(
+                    "Failed to compute segmented VLM cache boundaries, "
+                    "falling back to whole-request keying",
+                    exc_info=True,
+                )
+                image_cache_key_start = 0
+                image_cache_key_ranges = []
+
         # Extract additional model-specific inputs (filter None values
         # since prepare_inputs may include them after mlx-vlm 348466f)
         extra_model_inputs = {
@@ -1039,33 +933,56 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         if pixel_values is not None and num_images > 0:
-            # Compute image hash FIRST for vision feature cache lookup
+            # Compute whole-request image hash (used for KV prefix cache keying)
             image_hash = compute_image_hash(images)
 
             # Build call kwargs from extra_model_inputs
             call_kwargs = dict(extra_model_inputs)
 
-            # Try vision feature cache
-            if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
-                cached_features = self._vision_cache.get(image_hash, self._model_name)
-                if cached_features is not None:
-                    call_kwargs["cached_image_features"] = cached_features
-                    logger.debug("Vision feature cache hit: %s", image_hash[:16])
+            # Try per-image vision feature cache
+            if self._vision_cache is not None and self._vision_cache_enabled:
+                per_hashes = compute_per_image_hashes(images)
+                cached_per_image = [
+                    self._vision_cache.get(h, self._model_name) for h in per_hashes
+                ]
+
+                if all(f is not None for f in cached_per_image):
+                    # All images cached individually — combine and use
+                    combined = mx.concatenate(cached_per_image, axis=0)
+                    call_kwargs["cached_image_features"] = combined
+                    logger.debug(
+                        "Vision feature cache hit (per-image): all %d images cached",
+                        num_images,
+                    )
                 else:
+                    # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
                             pixel_values, extra_model_inputs
                         )
                         if features is not None:
                             mx.eval(features)
-                            self._vision_cache.put(
-                                image_hash, self._model_name, features
-                            )
                             call_kwargs["cached_image_features"] = features
-                            logger.debug(
-                                "Vision feature cache miss, stored: %s",
-                                image_hash[:16],
+                            # Split and cache each image individually
+                            per_features = self._split_vision_features(
+                                features, num_images, extra_model_inputs
                             )
+                            if per_features is not None:
+                                for h, f in zip(per_hashes, per_features):
+                                    self._vision_cache.put(h, self._model_name, f)
+                                logger.debug(
+                                    "Vision feature cache miss, stored %d per-image entries",
+                                    len(per_features),
+                                )
+                            else:
+                                # Split unsupported for this model — store whole-request
+                                self._vision_cache.put(
+                                    image_hash, self._model_name, features
+                                )
+                                logger.debug(
+                                    "Vision feature cache miss, stored whole-request: %s",
+                                    image_hash[:16],
+                                )
                     except Exception:
                         logger.debug(
                             "Vision feature computation failed, using full pipeline",
@@ -1121,11 +1038,18 @@ class VLMBatchedEngine(BaseEngine):
             # Extract token IDs as list
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
 
-            return token_ids, embed_features.inputs_embeds, extra_kwargs, image_hash
+            return (
+                token_ids,
+                embed_features.inputs_embeds,
+                extra_kwargs,
+                image_hash,
+                image_cache_key_start,
+                image_cache_key_ranges,
+            )
         else:
             # Text-only (no images in this message)
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            return token_ids, None, None, None
+            return token_ids, None, None, None, 0, []
 
     def _apply_chat_template(
         self,
@@ -1175,6 +1099,8 @@ class VLMBatchedEngine(BaseEngine):
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
+        vlm_cache_key_start: int = 0,
+        vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
         **kwargs,
     ) -> GenerationOutput:
         """Generate a complete response (non-streaming)."""
@@ -1214,6 +1140,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -1241,6 +1169,8 @@ class VLMBatchedEngine(BaseEngine):
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
+        vlm_cache_key_start: int = 0,
+        vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream generation token by token."""
@@ -1291,6 +1221,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
             **specprefill_kwargs,
         )
 
@@ -1337,7 +1269,7 @@ class VLMBatchedEngine(BaseEngine):
             await self.start()
 
         loop = asyncio.get_running_loop()
-        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+        prompt, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = await loop.run_in_executor(
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
@@ -1354,6 +1286,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
+            vlm_cache_key_start=image_cache_key_start,
+            vlm_cache_key_ranges=image_cache_key_ranges,
             **kwargs,
         )
 
@@ -1379,7 +1313,7 @@ class VLMBatchedEngine(BaseEngine):
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
         loop = asyncio.get_running_loop()
-        prompt, vlm_embeds, vlm_kwargs, image_hash = await loop.run_in_executor(
+        prompt, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = await loop.run_in_executor(
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
@@ -1387,7 +1321,8 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
         # so compute by subtracting non-system from full prompt tokens.
-        if kwargs.get("specprefill") is not False:
+        specprefill_model_enabled = getattr(self._model_settings, "specprefill_enabled", False) if self._model_settings else False
+        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
             non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
             if len(non_system) < len(messages) and non_system:
                 try:
@@ -1414,6 +1349,8 @@ class VLMBatchedEngine(BaseEngine):
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
+            vlm_cache_key_start=image_cache_key_start,
+            vlm_cache_key_ranges=image_cache_key_ranges,
             **kwargs,
         ):
             yield output
@@ -1478,7 +1415,7 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None,
         kwargs: dict,
-    ) -> Tuple[str | list[int], Any, dict | None, str | None]:
+    ) -> Tuple[str | list[int], Any, dict | None, str | None, int, List[Tuple[int, str]]]:
         """
         Process chat messages, extracting images and preparing VLM inputs.
 
@@ -1490,19 +1427,19 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
+        # Keep VLM-capable models on one prompt-rendering path, even before the
+        # first image arrives. Otherwise the conversation switches prompt families
+        # on the first image-bearing turn and invalidates early prefix blocks.
+        vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
+        template_tools = convert_tools_for_template(tools) if tools else None
+        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = self._prepare_vision_inputs(
+            vlm_messages,
+            images,
+            chat_template_kwargs=ct_kwargs,
+            tools=template_tools,
+        )
+
         if images:
-            # Apply OCR-specific prompt if applicable
-            ocr_messages = self._apply_ocr_prompt(messages)
-
-            # Convert tools for template format (same as text-only path)
-            template_tools = convert_tools_for_template(tools) if tools else None
-
-            # VLM path: prepare vision inputs
-            token_ids, vlm_embeds, vlm_kwargs, image_hash = self._prepare_vision_inputs(
-                ocr_messages, images,
-                chat_template_kwargs=ct_kwargs,
-                tools=template_tools,
-            )
             # Free Metal intermediates from vision encoding.
             # Vision tower + projector produce large intermediate buffers
             # that stay in the Metal cache pool until explicitly cleared.
@@ -1510,14 +1447,15 @@ class VLMBatchedEngine(BaseEngine):
             # eventually trigger ProcessMemoryEnforcer aborts (see #667).
             mx.synchronize()
             mx.clear_cache()
-            return token_ids, vlm_embeds, vlm_kwargs, image_hash
-        else:
-            # Text-only path: standard chat template
-            template_tools = convert_tools_for_template(tools) if tools else None
-            prompt = self._apply_chat_template(
-                text_messages, template_tools, chat_template_kwargs=ct_kwargs
-            )
-            return prompt, None, None, None
+
+        return (
+            token_ids,
+            vlm_embeds,
+            vlm_kwargs,
+            image_hash,
+            image_cache_key_start,
+            image_cache_key_ranges,
+        )
 
     def count_chat_tokens(
         self,

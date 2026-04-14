@@ -68,6 +68,7 @@ class MLXEmbeddingModel:
         self._using_native = False
         self._is_compiled = False
         self._compiled_embed = None
+        self._remap_input_ids_to_inputs = False
 
     def _load_native(self) -> bool:
         """
@@ -176,6 +177,7 @@ class MLXEmbeddingModel:
                     self._hidden_size = getattr(config.text_config, "hidden_size", None)
 
             self._using_native = False
+            self._detect_input_key_remapping()
             self._is_compiled = self._try_compile()
             self._loaded = True
             logger.info(
@@ -323,6 +325,25 @@ class MLXEmbeddingModel:
             None,
         )
 
+    def _detect_input_key_remapping(self) -> None:
+        """Check if the model accepts `inputs` instead of `input_ids` and cache the result."""
+        try:
+            params = inspect.signature(self.model.__call__).parameters
+            self._remap_input_ids_to_inputs = (
+                "input_ids" not in params and "inputs" in params
+            )
+        except (TypeError, ValueError):
+            self._remap_input_ids_to_inputs = False
+
+    def _adapt_model_inputs_for_call(
+        self, model_inputs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Rename prepared inputs to match the embedding model call signature."""
+        adapted_inputs = dict(model_inputs)
+        if self._remap_input_ids_to_inputs and "input_ids" in adapted_inputs:
+            adapted_inputs["inputs"] = adapted_inputs.pop("input_ids")
+        return adapted_inputs
+
     def _try_compile(self) -> bool:
         """
         Compile a primitive-output embedding forward function.
@@ -336,7 +357,7 @@ class MLXEmbeddingModel:
 
         try:
             def _compiled_embed(inputs):
-                outputs = base_model(**inputs)
+                outputs = base_model(**self._adapt_model_inputs_for_call(inputs))
                 return self._extract_embeddings_array(outputs)
 
             self._compiled_embed = mx.compile(_compiled_embed)
@@ -459,7 +480,7 @@ class MLXEmbeddingModel:
                     )
                     if not isinstance(inputs, dict):
                         inputs = dict(inputs)
-                    outputs = self.model(**inputs)
+                    outputs = self.model(**self._adapt_model_inputs_for_call(inputs))
                     total_tokens = self._count_prepared_tokens(inputs)
                 else:
                     from mlx_embeddings import generate

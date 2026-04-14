@@ -111,6 +111,9 @@ omlx/_build_info.py
 # Tailwind CSS standalone CLI binary (download on demand via build_css.py)
 omlx/admin/tailwindcss-*
 
+# Git worktrees
+.worktrees/
+
 # User local configurations and tools
 MEMORY/
 benchmark_qwen35.py

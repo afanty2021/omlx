@@ -120,6 +120,11 @@ class TTSEngine(BaseNonStreamingEngine):
         instructions: Optional[str] = None,
         ref_audio: Optional[str] = None,
         ref_text: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        max_tokens: Optional[int] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -130,6 +135,13 @@ class TTSEngine(BaseNonStreamingEngine):
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
             instructions: Optional voice description for instruct-capable models
+            ref_audio: Optional path to reference audio file (voice cloning)
+            ref_text: Optional transcript of the reference audio
+            temperature: Sampling temperature for generation
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            repetition_penalty: Repetition penalty for generation
+            max_tokens: Maximum number of tokens to generate
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -174,16 +186,27 @@ class TTSEngine(BaseNonStreamingEngine):
             if ref_audio is not None and "ref_audio" in gen_params:
                 gen_kwargs["ref_audio"] = ref_audio
                 gen_kwargs["ref_text"] = ref_text
+            # Generation params (only add non-None values)
+            if temperature is not None:
+                gen_kwargs["temperature"] = temperature
+            if top_k is not None:
+                gen_kwargs["top_k"] = top_k
+            if top_p is not None:
+                gen_kwargs["top_p"] = top_p
+            if repetition_penalty is not None:
+                gen_kwargs["repetition_penalty"] = repetition_penalty
+            if max_tokens is not None:
+                gen_kwargs["max_tokens"] = max_tokens
             gen_kwargs.update(kwargs)
 
             results = model.generate(**gen_kwargs)
+
+            # Use model.sample_rate if available (e.g. Qwen3-TTS)
+            sample_rate = getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE)
             audio_chunks = []
-            sample_rate = _DEFAULT_SAMPLE_RATE
 
             for result in results:
                 audio_chunks.append(np.array(result.audio))
-                if hasattr(result, "sample_rate"):
-                    sample_rate = result.sample_rate
 
             if not audio_chunks:
                 raise RuntimeError("TTS model produced no audio output")

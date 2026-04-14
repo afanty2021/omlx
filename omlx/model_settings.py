@@ -53,6 +53,7 @@ class ModelSettings:
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
+    enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
@@ -60,6 +61,7 @@ class ModelSettings:
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
+    turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

@@ -72,6 +72,22 @@ class DeleteSubKeyRequest(BaseModel):
     key: str
 
 
+class CacheProbeRequest(BaseModel):
+    """Request model for probing per-prompt cache state.
+
+    Tokenizes a chat message list with the target model's tokenizer, then
+    classifies each block's location in the cache hierarchy:
+    - Hot SSD (in-RAM copy of SSD cache, ready to mount without disk read)
+    - Disk SSD (persisted only, needs disk read to reuse)
+    - Cold (fully uncached — would require full prefill)
+    """
+
+    model_id: str
+    messages: List[Dict[str, Any]]
+    tools: Optional[List[Dict[str, Any]]] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -91,6 +107,7 @@ class ModelSettingsRequest(BaseModel):
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
     index_cache_freq: Optional[int] = None
+    enable_thinking: Optional[bool] = None
     thinking_budget_enabled: Optional[bool] = None
     thinking_budget_tokens: Optional[int] = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -117,6 +134,7 @@ class GlobalSettingsRequest(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     log_level: Optional[str] = None
+    server_aliases: Optional[List[str]] = None
 
     # Model settings
     model_dirs: Optional[List[str]] = None
@@ -147,6 +165,12 @@ class GlobalSettingsRequest(BaseModel):
     # ModelScope settings
     ms_endpoint: Optional[str] = None
 
+    # Network settings
+    network_http_proxy: Optional[str] = None
+    network_https_proxy: Optional[str] = None
+    network_no_proxy: Optional[str] = None
+    network_ca_bundle: Optional[str] = None
+
     # Sampling defaults
     sampling_max_context_window: Optional[int] = None
     sampling_max_tokens: Optional[int] = None
@@ -167,6 +191,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_codex_model: Optional[str] = None
     integrations_opencode_model: Optional[str] = None
     integrations_openclaw_model: Optional[str] = None
+    integrations_pi_model: Optional[str] = None
     integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
 
     # UI settings
@@ -902,11 +927,10 @@ async def login_page(request: Request):
 
     global_settings = _get_global_settings()
 
-    # Skip login page when skip_api_key_verification is enabled on localhost
+    # Skip login page when skip_api_key_verification is enabled
     if (
         global_settings is not None
         and global_settings.auth.skip_api_key_verification
-        and global_settings.server.host == "127.0.0.1"
     ):
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
@@ -1248,6 +1272,30 @@ async def delete_sub_key(
 
 
 # =============================================================================
+# Grammar API Routes
+# =============================================================================
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    """Return available reasoning parser names from xgrammar.
+
+    Queries ``xgrammar.get_builtin_structural_tag_supported_models()`` at
+    runtime so the list stays in sync with the installed xgrammar version.
+    """
+    try:
+        from xgrammar import get_builtin_structural_tag_supported_models
+
+        supported = get_builtin_structural_tag_supported_models()
+        return [
+            {"value": style, "label": style, "models": models}
+            for style, models in supported.items()
+        ]
+    except ImportError:
+        return []
+
+
+# =============================================================================
 # Models API Routes
 # =============================================================================
 
@@ -1298,6 +1346,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "thinking_default": model_info.get("thinking_default"),
             "last_access": model_info.get("last_access"),
         }
 
@@ -1316,6 +1365,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "presence_penalty": settings.presence_penalty,
                 "force_sampling": settings.force_sampling,
                 "max_tool_result_tokens": settings.max_tool_result_tokens,
+                "enable_thinking": settings.enable_thinking,
                 "thinking_budget_enabled": settings.thinking_budget_enabled,
                 "thinking_budget_tokens": settings.thinking_budget_tokens,
                 "reasoning_parser": settings.reasoning_parser,
@@ -1516,6 +1566,8 @@ async def update_model_settings(
         current_settings.max_tool_result_tokens = (
             request.max_tool_result_tokens if request.max_tool_result_tokens and request.max_tool_result_tokens > 0 else None
         )
+    if "enable_thinking" in sent:
+        current_settings.enable_thinking = request.enable_thinking
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = request.thinking_budget_enabled or False
     if "thinking_budget_tokens" in sent:
@@ -1700,6 +1752,40 @@ async def get_generation_config(
 # =============================================================================
 
 
+@router.get("/api/server-info")
+async def get_server_info(is_admin: bool = Depends(require_admin)):
+    """Return server connectivity metadata for the dashboard.
+
+    Provides the configured host, port, and the list of user-facing
+    aliases (hostnames/IPs) that the dashboard can use to render
+    selectable API URL hints.
+
+    Returns:
+        JSON object with ``host``, ``port``, and ``aliases``.
+
+    Raises:
+        HTTPException: 401 if not authenticated, 503 if server not initialized.
+    """
+    from ..utils.network import detect_server_aliases
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    configured = list(global_settings.server.server_aliases)
+    if configured:
+        aliases = configured
+    else:
+        # Fall back to live detection if persisted list is empty.
+        aliases = detect_server_aliases(host=global_settings.server.host)
+
+    return {
+        "host": global_settings.server.host,
+        "port": global_settings.server.port,
+        "aliases": aliases,
+    }
+
+
 @router.get("/api/global-settings")
 async def get_global_settings(is_admin: bool = Depends(require_admin)):
     """
@@ -1734,6 +1820,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "host": global_settings.server.host,
             "port": global_settings.server.port,
             "log_level": global_settings.server.log_level,
+            "server_aliases": list(global_settings.server.server_aliases),
         },
         "model": {
             "model_dirs": [
@@ -1769,6 +1856,12 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "modelscope": {
             "endpoint": global_settings.modelscope.endpoint,
         },
+        "network": {
+            "http_proxy": global_settings.network.http_proxy,
+            "https_proxy": global_settings.network.https_proxy,
+            "no_proxy": global_settings.network.no_proxy,
+            "ca_bundle": global_settings.network.ca_bundle,
+        },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
             "max_tokens": global_settings.sampling.max_tokens,
@@ -1795,6 +1888,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "pi_model": global_settings.integrations.pi_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
@@ -1845,9 +1939,6 @@ async def update_global_settings(
     # Apply server settings
     if request.host is not None:
         global_settings.server.host = request.host
-        # Reset skip_api_key_verification when host is not localhost
-        if request.host != "127.0.0.1":
-            global_settings.auth.skip_api_key_verification = False
     if request.port is not None:
         global_settings.server.port = request.port
     if request.log_level is not None:
@@ -1855,6 +1946,30 @@ async def update_global_settings(
         # Apply log level at runtime
         _apply_log_level_runtime(request.log_level)
         runtime_applied.append("log_level")
+
+    if request.server_aliases is not None:
+        from ..utils.network import is_valid_alias
+
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for alias in request.server_aliases:
+            if not isinstance(alias, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid server alias: each alias must be a string",
+                )
+            value = alias.strip()
+            if not value or value in seen:
+                continue
+            if not is_valid_alias(value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid server alias: {value!r} (must be a hostname or IP address)",
+                )
+            seen.add(value)
+            cleaned.append(value)
+        global_settings.server.server_aliases = cleaned
+        runtime_applied.append("server_aliases")
 
     # Apply model settings
     new_dirs = None
@@ -2000,6 +2115,52 @@ async def update_global_settings(
             f"{request.ms_endpoint or '(default)'}"
         )
 
+    # Apply network settings (Live - immediately applied via env vars)
+    network_changed = False
+    if request.network_http_proxy is not None:
+        global_settings.network.http_proxy = request.network_http_proxy
+        if request.network_http_proxy:
+            os.environ["HTTP_PROXY"] = request.network_http_proxy
+            os.environ["http_proxy"] = request.network_http_proxy
+        else:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("http_proxy", None)
+        network_changed = True
+
+    if request.network_https_proxy is not None:
+        global_settings.network.https_proxy = request.network_https_proxy
+        if request.network_https_proxy:
+            os.environ["HTTPS_PROXY"] = request.network_https_proxy
+            os.environ["https_proxy"] = request.network_https_proxy
+        else:
+            os.environ.pop("HTTPS_PROXY", None)
+            os.environ.pop("https_proxy", None)
+        network_changed = True
+
+    if request.network_no_proxy is not None:
+        global_settings.network.no_proxy = request.network_no_proxy
+        if request.network_no_proxy:
+            os.environ["NO_PROXY"] = request.network_no_proxy
+            os.environ["no_proxy"] = request.network_no_proxy
+        else:
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+        network_changed = True
+
+    if request.network_ca_bundle is not None:
+        global_settings.network.ca_bundle = request.network_ca_bundle
+        if request.network_ca_bundle:
+            os.environ["REQUESTS_CA_BUNDLE"] = request.network_ca_bundle
+            os.environ["SSL_CERT_FILE"] = request.network_ca_bundle
+        else:
+            os.environ.pop("REQUESTS_CA_BUNDLE", None)
+            os.environ.pop("SSL_CERT_FILE", None)
+        network_changed = True
+
+    if network_changed:
+        runtime_applied.append("network")
+        logger.info("Network settings updated")
+
     # Apply sampling settings (Live - immediately applied)
     sampling_changed = False
     if request.sampling_max_context_window is not None:
@@ -2090,6 +2251,9 @@ async def update_global_settings(
             request.integrations_openclaw_model
         )
         integrations_changed = True
+    if "integrations_pi_model" in request.model_fields_set:
+        global_settings.integrations.pi_model = request.integrations_pi_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -2102,7 +2266,8 @@ async def update_global_settings(
             f"Integration settings updated: "
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
-            f"openclaw={global_settings.integrations.openclaw_model}"
+            f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"pi={global_settings.integrations.pi_model}"
         )
 
     # Apply UI settings
@@ -2126,11 +2291,7 @@ async def update_global_settings(
         logger.info("API key updated via admin settings")
 
     if request.skip_api_key_verification is not None:
-        # Only allow enabling when host is localhost
-        if request.skip_api_key_verification and global_settings.server.host != "127.0.0.1":
-            global_settings.auth.skip_api_key_verification = False
-        else:
-            global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
+        global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
         runtime_applied.append("skip_api_key_verification")
 
     # Validate settings
@@ -2491,6 +2652,24 @@ def _build_runtime_cache_observability(
         elif not isinstance(ssd_stats, dict):
             ssd_stats = {}
 
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        scheduler_model_name = getattr(getattr(scheduler, "config", None), "model_name", "")
+        if ssd_manager is not None and hasattr(ssd_manager, "get_stats_for_model"):
+            try:
+                scoped_ssd_stats = ssd_manager.get_stats_for_model(
+                    scheduler_model_name or model_id
+                )
+                if is_dataclass(scoped_ssd_stats):
+                    ssd_stats = asdict(scoped_ssd_stats)
+                elif isinstance(scoped_ssd_stats, dict):
+                    ssd_stats = scoped_ssd_stats
+            except Exception as exc:
+                logger.warning(
+                    "Failed to collect model-scoped SSD cache stats for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
         prefix_stats = runtime_stats.get("prefix_cache")
         if is_dataclass(prefix_stats):
             prefix_stats = asdict(prefix_stats)
@@ -2788,6 +2967,187 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     return {"status": "ok", "total_deleted": total_deleted}
 
 
+@router.post("/api/cache/probe")
+async def probe_cache(
+    request: CacheProbeRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Probe cache state for a chat message list.
+
+    Classifies each block of the rendered prompt into one of three buckets:
+    - ``blocks_ssd_hot``: in the SSD manager's hot cache (RAM copy of cold
+      blocks, ready to mount without disk read)
+    - ``blocks_ssd_disk``: only in the SSD index on disk
+    - ``blocks_cold``: not cached anywhere (requires full prefill)
+
+    The split is computed via a walk of the chain-hashed block sequence — the
+    same hashing the scheduler uses at prefill time. The model must be loaded
+    for the probe to run; unloaded models return ``model_loaded: false``.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool._entries.get(request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {request.model_id}"
+        )
+    if entry.engine is None:
+        return {
+            "model_id": request.model_id,
+            "model_loaded": False,
+            "reason": "Model is not loaded — load it to enable cache probing.",
+        }
+
+    engine = entry.engine
+    tokenizer = getattr(engine, "_tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        raise HTTPException(
+            status_code=400,
+            detail="Model tokenizer does not support chat templating.",
+        )
+
+    # Reach into the scheduler to access the prefix index and SSD manager.
+    async_core = getattr(engine, "_engine", None)
+    core = getattr(async_core, "engine", None) if async_core is not None else None
+    scheduler = getattr(core, "scheduler", None) if core is not None else None
+    if scheduler is None:
+        raise HTTPException(
+            status_code=500, detail="Scheduler unavailable for loaded model."
+        )
+
+    prefix_cache = getattr(scheduler, "block_aware_cache", None)
+    ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+    paged_cache = getattr(scheduler, "paged_cache_manager", None)
+    block_size = getattr(
+        getattr(scheduler, "config", None), "paged_cache_block_size", 0
+    )
+    if not block_size and prefix_cache is not None:
+        block_size = getattr(prefix_cache, "block_size", 0)
+    if not block_size:
+        raise HTTPException(
+            status_code=500,
+            detail="Cache block size unavailable — cache may not be enabled.",
+        )
+
+    # Render + tokenize the prompt using the same path as generation so the
+    # hashes line up with what the scheduler would produce at prefill.
+    try:
+        messages = request.messages
+        if hasattr(engine, "_preprocess_messages"):
+            messages = engine._preprocess_messages(messages)
+        try:
+            from ..api.tool_calling import convert_tools_for_template  # type: ignore
+            template_tools = (
+                convert_tools_for_template(request.tools) if request.tools else None
+            )
+        except Exception:
+            template_tools = request.tools or None
+        if hasattr(engine, "_apply_chat_template"):
+            prompt = engine._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=request.chat_template_kwargs,
+            )
+        else:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        token_ids = list(tokenizer.encode(prompt))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to tokenize messages: {exc}"
+        )
+
+    total_tokens = len(token_ids)
+    if total_tokens == 0:
+        return {
+            "model_id": request.model_id,
+            "model_loaded": True,
+            "total_tokens": 0,
+            "block_size": block_size,
+            "total_blocks": 0,
+            "blocks_ssd_hot": 0,
+            "blocks_ssd_disk": 0,
+            "blocks_cold": 0,
+            "ssd_hit_tokens": 0,
+            "cold_tokens": 0,
+        }
+
+    # Compute chain-hashed block sequence.
+    from ..cache.paged_cache import compute_block_hash
+
+    model_name = getattr(paged_cache, "model_name", None) if paged_cache else None
+    ssd_index = getattr(ssd_manager, "_index", None) if ssd_manager else None
+    ssd_hot = getattr(ssd_manager, "_hot_cache", None) if ssd_manager else None
+
+    # The cache is a contiguous prefix (each block chain-hashed from the
+    # previous), so we walk block-by-block until the first retrievability
+    # miss — after that, every subsequent block is necessarily cold.
+    #
+    # Ground truth for "cached" in paged-SSD mode is retrievability:
+    # hot_cache (RAM copy) OR ssd_index (on disk). BlockAwarePrefixCache's
+    # internal prefix index is deliberately NOT consulted — it tracks every
+    # hash the scheduler has seen and isn't cleared by clear_ssd_cache(),
+    # so relying on it would report false positives after a manual wipe.
+    blocks_ssd_hot = 0
+    blocks_ssd_disk = 0
+    ssd_hit_tokens = 0
+
+    parent_hash = b""
+    total_blocks = (total_tokens + block_size - 1) // block_size
+
+    for start in range(0, total_tokens, block_size):
+        end = min(start + block_size, total_tokens)
+        block_tokens = token_ids[start:end]
+        if not block_tokens:
+            break
+
+        block_hash = compute_block_hash(
+            parent_hash,
+            block_tokens,
+            extra_keys=None,
+            model_name=model_name,
+        )
+        parent_hash = block_hash
+
+        in_ssd_hot = ssd_hot is not None and block_hash in ssd_hot
+        in_ssd_disk = False
+        if ssd_index is not None:
+            try:
+                in_ssd_disk = ssd_index.contains(block_hash)
+            except Exception:
+                in_ssd_disk = False
+
+        if not (in_ssd_hot or in_ssd_disk):
+            break
+
+        if in_ssd_hot:
+            blocks_ssd_hot += 1
+        else:
+            blocks_ssd_disk += 1
+        ssd_hit_tokens += len(block_tokens)
+
+    cached_blocks = blocks_ssd_hot + blocks_ssd_disk
+    blocks_cold = max(total_blocks - cached_blocks, 0)
+
+    return {
+        "model_id": request.model_id,
+        "model_loaded": True,
+        "total_tokens": total_tokens,
+        "block_size": block_size,
+        "total_blocks": total_blocks,
+        "blocks_ssd_hot": blocks_ssd_hot,
+        "blocks_ssd_disk": blocks_ssd_disk,
+        "blocks_cold": blocks_cold,
+        "ssd_hit_tokens": ssd_hit_tokens,
+        "cold_tokens": max(total_tokens - ssd_hit_tokens, 0),
+    }
+
+
 # =============================================================================
 # HuggingFace Downloader API Routes
 # =============================================================================
@@ -2970,6 +3330,24 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
+    from ..model_discovery import _resolve_hf_cache_entry
+
+    def _add_model(model_path: Path, model_name: str) -> None:
+        if model_name in seen_names:
+            return
+        seen_names.add(model_name)
+        total_size = sum(
+            f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+        )
+        models.append(
+            {
+                "name": model_name,
+                "path": str(model_path),
+                "size": total_size,
+                "size_formatted": format_size(total_size),
+            }
+        )
+
     models = []
     seen_names: set[str] = set()
     for model_dir in model_dirs:
@@ -2981,44 +3359,22 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
             if (subdir / "config.json").exists():
                 # Level 1: direct model folder
-                if subdir.name in seen_names:
-                    continue
-                seen_names.add(subdir.name)
-                total_size = sum(
-                    f.stat().st_size for f in subdir.rglob("*") if f.is_file()
-                )
-                models.append(
-                    {
-                        "name": subdir.name,
-                        "path": str(subdir),
-                        "size": total_size,
-                        "size_formatted": format_size(total_size),
-                    }
-                )
+                _add_model(subdir, subdir.name)
             else:
+                # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+                hf_resolved = _resolve_hf_cache_entry(subdir)
+                if hf_resolved is not None:
+                    snapshot_path, model_name = hf_resolved
+                    if (snapshot_path / "config.json").exists():
+                        _add_model(snapshot_path, model_name)
+                    continue
+
                 # Level 2: organization folder — scan children
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if not (child / "config.json").exists():
-                        continue
-                    if child.name in seen_names:
-                        continue
-                    seen_names.add(child.name)
-
-                    total_size = sum(
-                        f.stat().st_size
-                        for f in child.rglob("*")
-                        if f.is_file()
-                    )
-                    models.append(
-                        {
-                            "name": child.name,
-                            "path": str(child),
-                            "size": total_size,
-                            "size_formatted": format_size(total_size),
-                        }
-                    )
+                    if (child / "config.json").exists():
+                        _add_model(child, child.name)
 
     return {"models": models}
 

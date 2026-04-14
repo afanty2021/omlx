@@ -254,6 +254,9 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                    self._model_settings, "turboquant_skip_last", True
+                )
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -279,7 +282,11 @@ class BatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            self._engine.engine.close()
+            if hasattr(self._engine, 'engine') and self._engine.engine is not None:
+                try:
+                    self._engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
         self._engine = None
         self._model = None
         self._tokenizer = None
@@ -639,7 +646,8 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
         # so compute by subtracting non-system from full prompt tokens.
-        if kwargs.get("specprefill") is not False:
+        specprefill_model_enabled = getattr(self._model_settings, "specprefill_enabled", False) if self._model_settings else False
+        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
             non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
             if len(non_system) < len(messages) and non_system:
                 try:

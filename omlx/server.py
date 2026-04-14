@@ -143,6 +143,8 @@ from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
+    enrich_tool_params_for_gemma4,
+    restore_gemma4_param_names,
     extract_tool_calls_with_thinking,
     parse_json_output,
     parse_tool_calls,
@@ -260,11 +262,10 @@ async def verify_api_key(
     if _server_state.api_key is None:
         return True
 
-    # Skip verification if enabled and host is localhost
+    # Skip verification if enabled
     if (
         _server_state.global_settings is not None
         and _server_state.global_settings.auth.skip_api_key_verification
-        and _server_state.global_settings.server.host == "127.0.0.1"
     ):
         return True
 
@@ -293,6 +294,33 @@ async def verify_api_key(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
+    # Startup: Auto-populate server aliases for the admin dashboard
+    # so users get sensible hostname/IP options for API URL hints
+    # without manual configuration. Only runs when the persisted list
+    # is empty so user-curated aliases are never overwritten.
+    if (
+        _server_state.global_settings is not None
+        and not _server_state.global_settings.server.server_aliases
+    ):
+        try:
+            from .utils.network import detect_server_aliases
+
+            detected = detect_server_aliases(
+                host=_server_state.global_settings.server.host
+            )
+            if detected:
+                _server_state.global_settings.server.server_aliases = detected
+                try:
+                    _server_state.global_settings.save()
+                except Exception as save_exc:  # pragma: no cover - filesystem race
+                    logger.warning(
+                        "Auto-detected server aliases but could not persist: %s",
+                        save_exc,
+                    )
+                logger.info("Auto-detected server aliases: %s", detected)
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("Server alias auto-detection failed: %s", exc)
+
     # Startup: Preload pinned models
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.preload_pinned_models()
@@ -1977,6 +2005,9 @@ async def create_chat_completion(
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -2025,6 +2056,9 @@ async def create_chat_completion(
 
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
     try:
         num_prompt_tokens = engine.count_chat_tokens(
             messages, tools_for_template,
@@ -2078,6 +2112,13 @@ async def create_chat_completion(
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
+    # Auto-set enable_thinking in chat template kwargs when a thinking
+    # budget is active (from request or model settings).  Some chat
+    # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+    # kwarg is True.
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
+
     # Add compiled grammar for logit-level structured output.
     # When a reasoning_parser is configured, the structural tag includes
     # a thinking phase — auto-set a thinking_budget so the model exits
@@ -2115,7 +2156,7 @@ async def create_chat_completion(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -2182,6 +2223,17 @@ async def create_chat_completion(
                 cleaned_text = json.dumps(parsed_json)
             if not is_valid:
                 logger.warning(f"JSON validation failed: {error}")
+
+        # Reverse Gemma 4 parameter renaming (param_description -> description)
+        if tool_calls and "gemma" in (resolved_model or "").lower():
+            for tc in tool_calls:
+                if tc.function and tc.function.arguments:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        args = restore_gemma4_param_names(args)
+                        tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
 
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
@@ -2547,6 +2599,7 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -2725,6 +2778,16 @@ async def stream_chat_completion(
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
 
+        # Process response_format if specified
+        if request.response_format and not tool_calls:
+            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text, request.response_format
+            )
+            if parsed_json is not None:
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error}")
+
         # Buffered mode: emit thinking and cleaned content now
         if not stream_content:
             if cleaned_thinking:
@@ -2747,6 +2810,17 @@ async def stream_chat_completion(
                     )],
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    # Reverse Gemma 4 parameter renaming for streaming path
+    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+        for tc in tool_calls:
+            if tc.function and tc.function.arguments:
+                try:
+                    args = json.loads(tc.function.arguments)
+                    args = restore_gemma4_param_names(args)
+                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
     # Emit tool call chunks if found
     if tool_calls:
@@ -2835,6 +2909,7 @@ async def stream_anthropic_messages(
     engine: BaseEngine,
     messages: list,
     request: AnthropicMessagesRequest,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -3054,6 +3129,17 @@ async def stream_anthropic_messages(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
+    # Reverse Gemma 4 parameter renaming
+    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+        for tc in tool_calls:
+            if tc.function and tc.function.arguments:
+                try:
+                    args = json.loads(tc.function.arguments)
+                    args = restore_gemma4_param_names(args)
+                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
     # Emit tool_use blocks if present
     tool_block_start = block_index + 1
     if tool_calls:
@@ -3157,6 +3243,9 @@ async def create_anthropic_message(
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -3220,6 +3309,12 @@ async def create_anthropic_message(
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
+    # Auto-set enable_thinking in chat template kwargs when a thinking
+    # budget is active but enable_thinking was not already set (e.g. via
+    # the Anthropic thinking.type field above or model settings).
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
+
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
     if _server_state.mcp_manager:
@@ -3236,6 +3331,9 @@ async def create_anthropic_message(
             internal_tools = None
     else:
         internal_tools = user_internal
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if internal_tools and "gemma" in (resolved_model or "").lower():
+        internal_tools = enrich_tool_params_for_gemma4(internal_tools)
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
 
@@ -3270,7 +3368,7 @@ async def create_anthropic_message(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_anthropic_messages(engine, messages, request, **chat_kwargs),
+                stream_anthropic_messages(engine, messages, request, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -3329,6 +3427,17 @@ async def create_anthropic_message(
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
             cleaned_thinking = extraction.cleaned_thinking
+
+        # Reverse Gemma 4 parameter renaming
+        if tool_calls and "gemma" in (resolved_model or "").lower():
+            for tc in tool_calls:
+                if tc.function and tc.function.arguments:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        args = restore_gemma4_param_names(args)
+                        tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
 
         response = convert_internal_to_anthropic_response(
             text=cleaned_text.strip() if cleaned_text else regular_content,
@@ -3516,6 +3625,9 @@ async def create_response(
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already
@@ -3564,6 +3676,9 @@ async def create_response(
     tools_for_template = (
         convert_tools_for_template(effective_tools) if effective_tools else None
     )
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
 
     # Validate context window
     try:
@@ -3612,6 +3727,10 @@ async def create_response(
     if thinking_budget is not None:
         chat_kwargs["thinking_budget"] = thinking_budget
 
+    # Auto-set enable_thinking when thinking budget is active.
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
+
     # Add compiled grammar for logit-level structured output.
     if compiled_grammar is not None:
         chat_kwargs["compiled_grammar"] = compiled_grammar
@@ -3638,6 +3757,8 @@ async def create_response(
                     input_messages=current_input_messages,
                     store_response=_should_store_response(request.store),
                     model_load_duration=model_load_duration,
+                    resolved_model=resolved_model,
+                    response_format=response_format,
                     **chat_kwargs,
                 ),
                 http_request=http_request,
@@ -3683,6 +3804,29 @@ async def create_response(
             )
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
+
+        # Reverse Gemma 4 parameter renaming
+        if tool_calls and "gemma" in (resolved_model or "").lower():
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                if fn and fn.arguments:
+                    try:
+                        args = json.loads(fn.arguments)
+                        args = restore_gemma4_param_names(args)
+                        fn.arguments = json.dumps(args, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
+        # Process response_format if specified
+        if response_format and not tool_calls:
+            cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                cleaned_text or regular_content,
+                response_format
+            )
+            if parsed_json is not None:
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                logger.warning(f"JSON validation failed: {error}")
 
         # Build output items
         output_items: list[OutputItem] = []
@@ -3747,6 +3891,8 @@ async def stream_responses_api(
     input_messages: Optional[list[dict]] = None,
     store_response: bool = True,
     model_load_duration: float = 0.0,
+    resolved_model: Optional[str] = None,
+    response_format=None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -3925,7 +4071,29 @@ async def stream_responses_api(
         thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
+    # Reverse Gemma 4 parameter renaming
+    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            if fn and fn.arguments:
+                try:
+                    args = json.loads(fn.arguments)
+                    args = restore_gemma4_param_names(args)
+                    fn.arguments = json.dumps(args, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
     final_text = cleaned_text.strip() if cleaned_text else ""
+
+    # Process response_format if specified
+    if response_format and not tool_calls:
+        _, parsed_json, is_valid, error = parse_json_output(
+            final_text, response_format
+        )
+        if parsed_json is not None:
+            final_text = json.dumps(parsed_json)
+        if not is_valid:
+            logger.warning(f"JSON validation failed: {error}")
 
     # 6. response.output_text.done
     seq += 1

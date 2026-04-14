@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.3.5.dev1.tar.gz"
-  sha256 "c9877d8070fcbe4a98ca687815be79cf9dea5392e74e4e88a4554e563fe7f4d3"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.3.5-rc1.tar.gz"
+  sha256 "0969e4d0de46197126197d8eb13d26516f5fe2d62df86adc3e5ec02ac1b52879"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -35,12 +35,15 @@ class Omlx < Formula
     system "python3.11", "-m", "venv", libexec
 
     # Build Rust-based packages from source with headerpad to prevent
-    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths)
+    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths).
+    # tokenizers is excluded: its wheel ships a stable-ABI .abi3.so that does
+    # not need Homebrew's dylib ID rewrite, and building from source fails on
+    # macOS 15+ due to PyO3 linker errors (missing Python symbols at link time).
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken,tokenizers", install_spec
+    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken", install_spec
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
