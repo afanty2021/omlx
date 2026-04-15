@@ -286,29 +286,33 @@ python build.py --dmg-only
 
 ### 最新提交
 
-1. **b125bfc** - formula: bump to v0.3.5-rc1
-2. **62c8f5f** - fix: remove false-positive RotatingKVCache stale offset warning
-3. **fd55ab3** - bump version to 0.3.5
-4. **95ea04a** - fix: address PR review — safer restore, consistent model detection
-5. **fec8dc0** - fix: rename colliding params for Gemma 4
-6. **6fa0a77** - fix: enrich Gemma 4 tool parameter descriptions
-7. **8baa0af** - docs: add DFlash-MLX integration guide
-8. **6b1029c** - fix(benchmark): skip batch test for DFlashEngine (#759)
-9. **aca2de1** - fix: remove VoiceDesign hasattr routing from TTS engine
-10. **b2b03b3** - test: add unit tests for cache probe endpoint (#720)
-11. **3b4feb9** - feat(admin): add cache probe endpoint for prompt prefix lookup (#720)
-12. **ccbf09e** - feat: allow skip API key verification on any host
-13. **a34615e** - fix: verify actual Metal memory release before updating pool tracking
-14. **5373256** - fix: add parse_json_output to responses API and streaming endpoints
-15. **f378c9b** - fix(packaging): skip pip-stripped interpreters in _find_target_python
-16. **4928761** - fix: cache inspect.signature for embedding input remapping
-17. **1b60a90** - fix: enable_thinking toggle precedence + add tests
-18. **e6f2626** - feat: add dedicated Enable Thinking toggle with auto-detection (#748)
-19. **a4d17be** - fix(app): add reopen and termination delegate methods (#725)
-20. **ed289d7** - bump mlx-vlm to 3472132, remove dead gemma4 patch, fix 14 stale tests
+1. **b10eaad** - fix: scale settle_tolerance with model size for large models (#768)
+2. **6731a2c** - fix: revert TurboQuant KV conversion in external prefill (#771)
+3. **b125bfc** - formula: bump to v0.3.5-rc1
+4. **62c8f5f** - fix: remove false-positive RotatingKVCache stale offset warning
+5. **fd55ab3** - bump version to 0.3.5
+6. **95ea04a** - fix: address PR review — safer restore, consistent model detection
+7. **fec8dc0** - fix: rename colliding params for Gemma 4
+8. **6fa0a77** - fix: enrich Gemma 4 tool parameter descriptions
+9. **8baa0af** - docs: add DFlash-MLX integration guide
+10. **6b1029c** - fix(benchmark): skip batch test for DFlashEngine (#759)
+11. **aca2de1** - fix: remove VoiceDesign hasattr routing from TTS engine
+12. **b2b03b3** - test: add unit tests for cache probe endpoint (#720)
+13. **3b4feb9** - feat(admin): add cache probe endpoint for prompt prefix lookup (#720)
+14. **ccbf09e** - feat: allow skip API key verification on any host
+15. **a34615e** - fix: verify actual Metal memory release before updating pool tracking
+16. **5373256** - fix: add parse_json_output to responses API and streaming endpoints
+17. **f378c9b** - fix(packaging): skip pip-stripped interpreters in _find_target_python
+18. **4928761** - fix: cache inspect.signature for embedding input remapping
+19. **1b60a90** - fix: enable_thinking toggle precedence + add tests
+20. **e6f2626** - feat: add dedicated Enable Thinking toggle with auto-detection (#748)
+21. **a4d17be** - fix(app): add reopen and termination delegate methods (#725)
+22. **ed289d7** - bump mlx-vlm to 3472132, remove dead gemma4 patch, fix 14 stale tests
 
 ### 重要变更
 
+- **大型模型内存管理**：针对 40GB 以上模型，settle_tolerance 从固定 2GB 改为根据模型大小动态缩放（约 5%），解决虚假 settle barrier 超时和不必要的紧急回收问题 (#768)
+- **TurboQuant KV 修复**：回滚外部 prefill 中的 TurboQuantKV 转换，因为 TurboQuantKVCache 缺少 merge()/maybe_trim_front() 方法，导致量化 KV 模型（Llama-4-Scout、Nemotron-3-Super-120B）出现垃圾输出和 SIGABRT (#771)
 - **版本更新**：升级到 v0.3.5-rc1（候选发布版本）
 - **RotatingKVCache 优化**：移除虚假的 stale offset 警告，改进 specprefill system_end 计算
 - **Gemma 4 支持**：修复参数冲突问题，丰富工具参数描述
