@@ -1,8 +1,9 @@
 # oMLX - Mac 优化的 LLM 推理引擎
 
-> 最后更新：2026-04-15
-> 当前版本：v0.3.5-rc1
+> 最后更新：2026-04-16
+> 当前版本：v0.3.5
 > 上游仓库：https://github.com/jundot/omlx
+> **变更日志**：[CHANGELOG.md](CHANGELOG.md)
 
 ## 项目概述
 
@@ -35,7 +36,7 @@ mlx>=0.31.1
 mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e3
 mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dff
 mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa
-dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@fc7101b
+dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@814c4a1 (v0.1.3)
 fastapi>=0.108.0
 uvicorn>=0.23.0
 transformers>=5.0.0,<5.4.0
@@ -281,54 +282,6 @@ python build.py --skip-venv
 # 仅 DMG
 python build.py --dmg-only
 ```
-
-## 最近上游变更（2026-04-15）
-
-### 最新提交
-
-1. **b10eaad** - fix: scale settle_tolerance with model size for large models (#768)
-2. **6731a2c** - fix: revert TurboQuant KV conversion in external prefill (#771)
-3. **b125bfc** - formula: bump to v0.3.5-rc1
-4. **62c8f5f** - fix: remove false-positive RotatingKVCache stale offset warning
-5. **fd55ab3** - bump version to 0.3.5
-6. **95ea04a** - fix: address PR review — safer restore, consistent model detection
-7. **fec8dc0** - fix: rename colliding params for Gemma 4
-8. **6fa0a77** - fix: enrich Gemma 4 tool parameter descriptions
-9. **8baa0af** - docs: add DFlash-MLX integration guide
-10. **6b1029c** - fix(benchmark): skip batch test for DFlashEngine (#759)
-11. **aca2de1** - fix: remove VoiceDesign hasattr routing from TTS engine
-12. **b2b03b3** - test: add unit tests for cache probe endpoint (#720)
-13. **3b4feb9** - feat(admin): add cache probe endpoint for prompt prefix lookup (#720)
-14. **ccbf09e** - feat: allow skip API key verification on any host
-15. **a34615e** - fix: verify actual Metal memory release before updating pool tracking
-16. **5373256** - fix: add parse_json_output to responses API and streaming endpoints
-17. **f378c9b** - fix(packaging): skip pip-stripped interpreters in _find_target_python
-18. **4928761** - fix: cache inspect.signature for embedding input remapping
-19. **1b60a90** - fix: enable_thinking toggle precedence + add tests
-20. **e6f2626** - feat: add dedicated Enable Thinking toggle with auto-detection (#748)
-21. **a4d17be** - fix(app): add reopen and termination delegate methods (#725)
-22. **ed289d7** - bump mlx-vlm to 3472132, remove dead gemma4 patch, fix 14 stale tests
-
-### 重要变更
-
-- **大型模型内存管理**：针对 40GB 以上模型，settle_tolerance 从固定 2GB 改为根据模型大小动态缩放（约 5%），解决虚假 settle barrier 超时和不必要的紧急回收问题 (#768)
-- **TurboQuant KV 修复**：回滚外部 prefill 中的 TurboQuantKV 转换，因为 TurboQuantKVCache 缺少 merge()/maybe_trim_front() 方法，导致量化 KV 模型（Llama-4-Scout、Nemotron-3-Super-120B）出现垃圾输出和 SIGABRT (#771)
-- **版本更新**：升级到 v0.3.5-rc1（候选发布版本）
-- **RotatingKVCache 优化**：移除虚假的 stale offset 警告，改进 specprefill system_end 计算
-- **Gemma 4 支持**：修复参数冲突问题，丰富工具参数描述
-- **DFlash-MLX 集成指南**：新增完整的集成文档
-- **缓存探测端点**：管理面板新增提示前缀查找功能 (#720)
-- **思维模式切换**：新增专用 Enable Thinking 切换按钮，支持自动检测 (#748)
-- **API 密钥验证**：允许在任何主机上跳过 API 密钥验证
-- **Metal 内存管理**：验证实际的 Metal 内存释放后再更新池跟踪
-- **JSON 输出解析**：为响应 API 和流式端点添加 parse_json_output
-- **mlx-vlm 更新**：升级到 3472132 版本，修复 14 个过时测试
-- **应用委托方法**：添加重新打开和终止委托方法 (#725)
-- **TurboQuantKV 优化**：
-  - 添加 TurboQuantKVCache.merge monkey-patch 支持
-  - 改进 mRoPE 实现，使用 PromptProcessingBatch.prompt
-  - 修复 burst-completion bug (#557)
-  - 添加 _apply_turboquant_kv_empty 方法
 
 ## 工作流程
 
