@@ -434,7 +434,13 @@ class Scheduler:
             config: Scheduler configuration
         """
         self.model = model
-        self.tokenizer = tokenizer
+        # Deep-copy the tokenizer so the scheduler owns an independent Rust
+        # tokenizer backend.  Without this, concurrent access from the asyncio
+        # event loop (encode/apply_chat_template in engine handlers) and the
+        # MLX executor thread (scheduler.step) causes
+        # "RuntimeError: Already borrowed" from the HuggingFace tokenizers
+        # Rust RefCell.  See: https://github.com/huggingface/tokenizers/issues/537
+        self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
 
         # Load additional EOS tokens from generation_config.json.
@@ -3151,6 +3157,12 @@ class Scheduler:
                 # Clean up temp UID mapping
                 del self.uid_to_request_id[temp_uid]
                 del self.request_id_to_uid[request.request_id]
+
+                # Prefill complete: remove from progress tracker so dashboard
+                # shows "generating" instead of "PP" during decode.
+                from .prefill_progress import get_prefill_tracker
+
+                get_prefill_tracker().remove(request.request_id)
 
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token

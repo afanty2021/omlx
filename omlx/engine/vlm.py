@@ -325,11 +325,17 @@ class VLMBatchedEngine(BaseEngine):
         )
         logger.info("Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled")
 
-        # Extract tokenizer from processor
+        # Extract tokenizer from processor with deep-copy for thread safety.
+        # The processor keeps the original tokenizer for executor-thread work
+        # (_prepare_vision_inputs / prepare_inputs), while this deep copy is
+        # used exclusively on the event loop (apply_chat_template, encode).
+        # Without separate Rust tokenizer backends, concurrent access causes
+        # "RuntimeError: Already borrowed".
+        # See: https://github.com/huggingface/tokenizers/issues/537
         if hasattr(self._processor, "tokenizer"):
-            self._tokenizer = self._processor.tokenizer
+            self._tokenizer = copy.deepcopy(self._processor.tokenizer)
         else:
-            self._tokenizer = self._processor
+            self._tokenizer = copy.deepcopy(self._processor)
 
         # Build mlx-lm decode model for batched decode by sharing VLM weights.
         # mlx-vlm language models may produce degenerated output in batched
@@ -589,8 +595,17 @@ class VLMBatchedEngine(BaseEngine):
             if msg_num_images > 0:
                 image_message_ranges.append((idx, msg_num_images))
 
-            formatted_messages.append(
-                get_message_json(
+            # Preserve tool-related messages verbatim so the chat
+            # template receives tool_calls, tool_call_id, and
+            # tool_responses fields.  get_message_json() strips these,
+            # which makes tool results invisible to the model.
+            if role == "tool" or (
+                role == "assistant"
+                and (msg.get("tool_calls") or msg.get("tool_responses"))
+            ):
+                formatted_messages.append(msg)
+            else:
+                formatted = get_message_json(
                     model_type,
                     content,
                     role,
@@ -599,7 +614,18 @@ class VLMBatchedEngine(BaseEngine):
                     num_images=msg_num_images,
                     num_audios=0,
                 )
-            )
+                # Collapse text-only list content to plain string so that
+                # simplified chat templates (without render_content macro)
+                # can handle it.  Image/audio/video parts stay as list.
+                fc = formatted.get("content")
+                if isinstance(fc, list) and all(
+                    isinstance(p, dict) and p.get("type") == "text"
+                    for p in fc
+                ):
+                    formatted["content"] = "\n".join(
+                        p.get("text", "") for p in fc
+                    )
+                formatted_messages.append(formatted)
 
         return formatted_messages, image_message_ranges
 
