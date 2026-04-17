@@ -8,6 +8,7 @@ import logging
 import platform
 import time
 import webbrowser
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +17,8 @@ import requests
 
 from omlx._version import __version__
 from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
     NSApp,
     NSAppearanceNameDarkAqua,
     NSApplication,
@@ -24,14 +27,24 @@ from AppKit import (
     NSAttributedString,
     NSBundle,
     NSColor,
+    NSFont,
+    NSFontAttributeName,
     NSForegroundColorAttributeName,
     NSImage,
     NSMenu,
     NSMenuItem,
+    NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName,
+    NSRightTabStopType,
     NSStatusBar,
+    NSTextField,
+    NSTextTab,
+    NSTextAlignmentCenter,
     NSVariableStatusItemLength,
+    NSView,
+    NSWorkspace,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer, NSURL
 
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
@@ -91,6 +104,10 @@ class OMLXAppDelegate(NSObject):
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
         self._menu_is_open = False  # True while the status-bar menu is visible
+        # Menubar visibility tracking — Tahoe ControlCenter can hide the item
+        # silently, and isVisible() returns True even when hidden (see issue #725)
+        self._visibility_check_timer = None
+        self._warned_hidden = False
         # Weak references to dynamic menu items for in-place updates
         self._status_header_item = None
         self._stop_item = None
@@ -121,8 +138,6 @@ class OMLXAppDelegate(NSObject):
 
     def _show_fatal_error_and_quit(self, message: str):
         """Show a fatal error dialog and terminate the application."""
-        from AppKit import NSAlert
-
         alert = NSAlert.alloc().init()
         alert.setMessageText_("oMLX Failed to Launch")
         alert.setInformativeText_(message)
@@ -140,6 +155,9 @@ class OMLXAppDelegate(NSObject):
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
         )
+        # Stable identity for ControlCenter so it persists visibility prefs
+        # across app relaunches and distinguishes from previously blocked items.
+        self.status_item.setAutosaveName_("com.omlx.app-statusItem")
         self._update_menubar_icon()
 
         # Build menu
@@ -160,6 +178,9 @@ class OMLXAppDelegate(NSObject):
         # We start as Regular (in main()) so macOS grants full GUI access,
         # then switch here — required on macOS Tahoe where Accessory apps
         # launched via LaunchServices remain "NotVisible" otherwise.
+        # IMPORTANT: Info.plist must NOT contain LSUIElement=true. Combining
+        # LSUIElement with this runtime policy switch causes ControlCenter
+        # to block the NSStatusItem on Sonoma+. See issue #725.
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         NSApp.activateIgnoringOtherApps_(True)
 
@@ -189,6 +210,73 @@ class OMLXAppDelegate(NSObject):
                 self._handle_port_conflict(result)
             else:
                 self._update_status_display()
+
+        # Delayed check: warn user if ControlCenter blocked the status item.
+        # 3s delay gives ControlCenter time to settle its visibility decision.
+        # Retain the timer reference to prevent early dealloc under PyObjC.
+        self._visibility_check_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                3.0, self, "checkStatusItemVisibility:", None, False
+            )
+        )
+
+    def _is_status_item_hidden(self) -> bool:
+        """Detect whether the menubar icon is actually rendered.
+
+        NSStatusItem.isVisible() only reflects app-side setVisible: state; on
+        macOS Tahoe it stays True even when ControlCenter or the Menu Bar
+        toggle hides the item. Checking the button's window frame is the
+        closest public signal — hidden items have no window or a zero-sized
+        one, and an off-screen origin.x indicates a blocked placement.
+        """
+        if self.status_item is None:
+            return True
+        button = self.status_item.button()
+        if button is None:
+            return True
+        window = button.window()
+        if window is None:
+            return True
+        frame = window.frame()
+        if frame.size.width <= 0 or frame.size.height <= 0:
+            return True
+        if frame.origin.x < 0:
+            return True
+        return False
+
+    def checkStatusItemVisibility_(self, timer):
+        """One-shot post-launch check for menubar icon visibility."""
+        if self._is_status_item_hidden():
+            logger.warning(
+                "NSStatusItem appears hidden after launch — likely blocked by "
+                "ControlCenter or disabled in System Settings > Menu Bar."
+            )
+            self._show_menubar_hidden_alert()
+
+    def _show_menubar_hidden_alert(self):
+        """Inform the user and offer a deep link to the Menu Bar settings."""
+        if self._warned_hidden:
+            return
+        self._warned_hidden = True
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("oMLX Menubar Icon Hidden")
+        alert.setInformativeText_(
+            "macOS is hiding the oMLX menubar icon.\n\n"
+            "This happens on macOS Tahoe (26.x) when ControlCenter blocks the "
+            "icon, or when oMLX is toggled off in System Settings > Menu Bar.\n\n"
+            "Click \"Open Menu Bar Settings\" to enable it. If oMLX doesn't "
+            "appear in the list, quit and relaunch oMLX first."
+        )
+        alert.addButtonWithTitle_("Open Menu Bar Settings")
+        alert.addButtonWithTitle_("Dismiss")
+        response = alert.runModal()
+        if response == NSAlertFirstButtonReturn:
+            url = NSURL.URLWithString_(
+                "x-apple.systempreferences:com.apple.ControlCenter-Settings."
+                "extension?MenuBar"
+            )
+            NSWorkspace.sharedWorkspace().openURL_(url)
 
     # --- Icon management ---
 
@@ -506,6 +594,140 @@ class OMLXAppDelegate(NSObject):
             logger.debug(f"Failed to load SF Symbol {sf_symbol}: {e}")
         return None
 
+    def _menu_font(self) -> Optional[NSFont]:
+        """Return the default menu font for measurement and rendering."""
+        try:
+            return NSFont.menuFontOfSize_(0.0)
+        except Exception:
+            return None
+
+    def _measure_menu_text_width(self, text: str, font: Optional[NSFont]) -> float:
+        """Measure menu text width in points, with a safe fallback."""
+        try:
+            attrs = {}
+            if font is not None:
+                attrs[NSFontAttributeName] = font
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                text, attrs
+            )
+            return float(attributed.size().width)
+        except Exception:
+            return float(max(1, len(text)) * 7)
+
+    def _compute_stats_tab_stop(self, entries: list[tuple[str, str]]) -> float:
+        """Compute right-tab position for aligned stats rows."""
+        if not entries:
+            return 240.0
+
+        font = self._menu_font()
+        max_label_width = max(
+            self._measure_menu_text_width(label, font) for label, _ in entries
+        )
+        max_value_width = max(
+            self._measure_menu_text_width(value, font) for _, value in entries
+        )
+
+        gap = 16.0
+        return max(200.0, max_label_width + gap + max_value_width)
+
+    def _format_compact_count(self, value) -> tuple[str, str]:
+        """Format large counts with compact units and return raw full value."""
+        if value is None or isinstance(value, bool):
+            return "--", "--"
+
+        try:
+            if isinstance(value, int):
+                n = Decimal(value)
+            else:
+                s = str(value).strip().replace(",", "")
+                if not s:
+                    return "--", "--"
+                n = Decimal(s)
+        except (InvalidOperation, ValueError, TypeError):
+            return "--", "--"
+
+        is_integer = n == n.to_integral_value()
+        raw_value = f"{int(n):,}" if is_integer else f"{n:,.2f}"
+
+        abs_n = abs(n)
+        units: list[tuple[str, Decimal]] = [
+            ("E", Decimal("1000000000000000000")),  # 10^18
+            ("P", Decimal("1000000000000000")),  # 10^15
+            ("T", Decimal("1000000000000")),  # 10^12
+            ("B", Decimal("1000000000")),  # 10^9
+            ("M", Decimal("1000000")),  # 10^6
+            ("K", Decimal("1000")),  # 10^3
+        ]
+        for suffix, factor in units:
+            if abs_n >= factor:
+                compact = (n / factor).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                return f"{compact}{suffix}", raw_value
+
+        if is_integer:
+            return str(int(n)), raw_value
+        return str(n.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), raw_value
+
+    def _make_aligned_stats_item(
+        self, label: str, value: str, tab_stop: float, tooltip: Optional[str] = None
+    ) -> NSMenuItem:
+        """Create one stats row with left-aligned label and right-aligned value."""
+        plain_text = f"{label}: {value}"
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            plain_text, "noOp:", ""
+        )
+        item.setTarget_(self)
+        if tooltip and tooltip != "--":
+            try:
+                item.setToolTip_(tooltip)
+            except Exception:
+                pass
+
+        try:
+            paragraph = NSMutableParagraphStyle.alloc().init()
+            tab = NSTextTab.alloc().initWithType_location_(
+                NSRightTabStopType, tab_stop
+            )
+            paragraph.setTabStops_([tab])
+
+            attrs = {NSParagraphStyleAttributeName: paragraph}
+            font = self._menu_font()
+            if font is not None:
+                attrs[NSFontAttributeName] = font
+
+            attributed = NSAttributedString.alloc().initWithString_attributes_(
+                f"{label}\t{value}", attrs
+            )
+            item.setAttributedTitle_(attributed)
+        except Exception as e:
+            logger.debug(f"Failed to align stats row '{plain_text}': {e}")
+
+        return item
+
+    def _make_centered_stats_header(self, title: str, row_width: float) -> NSMenuItem:
+        """Create a centered, disabled header item for stats sections."""
+        text = f"── {title} ──"
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(text, None, "")
+        item.setEnabled_(False)
+        header_width = max(220.0, float(row_width))
+
+        view = NSView.alloc().initWithFrame_(((0.0, 0.0), (header_width, 20.0)))
+        label = NSTextField.alloc().initWithFrame_(((0.0, 1.0), (header_width, 18.0)))
+        label.setStringValue_(text)
+        label.setEditable_(False)
+        label.setBordered_(False)
+        label.setDrawsBackground_(False)
+        label.setSelectable_(False)
+        label.setAlignment_(NSTextAlignmentCenter)
+        label.setTextColor_(NSColor.secondaryLabelColor())
+        font = self._menu_font()
+        if font is not None:
+            label.setFont_(font)
+        view.addSubview_(label)
+        item.setView_(view)
+        return item
+
     def _get_status_display(self):
         """Return (text, color) for the current server status header."""
         status = self.server_manager.status
@@ -636,51 +858,76 @@ class OMLXAppDelegate(NSObject):
 
         if is_running and self._cached_stats:
             s = self._cached_stats
+            a = self._cached_alltime_stats or {}
 
-            # Session stats
-            session_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "── Session ──", None, ""
+            session_total_display, session_total_raw = self._format_compact_count(
+                s.get("total_prompt_tokens", 0)
             )
-            session_header.setEnabled_(False)
-            stats_submenu.addItem_(session_header)
+            session_cached_display, session_cached_raw = self._format_compact_count(
+                s.get("total_cached_tokens", 0)
+            )
+            alltime_total_display, alltime_total_raw = self._format_compact_count(
+                a.get("total_prompt_tokens", 0)
+            )
+            alltime_cached_display, alltime_cached_raw = self._format_compact_count(
+                a.get("total_cached_tokens", 0)
+            )
+            alltime_requests_display, alltime_requests_raw = self._format_compact_count(
+                a.get("total_requests", 0)
+            )
 
             session_entries = [
-                ("Total Tokens Processed", f"{s.get('total_prompt_tokens', 0):,}"),
-                ("Cached Tokens", f"{s.get('total_cached_tokens', 0):,}"),
-                ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%"),
-                ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s"),
-                ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s"),
+                (
+                    "Total Tokens Processed",
+                    session_total_display,
+                    session_total_raw,
+                ),
+                ("Cached Tokens", session_cached_display, session_cached_raw),
+                ("Cache Efficiency", f"{s.get('cache_efficiency', 0):.1f}%", None),
+                ("Avg PP Speed", f"{s.get('avg_prefill_tps', 0):.1f} tok/s", None),
+                ("Avg TG Speed", f"{s.get('avg_generation_tps', 0):.1f} tok/s", None),
             ]
-            for label, value in session_entries:
-                text = f"{label}: {value}"
-                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    text, "noOp:", ""
+            alltime_entries = [
+                (
+                    "Total Tokens Processed",
+                    alltime_total_display,
+                    alltime_total_raw,
+                ),
+                ("Cached Tokens", alltime_cached_display, alltime_cached_raw),
+                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%", None),
+                ("Total Requests", alltime_requests_display, alltime_requests_raw),
+            ]
+
+            # One shared tab stop keeps the right value edge aligned across both sections.
+            shared_tab_stop = self._compute_stats_tab_stop(
+                [(label, value) for label, value, _ in (session_entries + alltime_entries)]
+            )
+            header_row_width = shared_tab_stop + 28.0
+
+            # Session stats
+            session_header = self._make_centered_stats_header(
+                "Session", header_row_width
+            )
+            stats_submenu.addItem_(session_header)
+            for label, value, tooltip in session_entries:
+                stats_submenu.addItem_(
+                    self._make_aligned_stats_item(
+                        label, value, shared_tab_stop, tooltip=tooltip
+                    )
                 )
-                mi.setTarget_(self)
-                stats_submenu.addItem_(mi)
 
             # All-time stats
             stats_submenu.addItem_(NSMenuItem.separatorItem())
-            alltime_header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "── All-Time ──", None, ""
+            alltime_header = self._make_centered_stats_header(
+                "All-Time", header_row_width
             )
-            alltime_header.setEnabled_(False)
             stats_submenu.addItem_(alltime_header)
-
-            a = self._cached_alltime_stats or {}
-            alltime_entries = [
-                ("Total Tokens Processed", f"{a.get('total_prompt_tokens', 0):,}"),
-                ("Cached Tokens", f"{a.get('total_cached_tokens', 0):,}"),
-                ("Cache Efficiency", f"{a.get('cache_efficiency', 0):.1f}%"),
-                ("Total Requests", f"{a.get('total_requests', 0):,}"),
-            ]
-            for label, value in alltime_entries:
-                text = f"{label}: {value}"
-                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    text, "noOp:", ""
+            for label, value, tooltip in alltime_entries:
+                stats_submenu.addItem_(
+                    self._make_aligned_stats_item(
+                        label, value, shared_tab_stop, tooltip=tooltip
+                    )
                 )
-                mi.setTarget_(self)
-                stats_submenu.addItem_(mi)
         else:
             off_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Server is off" if not is_running else "Loading stats...",
@@ -941,6 +1188,15 @@ class OMLXAppDelegate(NSObject):
 
         # Always refresh icon in case theme changed
         self._update_menubar_icon()
+
+        # Catch runtime changes: user toggles oMLX off in System Settings
+        # after the 3s one-shot has already fired. Warn once per session.
+        if not self._warned_hidden and self._is_status_item_hidden():
+            logger.warning(
+                "NSStatusItem turned hidden at runtime — user likely toggled "
+                "oMLX off in System Settings > Menu Bar."
+            )
+            self._show_menubar_hidden_alert()
 
     # --- Menu actions ---
 
