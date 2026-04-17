@@ -17,6 +17,8 @@ import requests
 
 from omlx._version import __version__
 from AppKit import (
+    NSAlert,
+    NSAlertFirstButtonReturn,
     NSApp,
     NSAppearanceNameDarkAqua,
     NSApplication,
@@ -40,8 +42,9 @@ from AppKit import (
     NSTextAlignmentCenter,
     NSVariableStatusItemLength,
     NSView,
+    NSWorkspace,
 )
-from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import NSData, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer, NSURL
 
 from .config import ServerConfig
 from .server_manager import PortConflict, ServerManager, ServerStatus
@@ -101,6 +104,10 @@ class OMLXAppDelegate(NSObject):
         self._updater = None  # AppUpdater instance during download
         self._update_progress_text = ""  # Current download progress text
         self._menu_is_open = False  # True while the status-bar menu is visible
+        # Menubar visibility tracking — Tahoe ControlCenter can hide the item
+        # silently, and isVisible() returns True even when hidden (see issue #725)
+        self._visibility_check_timer = None
+        self._warned_hidden = False
         # Weak references to dynamic menu items for in-place updates
         self._status_header_item = None
         self._stop_item = None
@@ -131,8 +138,6 @@ class OMLXAppDelegate(NSObject):
 
     def _show_fatal_error_and_quit(self, message: str):
         """Show a fatal error dialog and terminate the application."""
-        from AppKit import NSAlert
-
         alert = NSAlert.alloc().init()
         alert.setMessageText_("oMLX Failed to Launch")
         alert.setInformativeText_(message)
@@ -207,29 +212,71 @@ class OMLXAppDelegate(NSObject):
                 self._update_status_display()
 
         # Delayed check: warn user if ControlCenter blocked the status item.
-        # 1s delay gives ControlCenter time to settle its visibility decision.
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            1.0, self, "checkStatusItemVisibility:", None, False
+        # 3s delay gives ControlCenter time to settle its visibility decision.
+        # Retain the timer reference to prevent early dealloc under PyObjC.
+        self._visibility_check_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                3.0, self, "checkStatusItemVisibility:", None, False
+            )
         )
 
-    def checkStatusItemVisibility_(self, timer):
-        """One-shot check for ControlCenter blocking the menubar icon."""
-        if self.status_item and not self.status_item.isVisible():
-            logger.warning(
-                "NSStatusItem is not visible — likely blocked by ControlCenter"
-            )
-            from AppKit import NSAlert
+    def _is_status_item_hidden(self) -> bool:
+        """Detect whether the menubar icon is actually rendered.
 
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("Menubar Icon Hidden")
-            alert.setInformativeText_(
-                "macOS is hiding the oMLX menubar icon.\n\n"
-                "To fix this, go to System Settings > Control Center, "
-                "find oMLX under the menu bar items section, "
-                "and set it to \"Show in Menu Bar\"."
+        NSStatusItem.isVisible() only reflects app-side setVisible: state; on
+        macOS Tahoe it stays True even when ControlCenter or the Menu Bar
+        toggle hides the item. Checking the button's window frame is the
+        closest public signal — hidden items have no window or a zero-sized
+        one, and an off-screen origin.x indicates a blocked placement.
+        """
+        if self.status_item is None:
+            return True
+        button = self.status_item.button()
+        if button is None:
+            return True
+        window = button.window()
+        if window is None:
+            return True
+        frame = window.frame()
+        if frame.size.width <= 0 or frame.size.height <= 0:
+            return True
+        if frame.origin.x < 0:
+            return True
+        return False
+
+    def checkStatusItemVisibility_(self, timer):
+        """One-shot post-launch check for menubar icon visibility."""
+        if self._is_status_item_hidden():
+            logger.warning(
+                "NSStatusItem appears hidden after launch — likely blocked by "
+                "ControlCenter or disabled in System Settings > Menu Bar."
             )
-            alert.addButtonWithTitle_("OK")
-            alert.runModal()
+            self._show_menubar_hidden_alert()
+
+    def _show_menubar_hidden_alert(self):
+        """Inform the user and offer a deep link to the Menu Bar settings."""
+        if self._warned_hidden:
+            return
+        self._warned_hidden = True
+
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("oMLX Menubar Icon Hidden")
+        alert.setInformativeText_(
+            "macOS is hiding the oMLX menubar icon.\n\n"
+            "This happens on macOS Tahoe (26.x) when ControlCenter blocks the "
+            "icon, or when oMLX is toggled off in System Settings > Menu Bar.\n\n"
+            "Click \"Open Menu Bar Settings\" to enable it. If oMLX doesn't "
+            "appear in the list, quit and relaunch oMLX first."
+        )
+        alert.addButtonWithTitle_("Open Menu Bar Settings")
+        alert.addButtonWithTitle_("Dismiss")
+        response = alert.runModal()
+        if response == NSAlertFirstButtonReturn:
+            url = NSURL.URLWithString_(
+                "x-apple.systempreferences:com.apple.ControlCenter-Settings."
+                "extension?MenuBar"
+            )
+            NSWorkspace.sharedWorkspace().openURL_(url)
 
     # --- Icon management ---
 
@@ -1141,6 +1188,15 @@ class OMLXAppDelegate(NSObject):
 
         # Always refresh icon in case theme changed
         self._update_menubar_icon()
+
+        # Catch runtime changes: user toggles oMLX off in System Settings
+        # after the 3s one-shot has already fired. Warn once per session.
+        if not self._warned_hidden and self._is_status_item_hidden():
+            logger.warning(
+                "NSStatusItem turned hidden at runtime — user likely toggled "
+                "oMLX off in System Settings > Menu Bar."
+            )
+            self._show_menubar_hidden_alert()
 
     # --- Menu actions ---
 
