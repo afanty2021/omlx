@@ -430,32 +430,40 @@ def diagnose_menubar() -> int:
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         print(f"Menubar app:    check failed ({e})")
 
-    log_path = (
-        Path.home() / "Library" / "Application Support" / "oMLX" / "logs" / "server.log"
-    )
-    print(f"Log file:       {log_path}")
+    log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
+    # menubar.log captures the visibility probe (frame + isVisible);
+    # server.log may carry fallback warnings for older builds.
+    log_candidates = [log_dir / "menubar.log", log_dir / "server.log"]
+    print(f"Log dir:        {log_dir}")
 
-    if log_path.exists():
+    hits: list[tuple[str, str]] = []
+    for path in log_candidates:
+        if not path.exists():
+            continue
         try:
-            with open(log_path, "rb") as f:
+            with open(path, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
-                f.seek(max(0, size - 65536))
+                f.seek(max(0, size - 131072))
                 tail = f.read().decode("utf-8", errors="replace")
-            hits = [
-                ln for ln in tail.splitlines()
-                if "NSStatusItem" in ln or "ControlCenter" in ln or "hidden" in ln.lower()
-            ]
-            if hits:
-                print("\nRecent visibility log entries (last 5):")
-                for ln in hits[-5:]:
-                    print(f"  {ln}")
-            else:
-                print("\nNo visibility warnings found in log tail.")
         except OSError as e:
-            print(f"\nCould not read log: {e}")
+            print(f"Could not read {path.name}: {e}")
+            continue
+        for ln in tail.splitlines():
+            if (
+                "menubar visibility probe" in ln
+                or "NSStatusItem" in ln
+                or "ControlCenter" in ln
+                or "Menu Bar" in ln
+            ):
+                hits.append((path.name, ln))
+
+    if hits:
+        print("\nRecent visibility log entries (last 10):")
+        for src, ln in hits[-10:]:
+            print(f"  [{src}] {ln}")
     else:
-        print("\nLog file not found (app hasn't run yet?).")
+        print("\nNo visibility log entries found (app may not have probed yet).")
 
     print()
     print("If the icon is missing on macOS Tahoe (26.x):")
