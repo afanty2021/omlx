@@ -190,11 +190,13 @@ def get_tokenizer_config(
         config["eos_token"] = "<|im_end|>"
         logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
 
-    # Apply Gemma 4 fix: clear extra_special_tokens to avoid transformers error
-    # Gemma 4 models have extra_special_tokens as a list, but transformers expects dict or None
+    # Gemma 4 models: Set extra_special_tokens to empty dict to avoid AttributeError
+    # Gemma 4 configs have extra_special_tokens as a list, but transformers expects a dict.
+    # Setting it to an empty dict overrides the config value and prevents:
+    # "AttributeError: 'list' object has no attribute 'keys'"
     if is_gemma4_model(model_name):
-        config["extra_special_tokens"] = None
-        logger.info("Gemma 4 detected: clearing extra_special_tokens to avoid tokenizer error")
+        config["extra_special_tokens"] = {}
+        logger.debug("Gemma 4 detected: overriding extra_special_tokens to empty dict")
 
     return config
 
