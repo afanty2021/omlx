@@ -190,6 +190,12 @@ def get_tokenizer_config(
         config["eos_token"] = "<|im_end|>"
         logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
 
+    # Apply Gemma 4 fix: clear extra_special_tokens to avoid transformers error
+    # Gemma 4 models have extra_special_tokens as a list, but transformers expects dict or None
+    if is_gemma4_model(model_name):
+        config["extra_special_tokens"] = None
+        logger.info("Gemma 4 detected: clearing extra_special_tokens to avoid tokenizer error")
+
     return config
 
 
