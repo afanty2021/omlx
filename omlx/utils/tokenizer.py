@@ -198,6 +198,13 @@ def get_tokenizer_config(
         config["extra_special_tokens"] = {}
         logger.debug("Gemma 4 detected: overriding extra_special_tokens to empty dict")
 
+    # Fix for Qwen3.5/3.6-A3B models with broken tokenizer_class
+    # These MLX-quantized models have "tokenizer_class": "TokenizersBackend" which
+    # doesn't exist in transformers. We need to override it to "Qwen2Tokenizer".
+    if ("Qwen3.5" in model_name or "Qwen3.6" in model_name) and "A3B" in model_name:
+        config["tokenizer_class"] = "Qwen2Tokenizer"
+        logger.debug(f"{model_name}: overriding tokenizer_class to Qwen2Tokenizer")
+
     return config
 
 

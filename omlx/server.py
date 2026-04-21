@@ -1541,59 +1541,32 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
 
-        # Get the actual model
-        actual_model_id = None
+        # Add all available models
         for m in status["models"]:
-            actual_model_id = m["id"]
-            break
+            model_id = m["id"]
+            model_type = m.get("model_type", "llm")
 
-        if not actual_model_id:
-            return ModelsResponse(data=models)
+            # Get display name (alias if set)
+            display_id = model_id
+            if settings_manager:
+                ms = settings_manager.get_settings(model_id)
+                if ms.model_alias:
+                    display_id = ms.model_alias
 
-        # Get display name (alias if set)
-        display_id = actual_model_id
-        if settings_manager:
-            ms = settings_manager.get_settings(actual_model_id)
-            if ms.model_alias:
-                display_id = ms.model_alias
+            # Get max tokens for capabilities
+            max_tok = get_max_context_window(model_id)
 
-        # Get max tokens for capabilities
-        max_tok = get_max_context_window(actual_model_id)
+            # Determine capabilities based on model type
+            is_vlm = model_type == "vlm"
 
-        # Add the actual model
-        models.append(
-            ModelInfo(
-                id=display_id,
-                owned_by="omlx",
-                capabilities={
-                    "type": "text",
-                    "streaming": True,
-                    "vision": False,
-                    "function_calling": True,
-                    "max_tokens": max_tok,
-                },
-            )
-        )
-
-        # Add Claude-compatible aliases for easier client integration
-        claude_aliases = [
-            "claude-3-opus",
-            "claude-3-sonnet",
-            "claude-3-haiku",
-            "claude-opus-4",
-            "claude-sonnet-4",
-            "claude-haiku-4",
-        ]
-
-        for alias in claude_aliases:
             models.append(
                 ModelInfo(
-                    id=alias,
+                    id=display_id,
                     owned_by="omlx",
                     capabilities={
-                        "type": "text",
+                        "type": "text" if not is_vlm else "vision",
                         "streaming": True,
-                        "vision": False,
+                        "vision": is_vlm,
                         "function_calling": True,
                         "max_tokens": max_tok,
                     },
