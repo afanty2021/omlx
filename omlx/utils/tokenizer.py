@@ -196,7 +196,11 @@ def get_tokenizer_config(
     # "AttributeError: 'list' object has no attribute 'keys'"
     if is_gemma4_model(model_name):
         config["extra_special_tokens"] = {}
-        logger.debug("Gemma 4 detected: overriding extra_special_tokens to empty dict")
+        # Override tokenizer_class to GemmaTokenizer (Gemma 2/3 tokenizer) for compatibility
+        # with transformers <5.4.0. Gemma 4 support was added in transformers 5.5.0+.
+        # GemmaTokenizer is backward compatible and works with Gemma 4 models.
+        config["tokenizer_class"] = "GemmaTokenizer"
+        logger.debug("Gemma 4 detected: overriding extra_special_tokens to empty dict, tokenizer_class to GemmaTokenizer")
 
     # Fix for Qwen3.5/3.6-A3B models with broken tokenizer_class
     # These MLX-quantized models have "tokenizer_class": "TokenizersBackend" which
