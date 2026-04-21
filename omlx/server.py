@@ -1541,59 +1541,32 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
 
-        # Get the actual model
-        actual_model_id = None
+        # Add all available models
         for m in status["models"]:
-            actual_model_id = m["id"]
-            break
+            model_id = m["id"]
+            model_type = m.get("model_type", "llm")
 
-        if not actual_model_id:
-            return ModelsResponse(data=models)
+            # Get display name (alias if set)
+            display_id = model_id
+            if settings_manager:
+                ms = settings_manager.get_settings(model_id)
+                if ms.model_alias:
+                    display_id = ms.model_alias
 
-        # Get display name (alias if set)
-        display_id = actual_model_id
-        if settings_manager:
-            ms = settings_manager.get_settings(actual_model_id)
-            if ms.model_alias:
-                display_id = ms.model_alias
+            # Get max tokens for capabilities
+            max_tok = get_max_context_window(model_id)
 
-        # Get max tokens for capabilities
-        max_tok = get_max_context_window(actual_model_id)
+            # Determine capabilities based on model type
+            is_vlm = model_type == "vlm"
 
-        # Add the actual model
-        models.append(
-            ModelInfo(
-                id=display_id,
-                owned_by="omlx",
-                capabilities={
-                    "type": "text",
-                    "streaming": True,
-                    "vision": False,
-                    "function_calling": True,
-                    "max_tokens": max_tok,
-                },
-            )
-        )
-
-        # Add Claude-compatible aliases for easier client integration
-        claude_aliases = [
-            "claude-3-opus",
-            "claude-3-sonnet",
-            "claude-3-haiku",
-            "claude-opus-4",
-            "claude-sonnet-4",
-            "claude-haiku-4",
-        ]
-
-        for alias in claude_aliases:
             models.append(
                 ModelInfo(
-                    id=alias,
+                    id=display_id,
                     owned_by="omlx",
                     capabilities={
-                        "type": "text",
+                        "type": "text" if not is_vlm else "vision",
                         "streaming": True,
-                        "vision": False,
+                        "vision": is_vlm,
                         "function_calling": True,
                         "max_tokens": max_tok,
                     },
@@ -2008,6 +1981,9 @@ async def create_chat_completion(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -2118,6 +2094,13 @@ async def create_chat_completion(
     # kwarg is True.
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking when thinking is active.  Qwen 3.6+
+    # templates strip <think> blocks from historical turns by default,
+    # which breaks KV prefix cache reuse.  Always preserve unless the
+    # user explicitly opted out.
+    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
     # When a reasoning_parser is configured, the structural tag includes
@@ -3246,6 +3229,9 @@ async def create_anthropic_message(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -3314,6 +3300,10 @@ async def create_anthropic_message(
     # the Anthropic thinking.type field above or model settings).
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
+    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
 
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
@@ -3628,6 +3618,9 @@ async def create_response(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already
@@ -3730,6 +3723,10 @@ async def create_response(
     # Auto-set enable_thinking when thinking budget is active.
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
+
+    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
+    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
     if compiled_grammar is not None:

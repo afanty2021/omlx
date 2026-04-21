@@ -257,6 +257,7 @@ class DiscoveredModel:
     estimated_size: int  # Estimated memory usage in bytes
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
+    preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -438,12 +439,17 @@ def detect_model_type(model_path: Path) -> ModelType:
     # For model families known to have text-only variants, require vision_config.
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
-            if normalized_type in VLM_MODEL_TYPES and "vision_config" not in config:
-                logger.info(
-                    f"Architecture '{arch}' is a VLM architecture but no vision_config "
-                    "found — treating as LLM (text-only quant)"
-                )
-                break
+            # Special handling for Gemma 4: check if it's a quantized text-only version
+            # Quantized versions often keep vision_config in config.json but lack vision weights
+            if normalized_type in VLM_MODEL_TYPES:
+                model_dir_lower = str(model_path).lower()
+                is_quantized = any(q in model_dir_lower for q in ["4bit", "8bit", "quant", "gguf"])
+                if is_quantized or "vision_config" not in config:
+                    logger.info(
+                        f"Architecture '{arch}' is a VLM architecture but this appears to be "
+                        f"a text-only quant (no vision weights) — treating as LLM"
+                    )
+                    break
             return "vlm"
 
     # Check for VLM: model_type field (only if vision capabilities are present)
@@ -537,6 +543,40 @@ def detect_thinking_default(model_path: Path) -> bool | None:
         return False  # OFF by default (Gemma pattern)
 
     return None
+
+
+def detect_preserve_thinking(model_path: Path) -> bool | None:
+    """Detect whether a model's chat template supports ``preserve_thinking``.
+
+    Qwen 3.6+ templates strip ``<think>`` blocks from historical assistant
+    turns by default and only keep them when ``preserve_thinking`` is true.
+    Stripping breaks KV prefix cache reuse, so we default to True when the
+    template supports this flag.
+
+    Returns:
+        True if the template references ``preserve_thinking`` (should be
+        enabled), None otherwise (template has no such flag).
+    """
+    template_text = None
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            template_text = jinja_path.read_text(encoding="utf-8")
+
+    if template_text is None:
+        tc_path = model_path / "tokenizer_config.json"
+        if tc_path.exists():
+            try:
+                with open(tc_path) as f:
+                    tc = json.load(f)
+                template_text = tc.get("chat_template")
+            except Exception:
+                pass
+
+    if not template_text or "preserve_thinking" not in template_text:
+        return None
+
+    return True
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -653,6 +693,7 @@ def _register_model(
             pass
 
         thinking_default = detect_thinking_default(model_dir)
+        preserve_thinking_default = detect_preserve_thinking(model_dir)
 
         models[model_id] = DiscoveredModel(
             model_id=model_id,
@@ -662,6 +703,7 @@ def _register_model(
             estimated_size=estimated_size,
             config_model_type=config_model_type,
             thinking_default=thinking_default,
+            preserve_thinking_default=preserve_thinking_default,
         )
 
         size_gb = estimated_size / (1024**3)

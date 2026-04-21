@@ -119,6 +119,7 @@ class _PrefillAbortedError(Exception):
 # TEMPORARILY DISABLED: GenerationBatch not available in mlx-lm 0.31.2
 # TODO: Re-enable when mlx-lm adds GenerationBatch back or alternative is found
 # ---------------------------------------------------------------------------
+# NOTE: Re-enabled in mlx-lm commit dcbf6e3 - GenerationBatch is now available
 _original_generation_batch_step = GenerationBatch._step
 
 def _patched_generation_batch_step(self):
