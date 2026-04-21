@@ -68,7 +68,8 @@ dependencies = [
     "mlx-vlm @ file:///Users/berton/Github/mlx-vlm",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    # Using local path for development (from /Users/berton/Github/dflash-mlx)
+    "dflash-mlx @ file:///Users/berton/Github/dflash-mlx",
 ]
 
 [project.optional-dependencies]
