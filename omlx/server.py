@@ -1990,7 +1990,12 @@ async def create_chat_completion(
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
-    # Extract messages - different engines need different content handling
+    # Extract messages - different engines need different content handling.
+    # Templates that expose message.reasoning_content natively (Qwen 3.6+)
+    # get reasoning as a separate field; others fall back to <think> inlined
+    # in content.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     is_vlm = isinstance(engine, VLMBatchedEngine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
@@ -1998,11 +2003,17 @@ async def create_chat_completion(
     elif is_vlm:
         # VLM: preserve image_url content parts for vision processing
         messages = extract_multimodal_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
         )
     else:
         messages = extract_text_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
         )
 
     # Compile grammar for structured output (logit-level enforcement).
@@ -2095,11 +2106,16 @@ async def create_chat_completion(
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
 
-    # Auto-set preserve_thinking when thinking is active.  Qwen 3.6+
-    # templates strip <think> blocks from historical turns by default,
-    # which breaks KV prefix cache reuse.  Always preserve unless the
-    # user explicitly opted out.
-    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
+    # today but strict templates could raise, so gate on the detected flag.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
         merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
@@ -3255,6 +3271,8 @@ async def create_anthropic_message(
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request, max_tool_result_tokens, engine.tokenizer
@@ -3263,6 +3281,7 @@ async def create_anthropic_message(
         messages = convert_anthropic_to_internal(
             request, max_tool_result_tokens, engine.tokenizer,
             preserve_images=is_vlm,
+            native_reasoning_content=native_reasoning,
         )
 
     # Apply model-specific message extraction (e.g. Gemma 4 converts
@@ -3301,8 +3320,16 @@ async def create_anthropic_message(
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
 
-    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
-    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Gated on detection so other templates don't
+    # receive an unknown kwarg.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
         merged_ct_kwargs["preserve_thinking"] = True
 
     # Merge MCP tools with user-provided Anthropic tools
@@ -3724,8 +3751,16 @@ async def create_response(
     if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
         merged_ct_kwargs["enable_thinking"] = True
 
-    # Auto-set preserve_thinking when thinking is active (Qwen 3.6+).
-    if merged_ct_kwargs.get("enable_thinking") is not False and "preserve_thinking" not in merged_ct_kwargs:
+    # Auto-set preserve_thinking only when the template advertises support
+    # for it (Qwen 3.6+). Gated on detection so other templates don't
+    # receive an unknown kwarg.
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
         merged_ct_kwargs["preserve_thinking"] = True
 
     # Add compiled grammar for logit-level structured output.
