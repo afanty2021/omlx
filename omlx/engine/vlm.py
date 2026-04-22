@@ -180,6 +180,15 @@ class VLMBatchedEngine(BaseEngine):
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
+
+        # Gemma 4 模型需要启用 thinking 模式以避免输出乱码
+        # 如果用户未明确设置 enable_thinking，则为 Gemma 4 模型自动设置为 True
+        if enable_thinking is None:
+            from ..utils.tokenizer import is_gemma4_model
+            if is_gemma4_model(model_name):
+                logger.info("Gemma 4 model detected: automatically setting enable_thinking=True")
+                enable_thinking = True
+
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
 
@@ -295,6 +304,12 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
+        # Build tokenizer config with model-specific fixes (e.g., Gemma 4)
+        tokenizer_config = get_tokenizer_config(
+            self._model_name,
+            trust_remote_code=self._trust_remote_code,
+        )
+
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
@@ -304,7 +319,7 @@ class VLMBatchedEngine(BaseEngine):
             # when torchvision is not available (extractors is None, `in` fails).
             # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
-            return vlm_load(self._model_name)
+            return vlm_load(self._model_name, tokenizer_config=tokenizer_config)
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(

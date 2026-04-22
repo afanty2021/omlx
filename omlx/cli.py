@@ -222,11 +222,8 @@ def serve_command(args):
     else:
         scheduler_config.hot_cache_max_size = 0
 
-    # Clear SSD cache on unload: CLI arg > settings
-    scheduler_config.clear_ssd_cache_on_unload = (
-        args.paged_ssd_cache_clear_on_unload or
-        settings.paged_ssd_cache.clear_on_unload
-    )
+    # Clear SSD cache on unload: CLI arg (currently no settings file support)
+    scheduler_config.clear_ssd_cache_on_unload = args.paged_ssd_cache_clear_on_unload
 
     if args.no_cache:
         print("Mode: Multi-model serving (no oMLX cache, mlx-lm BatchGenerator only)")
