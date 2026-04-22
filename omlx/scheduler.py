@@ -322,6 +322,7 @@ class SchedulerConfig:
     paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
+    clear_ssd_cache_on_unload: bool = False  # Clear SSD cache when model is unloaded (useful for benchmarking)
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
