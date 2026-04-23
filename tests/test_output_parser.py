@@ -155,6 +155,33 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
 
+    def test_gemma4_stop_token_ids(self):
+        """Test that Gemma 4 parser includes stop token IDs."""
+        # Create a mock tokenizer with Gemma 4 special tokens
+        class Gemma4TokenizerWithSpecialTokens:
+            def __init__(self):
+                self.added_tokens_decoder = {
+                    47: {"content": "<tool|>"},
+                    49: {"content": "<tool_call|>"},
+                    101: {"content": "<channel|>"},
+                    106: {"content": "<turn|>"},
+                }
+
+        tokenizer = Gemma4TokenizerWithSpecialTokens()
+        factory = detect_output_parser(
+            "google/gemma-4-31b-it",
+            tokenizer,
+            {"model_type": "gemma4"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "gemma4"
+        # Verify that stop token IDs include the key Gemma 4 markers
+        assert 106 in factory.stop_token_ids  # <turn|> - primary stop signal
+        assert 101 in factory.stop_token_ids  # <channel|> - end of channel
+        assert 47 in factory.stop_token_ids   # <tool|>
+        assert 49 in factory.stop_token_ids   # <tool_call|>
+
     def test_harmony_wrapper_regression(self):
         encoding = load_harmony_encoding("HarmonyGptOss")
         tokenizer = HarmonyTokenizer(encoding)

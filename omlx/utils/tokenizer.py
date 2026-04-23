@@ -194,6 +194,8 @@ def get_tokenizer_config(
     # Gemma 4 configs have extra_special_tokens as a list, but transformers expects a dict.
     # Setting it to an empty dict overrides the config value and prevents:
     # "AttributeError: 'list' object has no attribute 'keys'"
+    # Note: The actual fix happens in _patch_gemma4_tokenizer_config() which converts
+    # the list to dict at model load time. This empty dict is just a fallback.
     if is_gemma4_model(model_name):
         config["extra_special_tokens"] = {}
         # Override tokenizer_class to GemmaTokenizer (Gemma 2/3 tokenizer) for compatibility

@@ -94,6 +94,47 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
 _video_processor_patched = False
 
 
+def _patch_gemma4_tokenizer_config(model_path: str) -> None:
+    """Patch Gemma 4 tokenizer_config.json to fix extra_special_tokens format.
+
+    Some Gemma 4 models have extra_special_tokens as a list instead of a dict,
+    which causes AttributeError in transformers. This function converts it to
+    the correct dict format.
+    """
+    from pathlib import Path
+
+    tokenizer_config_path = Path(model_path) / "tokenizer_config.json"
+    if not tokenizer_config_path.exists():
+        logger.debug(f"No tokenizer_config.json found at {model_path}")
+        return
+
+    import json
+
+    try:
+        with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        # Check if extra_special_tokens is a list
+        extra_tokens = config.get("extra_special_tokens")
+        if isinstance(extra_tokens, list):
+            logger.warning(
+                f"Patching tokenizer_config.json: extra_special_tokens is a list "
+                f"({len(extra_tokens)} items), converting to dict"
+            )
+            # Convert list to dict format
+            config["extra_special_tokens"] = {
+                token: token for token in extra_tokens if token
+            }
+
+            # Write back the fixed config
+            with open(tokenizer_config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Patched tokenizer_config.json at {model_path}")
+    except Exception as e:
+        logger.warning(f"Failed to patch tokenizer_config.json: {e}")
+
+
 def _patch_video_processor_bug():
     """Remove video_processor from transformers' auto-processor mapping.
 
@@ -180,15 +221,6 @@ class VLMBatchedEngine(BaseEngine):
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
-
-        # Gemma 4 模型需要启用 thinking 模式以避免输出乱码
-        # 如果用户未明确设置 enable_thinking，则为 Gemma 4 模型自动设置为 True
-        if enable_thinking is None:
-            from ..utils.tokenizer import is_gemma4_model
-            if is_gemma4_model(model_name):
-                logger.info("Gemma 4 model detected: automatically setting enable_thinking=True")
-                enable_thinking = True
-
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
 
@@ -319,6 +351,10 @@ class VLMBatchedEngine(BaseEngine):
             # when torchvision is not available (extractors is None, `in` fails).
             # oMLX does not support video input, so we skip video processing.
             _patch_video_processor_bug()
+
+            # Patch Gemma 4 tokenizer_config.json if extra_special_tokens is a list
+            _patch_gemma4_tokenizer_config(self._model_name)
+
             return vlm_load(self._model_name, tokenizer_config=tokenizer_config)
 
         loop = asyncio.get_running_loop()

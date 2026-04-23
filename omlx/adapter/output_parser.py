@@ -9,8 +9,11 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
+
+logger = logging.getLogger(__name__)
 
 try:
     from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
@@ -142,6 +145,53 @@ class HarmonyOutputParserSession:
         )
 
 
+def _get_gemma4_stop_token_ids(tokenizer: Any) -> set[int]:
+    """Get stop token IDs for Gemma 4 models.
+
+    Gemma 4 uses special tokens for protocol markers:
+    - <turn|> (ID 106): End of turn - primary stop signal
+    - <channel|> (ID 101): End of channel marker
+    - <tool|> (ID 47), <tool_call|> (ID 49): Tool-related markers
+
+    Returns:
+        Set of stop token IDs for Gemma 4 models.
+    """
+    stop_ids = set()
+
+    # Try to get token IDs from added_tokens
+    if hasattr(tokenizer, "added_tokens_decoder"):
+        logger.debug(f"Tokenizer has added_tokens_decoder: {type(tokenizer.added_tokens_decoder)}")
+        # Format: {token_id: {"content": "..."}}
+        for token_id, token_info in tokenizer.added_tokens_decoder.items():
+            content = token_info.get("content", "") if isinstance(token_info, dict) else ""
+            # Add stop tokens for turn end and tool markers
+            if content in ("<turn|>", "<channel|>", "<tool|>", "<tool_call|>"):
+                stop_ids.add(token_id)
+                logger.debug(f"Found stop token from added_tokens_decoder: {content} -> {token_id}")
+    else:
+        logger.debug("Tokenizer does not have added_tokens_decoder attribute")
+
+    # Fallback: try encoding the stop strings
+    if not stop_ids:
+        logger.debug("No stop IDs found in added_tokens_decoder, trying convert_tokens_to_ids fallback")
+        try:
+            for stop_str in ("<turn|>", "<channel|>", "<tool|>", "<tool_call|>"):
+                # Try convert_tokens_to_ids (HuggingFace style)
+                if hasattr(tokenizer, "convert_tokens_to_ids"):
+                    token_id = tokenizer.convert_tokens_to_ids(stop_str)
+                    unk_id = tokenizer.unk_token_id if hasattr(tokenizer, "unk_token_id") else 0
+                    if token_id and token_id not in (0, unk_id):
+                        stop_ids.add(token_id)
+                        logger.debug(f"Found stop token via convert_tokens_to_ids: {stop_str} -> {token_id}")
+                    else:
+                        logger.debug(f"convert_tokens_to_ids returned invalid ID for {stop_str}: {token_id}")
+        except Exception as e:
+            logger.warning(f"Error in convert_tokens_to_ids fallback: {e}")
+
+    logger.info(f"Gemma 4 stop token IDs resolved: {sorted(stop_ids) if stop_ids else 'None'}")
+    return stop_ids
+
+
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
@@ -160,10 +210,15 @@ def detect_output_parser(
     if is_gemma4_model(model_name, model_config):
         from .gemma4 import Gemma4OutputParserSession
 
+        stop_ids = _get_gemma4_stop_token_ids(tokenizer)
+        logger.info(
+            f"Gemma 4 output parser detected for {model_name}, "
+            f"stop_token_ids={sorted(stop_ids) if stop_ids else 'None'}"
+        )
         return OutputParserFactory(
             kind="gemma4",
             create_session=Gemma4OutputParserSession,
-            stop_token_ids=set(),
+            stop_token_ids=stop_ids,
         )
 
     return None
