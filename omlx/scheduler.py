@@ -48,9 +48,16 @@ def _sync_and_clear_cache():
     'completeMemory() prepare count underflow' kernel panic on M4 hardware
     (and SIGSEGV/SIGABRT on M3).
 
-    See: https://github.com/jundot/omlx/issues/300
+    See: https://github.com/jundot/omlx/issues/300, #888
     """
-    mx.synchronize(generation_stream)
+    # Generation_stream may not have in-flight work on the current thread
+    # (e.g. external prefill submits to the default stream). On some MLX
+    # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+    # thread" in that case; swallow it since there is nothing to drain.
+    try:
+        mx.synchronize(generation_stream)
+    except RuntimeError:
+        pass
     mx.synchronize()  # default stream
     mx.clear_cache()
 
@@ -320,6 +327,7 @@ class SchedulerConfig:
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
     # When None, no oMLX caching (mlx-lm BatchGenerator manages KV internally).
     paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
+    hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     clear_ssd_cache_on_unload: bool = False  # Clear SSD cache when model is unloaded (useful for benchmarking)
@@ -4064,11 +4072,14 @@ class Scheduler:
             return
 
         try:
+            cache_dir = Path(self.config.paged_ssd_cache_dir) if self.config.paged_ssd_cache_dir else None
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
-                cache_dir=Path(self.config.paged_ssd_cache_dir),
+                cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
+                hot_cache_only=self.config.hot_cache_only,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -4081,7 +4092,8 @@ class Scheduler:
 
             # Initialize boundary snapshot SSD store for offloading
             # non-sliceable cache snapshots during prefill.
-            if BoundarySnapshotSSDStore is not None:
+            # Skip in hot_cache_only mode since snapshots would never be written.
+            if BoundarySnapshotSSDStore is not None and not self.config.hot_cache_only:
                 try:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir)

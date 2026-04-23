@@ -339,6 +339,7 @@ async def lifespan(app: FastAPI):
                 max_bytes=max_bytes,
                 settings_manager=_server_state.settings_manager,
                 prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
+                global_settings=_server_state.global_settings,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -353,7 +354,9 @@ async def lifespan(app: FastAPI):
                 try:
                     if _server_state.settings_manager is not None:
                         await _server_state.engine_pool.check_ttl_expirations(
-                            _server_state.settings_manager
+                            _server_state.settings_manager,
+                            global_idle_timeout_seconds=_server_state.global_settings.idle_timeout.idle_timeout_seconds
+                            if _server_state.global_settings else None,
                         )
                 except asyncio.CancelledError:
                     break
@@ -1767,10 +1770,13 @@ async def create_rerank(
 
     engine = await get_reranker_engine(request.model)
 
-    # Normalize documents to list of strings
-    documents = normalize_documents(request.documents)
+    # Preserve original structure for the engine (multimodal rerankers need
+    # dicts with 'image'), but keep a normalized text view for logging and
+    # emptiness checks.
+    documents_raw = request.documents
+    documents_text = normalize_documents(documents_raw)
 
-    if not documents:
+    if not documents_text:
         raise HTTPException(status_code=400, detail="Documents cannot be empty")
 
     if not request.query:
@@ -1781,23 +1787,30 @@ async def create_rerank(
 
     output = await engine.rerank(
         query=request.query,
-        documents=documents,
+        documents=documents_raw,
         top_n=request.top_n,
     )
 
     elapsed = time.perf_counter() - start_time
     logger.info(
-        f"Rerank: {len(documents)} docs, "
+        f"Rerank: {len(documents_raw)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
 
-    # Format response - results sorted by score (descending)
+    # Format response - results sorted by score (descending). Strings wrap
+    # into {"text": "..."}; dict inputs pass through as-is so multimodal
+    # callers get their original 'image' back.
     results = []
     for idx in output.indices:
+        if request.return_documents:
+            orig = documents_raw[idx]
+            display_doc = orig if isinstance(orig, dict) else {"text": orig}
+        else:
+            display_doc = None
         result = RerankResult(
             index=idx,
             relevance_score=output.scores[idx],
-            document={"text": documents[idx]} if request.return_documents else None,
+            document=display_doc,
         )
         results.append(result)
 
@@ -1899,7 +1912,7 @@ async def create_completion(
             completion_tokens=total_completion_tokens,
             cached_tokens=total_cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolve_model_id(request.model) or request.model,
         )
 
         return CompletionResponse(
@@ -2177,7 +2190,7 @@ async def create_chat_completion(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Separate thinking from content
@@ -2560,7 +2573,7 @@ async def stream_completion(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolve_model_id(request.model) or request.model,
         )
 
         # Emit usage chunk if requested
@@ -2868,7 +2881,7 @@ async def stream_chat_completion(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
 
         # Emit usage chunk if requested
@@ -3183,7 +3196,7 @@ async def stream_anthropic_messages(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=end_time - (first_token_time or start_time),
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
 
     # 7. Send message_stop
@@ -3410,7 +3423,7 @@ async def create_anthropic_message(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Separate thinking from content
@@ -3816,7 +3829,7 @@ async def create_response(
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
-            model_id=request.model,
+            model_id=resolved_model,
         )
 
         # Process output text
@@ -4261,7 +4274,7 @@ async def stream_responses_api(
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
             generation_duration=gen_duration,
-            model_id=request.model,
+            model_id=resolved_model or request.model,
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
