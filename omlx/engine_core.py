@@ -46,11 +46,29 @@ def _init_mlx_thread() -> None:
 
     Fix: create a thread-local stream HERE and replace the module-level
     ``generation_stream`` in mlx_lm, mlx_vlm, and omlx.scheduler.
+
+    Note: Falls back to new_stream() if new_thread_local_stream() is not
+    available (MLX < 0.31.3). This provides compatibility but may have
+    reduced thread safety.
     """
     import sys
     import mlx.core as mx
 
-    stream = mx.new_thread_local_stream(mx.default_device())
+    try:
+        # Try thread-local stream first (MLX >= 0.31.3)
+        if hasattr(mx, 'new_thread_local_stream'):
+            stream = mx.new_thread_local_stream(mx.default_device())
+            logger.debug("Using mx.new_thread_local_stream (thread-local)")
+        else:
+            # Fallback to regular stream for older MLX versions
+            stream = mx.new_stream(mx.default_device())
+            logger.warning(
+                "Using mx.new_stream (non-thread-local) - "
+                "consider upgrading MLX to >=0.31.3 for better thread safety"
+            )
+    except Exception as e:
+        logger.error(f"Failed to create MLX stream: {e}")
+        raise
 
     gen_mod = sys.modules.get("mlx_lm.generate")
     if gen_mod is not None:
@@ -67,6 +85,38 @@ def _init_mlx_thread() -> None:
     logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
 
 
+def _is_executor_broken(executor: concurrent.futures.ThreadPoolExecutor) -> bool:
+    """Check if a thread pool executor is broken.
+
+    An executor is considered broken if:
+    - It has been shutdown
+    - Submitting a task raises BrokenThreadPool
+
+    Args:
+        executor: The executor to check
+
+    Returns:
+        True if the executor is broken, False otherwise
+    """
+    if executor is None:
+        return True
+
+    # Check if shutdown
+    if executor._shutdown:
+        return True
+
+    # Try submitting a simple task to verify it works
+    try:
+        future = executor.submit(lambda: None)
+        future.result(timeout=1.0)
+        return False
+    except (concurrent.futures.BrokenThreadPool, RuntimeError):
+        return True
+    except Exception:
+        # Other exceptions (timeout, cancellation) don't mean broken
+        return False
+
+
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
@@ -74,13 +124,29 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     (generation_stream), so ALL MLX GPU operations across all models
     MUST be serialized onto one thread to prevent Metal command buffer
     races that cause segfaults. See issue #85.
+
+    If the existing executor is broken, it will be shutdown and a new
+    one will be created automatically.
     """
     global _global_mlx_executor
-    if _global_mlx_executor is None:
+
+    # Check if we need to create or recreate the executor
+    if _global_mlx_executor is None or _is_executor_broken(_global_mlx_executor):
+        if _global_mlx_executor is not None:
+            logger.warning(
+                "MLX executor is broken, shutting down and creating a new one"
+            )
+            try:
+                _global_mlx_executor.shutdown(wait=False)
+            except Exception:
+                pass  # Ignore errors during shutdown
+
+        logger.info("Creating new MLX executor")
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mlx-global",
             initializer=_init_mlx_thread,
         )
+
     return _global_mlx_executor
 
 

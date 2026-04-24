@@ -38,16 +38,82 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     in history. Anything other than a dict must be coerced to "{}" here so
     we never hand the client a non-JSON value that the next turn's template
     would crash on.
+
+    Note: Some parsers (e.g., mlx-vlm's Gemma 4 parser) already return
+    arguments as a JSON string per the OpenAI spec. In this case, we validate
+    and return the string as-is.
     """
+    # Case 1: Already a JSON string (e.g., from mlx-vlm Gemma 4 parser)
+    if isinstance(arguments, str):
+        # Validate that it's valid JSON
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                # Workaround for mlx-vlm Gemma 4 parser bug:
+                # The parser may return keys with embedded quotes like '"key"'
+                # We need to clean these up before returning
+                if _has_quoted_keys(parsed):
+                    cleaned = _clean_quoted_keys(parsed)
+                    return json.dumps(cleaned, ensure_ascii=False)
+                return arguments
+            # Not a dict/object, warn and return empty object
+            logger.warning(
+                "Tool parser returned JSON string but it's not an object (type=%s); "
+                "coercing to empty object. Value: %.200r",
+                type(parsed).__name__,
+                arguments,
+            )
+            return "{}"
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(
+                "Tool parser returned invalid JSON string (error=%s); "
+                "coercing to empty object. Value: %.200r",
+                e,
+                arguments,
+            )
+            return "{}"
+
+    # Case 2: Dict that needs to be serialized
     if isinstance(arguments, dict):
+        # Check for and clean any keys with embedded quotes (e.g., '"key"')
+        # This handles the case where a parser returns a dict with quoted keys
+        if _has_quoted_keys(arguments):
+            arguments = _clean_quoted_keys(arguments)
         return json.dumps(arguments, ensure_ascii=False)
+
+    # Case 3: Unknown type - warn and return empty object
     logger.warning(
-        "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
+        "Tool parser returned non-dict, non-string arguments (type=%s, repr=%.200r); "
         "coercing to empty object to keep downstream template safe.",
         type(arguments).__name__,
         arguments,
     )
     return "{}"
+
+
+def _has_quoted_keys(d: dict) -> bool:
+    """Check if any keys in the dict have embedded quotes (e.g., '"key"')."""
+    for key in d.keys():
+        if isinstance(key, str) and key.startswith('"') and key.endswith('"'):
+            return True
+    return False
+
+
+def _clean_quoted_keys(d: dict) -> dict:
+    """Remove embedded quotes from dictionary keys (e.g., '"key"' -> 'key')."""
+    cleaned = {}
+    for key, value in d.items():
+        if isinstance(key, str) and key.startswith('"') and key.endswith('"'):
+            # Try to parse as JSON to handle escaped quotes
+            try:
+                new_key = json.loads(key)
+            except (json.JSONDecodeError, ValueError):
+                # Fallback: strip outer quotes
+                new_key = key[1:-1]
+            cleaned[new_key] = value
+        else:
+            cleaned[key] = value
+    return cleaned
 
 
 @dataclass(frozen=True)
