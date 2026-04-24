@@ -63,7 +63,7 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (3472132) - TQ race fix, Gemma 4 offset/projection/audio fixes
+    # mlx-vlm from commit (1bf7742) - continuous batching, torch-free Qwen VL, DFlash speculative
     # Using local path for development (from /Users/berton/Github/mlx-vlm)
     "mlx-vlm @ file:///Users/berton/Github/mlx-vlm",
     "Pillow>=9.0.0",
