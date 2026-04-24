@@ -63,9 +63,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (1bf7742) - continuous batching, torch-free Qwen VL, DFlash speculative
-    # Using local path for development (from /Users/berton/Github/mlx-vlm)
-    "mlx-vlm @ file:///Users/berton/Github/mlx-vlm",
+    # mlx-vlm from commit (e41cd25) - thread-local stream, DFlash GPU hang fix, hunyuan_vl/gemma3n cleanup
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
     # Using local path for development (from /Users/berton/Github/dflash-mlx)
