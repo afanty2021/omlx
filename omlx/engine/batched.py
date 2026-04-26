@@ -13,7 +13,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
-from ..utils.tokenizer import get_tokenizer_config
+from ..utils.tokenizer import get_tokenizer_config, is_translate_gemma_model
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -173,6 +173,86 @@ class BatchedEngine(BaseEngine):
         except AttributeError:
             return False
 
+    def _preprocess_translate_gemma_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """
+        Preprocess messages for translate-gemma models.
+
+        translate-gemma models require content to be an array with specific fields:
+        - type: "text" or "image"
+        - source_lang_code: source language code
+        - target_lang_code: target language code
+        - text: text content
+        - image: image content (optional)
+
+        This method converts standard OpenAI format (string content) to translate-gemma format.
+
+        Args:
+            messages: List of chat messages
+
+        Returns:
+            Preprocessed messages with translate-gemma format
+        """
+        processed = []
+        for msg in messages:
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+
+            # Skip system messages and non-user messages
+            if role != 'user':
+                processed.append(msg)
+                continue
+
+            # Convert string content to array format
+            if isinstance(content, str):
+                # Use ISO 639-1 language codes
+                # en = English, zh = Chinese (Simplified), zh-TW = Chinese (Traditional)
+                source_lang = "en"  # Default to English
+                target_lang = "zh"  # Default to Chinese
+
+                # Simple language detection based on content
+                # This is a basic implementation - could be enhanced with better detection
+                if any(c in content for c in ['中文', '翻译', 'Chinese', '汉']):
+                    source_lang = "en"
+                    target_lang = "zh"
+                elif any(c in content for c in ['English', 'translate to', '英文']):
+                    source_lang = "zh"
+                    target_lang = "en"
+
+                processed.append({
+                    'role': role,
+                    'content': [
+                        {
+                            'type': 'text',
+                            'source_lang_code': source_lang,
+                            'target_lang_code': target_lang,
+                            'text': content
+                        }
+                    ]
+                })
+            elif isinstance(content, list):
+                # Content is already an array, ensure it has the required fields
+                new_content = []
+                for item in content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        new_content.append({
+                            'type': 'text',
+                            'source_lang_code': item.get('source_lang_code', 'en'),
+                            'target_lang_code': item.get('target_lang_code', 'zh'),
+                            'text': item.get('text', '')
+                        })
+                    else:
+                        new_content.append(item)
+                processed.append({
+                    'role': role,
+                    'content': new_content
+                })
+            else:
+                processed.append(msg)
+
+        return processed
+
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -317,6 +397,11 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs: Optional kwargs passed to tokenizer.apply_chat_template
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
         """
+        # Preprocess messages for translate-gemma models
+        # translate-gemma requires content to be an array with specific fields
+        if is_translate_gemma_model(self._model_name):
+            messages = self._preprocess_translate_gemma_messages(messages)
+
         if hasattr(self._tokenizer, 'apply_chat_template'):
             is_partial = detect_and_strip_partial(messages)
             template_kwargs = {

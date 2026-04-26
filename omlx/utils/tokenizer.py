@@ -127,6 +127,26 @@ def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bo
     return False
 
 
+def is_translate_gemma_model(model_name: str) -> bool:
+    """
+    Check if the model is a translate-gemma model.
+
+    translate-gemma models require a special content format:
+    - content must be an array with exactly one item
+    - that item must be a mapping with type, source_lang_code, target_lang_code, text
+
+    Args:
+        model_name: The model name or path.
+
+    Returns:
+        True if the model is a translate-gemma model.
+    """
+    import re
+    model_lower = model_name.lower()
+    # Match translate-gemma, translate_gemma, translategemma, etc.
+    return bool(re.search(r'translate[-_]?gemma', model_lower))
+
+
 def is_qwen3_model(model_name: str) -> bool:
     """
     Check if the model is a Qwen3 model.
@@ -138,7 +158,7 @@ def is_qwen3_model(model_name: str) -> bool:
         True if the model is a Qwen3 model.
     """
     model_lower = model_name.lower()
-    return "qwen3" in model_lower or "Qwen3" in model_name
+    return "qwen3" in model_lower or "Qwen3" in model_lower
 
 
 def is_mistral_model(model_name: str) -> bool:
