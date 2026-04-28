@@ -3019,13 +3019,21 @@ async def stream_anthropic_messages(
                 if thinking_delta:
                     if thinking_filter:
                         thinking_delta = thinking_filter.feed(thinking_delta)
-                    if not thinking_block_started:
-                        if thinking_delta:
+                    if thinking_delta:
+                        # Close any open text block before starting a new
+                        # thinking block at a fresh index. Anthropic SDKs
+                        # reject mixed-type content_block events at the same
+                        # index — this transition handles a model that emits
+                        # a second thinking section after some text.
+                        if text_block_started:
+                            yield create_content_block_stop_event(index=block_index)
+                            block_index += 1
+                            text_block_started = False
+                        if not thinking_block_started:
                             yield create_content_block_start_event(
                                 index=block_index, block_type="thinking"
                             )
                             thinking_block_started = True
-                    if thinking_delta:
                         yield create_thinking_delta_event(
                             index=block_index, thinking=thinking_delta
                         )
@@ -3062,6 +3070,10 @@ async def stream_anthropic_messages(
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
         if thinking_delta:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3071,6 +3083,10 @@ async def stream_anthropic_messages(
     if thinking_filter:
         remaining_thinking = thinking_filter.finish()
         if remaining_thinking:
+            if text_block_started:
+                yield create_content_block_stop_event(index=block_index)
+                block_index += 1
+                text_block_started = False
             if not thinking_block_started:
                 yield create_content_block_start_event(
                     index=block_index, block_type="thinking"
@@ -3486,7 +3502,7 @@ async def create_anthropic_message(
                         pass
 
         response = convert_internal_to_anthropic_response(
-            text=cleaned_text.strip() if cleaned_text else regular_content,
+            text=cleaned_text.strip() if cleaned_text else "",
             model=request.model,
             prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
             completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),

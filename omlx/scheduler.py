@@ -29,7 +29,9 @@ from mlx_lm.generate import (
     generation_stream,
 )
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.sample_utils import make_logits_processors
+
+from .utils.sampling import make_sampler as omlx_make_sampler
 
 from pathlib import Path
 
@@ -961,7 +963,7 @@ class Scheduler:
 
     def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
-        sampler = make_sampler(
+        sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -1392,7 +1394,13 @@ class Scheduler:
         self, sampling_params: SamplingParams, request: Any = None
     ) -> Tuple[Callable[[mx.array], mx.array], List[Callable]]:
         """Build per-request sampler and logits processors."""
-        sampler = make_sampler(
+        # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
+        # The mlx-lm version decorates categorical_sampling and apply_* with
+        # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state),
+        # which fails to advance the RNG state after the first call in this
+        # server environment. Identical prompts then produce identical output
+        # even at temperature > 1.
+        sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -2084,13 +2092,13 @@ class Scheduler:
                 pass
 
         normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
-        effective_offset = max(0, offset)
-        if max_size > 0 and effective_offset >= max_size:
-            normalized_idx = min(normalized_len, max_size)
-        elif effective_offset > 0:
-            normalized_idx = min(normalized_len, effective_offset)
-        else:
-            normalized_idx = min(normalized_len, max(0, idx))
+        # Force case 1 of _temporal_order: _idx == keys.shape[2] means the
+        # buffer is already in temporal order (which is exactly what the
+        # oversized trim above produces — the contiguous tail of the most
+        # recent tokens). Anything else lets _temporal_order re-slice the
+        # buffer in the rotated branch (case 2), which is wasted work and
+        # obscures the merge contract. See cache.py:431-447 for the branches.
+        normalized_idx = normalized_len
 
         normalized_meta = (
             str(keep),
@@ -3210,12 +3218,24 @@ class Scheduler:
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
+            #
+            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
+            # list (possibly empty), never None.  mlx-lm's
+            # GenerationBatch._step does ``for p in self.logits_processors[e]``
+            # in any branch where ``any(self.logits_processors)`` is True
+            # (e.g., heterogeneous merge with another row that has a
+            # processor).  A None slot crashes that loop with
+            # ``TypeError: 'NoneType' object is not iterable``, which then
+            # bubbles into the engine retry loop and presents as a hang.
+            # See vllm-mlx-patched commit 8d4052b for the same root cause
+            # in a sibling project, and #934 for the user-visible symptom.
+            per_row_lps = list(logits_processors) if logits_processors else []
             uids = self.batch_generator.insert(
                 [tokens_to_process],
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
                 samplers=[sampler],
-                logits_processors=[logits_processors],
+                logits_processors=[per_row_lps],
                 state_machines=[sm],
             )
 
