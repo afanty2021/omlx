@@ -2031,6 +2031,7 @@ async def create_chat_completion(
             max_tool_result_tokens,
             engine.tokenizer,
             native_reasoning_content=native_reasoning,
+            model_name=request.model,
         )
 
     # Compile grammar for structured output (logit-level enforcement).

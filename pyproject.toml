@@ -37,9 +37,8 @@ dependencies = [
     # mlx-embeddings from latest commit (32981fa)
     # Using local path for development (from /Users/berton/Github/mlx-embeddings)
     "mlx-embeddings @ file:///Users/berton/Github/mlx-embeddings",
-    # transformers version aligned with mlx-lm requirement
-    # 5.4.0 broke VLM: Qwen2VLImageProcessor now hard-requires torch (#431)
-    "transformers>=5.0.0,<5.4.0",
+    # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
+    "transformers>=5.0.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",

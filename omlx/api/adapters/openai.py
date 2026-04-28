@@ -56,8 +56,8 @@ class OpenAIAdapter(BaseAdapter):
         Returns:
             InternalRequest in unified format.
         """
-        # Extract text content from messages
-        messages = extract_text_content(request.messages)
+        # Extract text content from messages, passing model name for TranslateGemma detection
+        messages = extract_text_content(request.messages, model_name=request.model)
 
         # Convert to internal messages
         internal_messages = [

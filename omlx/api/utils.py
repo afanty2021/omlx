@@ -323,6 +323,7 @@ def extract_text_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    model_name: str | None = None,
 ) -> List[dict]:
     """
     Extract text content from OpenAI-format messages.
@@ -483,7 +484,9 @@ def extract_text_content(
             # Simple text message
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Content array - extract text parts only
+            # Content array - extract text parts
+            # Note: For translate-gemma models, batched.py's _preprocess_translate_gemma_messages
+            # will handle the conversion to the required format
             combined_text = _extract_text_from_content_list(content)
             processed_messages.append(
                 {"role": role, "content": combined_text, **_extra}
