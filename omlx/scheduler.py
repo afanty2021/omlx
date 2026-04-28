@@ -339,7 +339,7 @@ class SchedulerConfig:
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
-    mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+    mlx_cache_cleanup_interval: int = 128  # Steps between mx.clear_cache() calls (reduced from 512 for Metal stability)
 
 
 @dataclass
@@ -429,7 +429,7 @@ class Scheduler:
     continuous batching at the token level, so we use it as the backend.
     """
 
-    _DEFERRED_CLEAR_DELAY: int = 8
+    _DEFERRED_CLEAR_DELAY: int = 2  # Reduced from 8 for Metal stability (faster cache clearing)
 
     def __init__(
         self,
@@ -3333,8 +3333,16 @@ class Scheduler:
                     detokenizer.add_token(response.token)
                     new_text = detokenizer.last_segment
                 else:
-                    # Fallback to single-token decode
-                    new_text = self.tokenizer.decode([response.token])
+                    # Fallback to single-token decode with error handling
+                    try:
+                        new_text = self.tokenizer.decode([response.token])
+                    except (UnicodeDecodeError, UnicodeError) as e:
+                        logger.debug(
+                            f"UTF-8 decode error for token {response.token}: {e}, "
+                            f"using replacement character"
+                        )
+                        # Use replacement character for undecodeable tokens
+                        new_text = "�"
 
             # Prepend <think> tag for first chunk if this is a reasoning model
             # (skip when a protocol parser already manages reasoning formatting)
@@ -3403,8 +3411,19 @@ class Scheduler:
                         if final_segment:
                             output.new_text += final_segment
 
-                    # Decode full output
-                    output.output_text = self.tokenizer.decode(request.output_token_ids)
+                    # Decode full output with error handling
+                    try:
+                        output.output_text = self.tokenizer.decode(request.output_token_ids)
+                    except (UnicodeDecodeError, UnicodeError) as e:
+                        logger.warning(
+                            f"UTF-8 decode error for final output: {e}, "
+                            f"using fallback decoding with replacement"
+                        )
+                        # Fallback: decode with errors='replace' to handle undecodeable sequences
+                        output.output_text = self.tokenizer.decode(
+                            request.output_token_ids,
+                            errors='replace'
+                        )
                     request.output_text = output.output_text
 
                 # Extract cache for future reuse.

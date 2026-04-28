@@ -560,6 +560,18 @@ class EngineCore:
                     yield output
 
                     if output.error:
+                        # Check if this is a Metal resource limit error
+                        if "Resource limit" in output.error and "metal::malloc" in output.error:
+                            logger.warning(
+                                f"Metal resource limit exceeded during streaming, "
+                                f"clearing cache and aborting stream..."
+                            )
+                            # Clear Metal cache to allow subsequent requests to succeed
+                            try:
+                                mx.synchronize()
+                                mx.clear_cache()
+                            except Exception as e:
+                                logger.warning(f"Cache clear failed: {e}")
                         raise RuntimeError(output.error)
 
                     if output.finished:
@@ -593,53 +605,80 @@ class EngineCore:
         Returns:
             Final RequestOutput with complete text
         """
-        request_id = await self.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            **kwargs,
-        )
+        max_retries = 2
+        retry_count = 0
 
-        # Wait for completion using event instead of streaming
-        # This avoids the waiting_consumer tracking overhead
-        event = self._finished_events.get(request_id)
-        if event is None:
-            raise RuntimeError(f"No event for request {request_id}")
+        while retry_count < max_retries:
+            request_id = await self.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **kwargs,
+            )
 
-        try:
-            # Wait for the request to finish
-            await event.wait()
-        except asyncio.CancelledError:
-            # Client disconnected or task was cancelled - abort the request
-            # to free scheduler/GPU resources (prevents orphaned requests)
-            logger.info(f"Request {request_id} cancelled, aborting")
-            await self.abort_request(request_id)
+            # Wait for completion using event instead of streaming
+            # This avoids the waiting_consumer tracking overhead
+            event = self._finished_events.get(request_id)
+            if event is None:
+                raise RuntimeError(f"No event for request {request_id}")
+
+            try:
+                # Wait for the request to finish
+                await event.wait()
+            except asyncio.CancelledError:
+                # Client disconnected or task was cancelled - abort the request
+                # to free scheduler/GPU resources (prevents orphaned requests)
+                logger.info(f"Request {request_id} cancelled, aborting")
+                await self.abort_request(request_id)
+                self._cleanup_request(request_id)
+                raise
+
+            # Get the final output from collector
+            collector = self._output_collectors.get(request_id)
+            if collector is None:
+                raise RuntimeError(f"No collector for request {request_id}")
+
+            # Drain all outputs and get the last one
+            final_output = None
+            while True:
+                output = collector.get_nowait()
+                if output is None:
+                    break
+                final_output = output
+
+            # Cleanup
             self._cleanup_request(request_id)
-            raise
 
-        # Get the final output from collector
-        collector = self._output_collectors.get(request_id)
-        if collector is None:
-            raise RuntimeError(f"No collector for request {request_id}")
+            if final_output is None:
+                raise RuntimeError(f"No output for request {request_id}")
 
-        # Drain all outputs and get the last one
-        final_output = None
-        while True:
-            output = collector.get_nowait()
-            if output is None:
-                break
-            final_output = output
+            if final_output.error:
+                # Check if this is a Metal resource limit error
+                if "Resource limit" in final_output.error and "metal::malloc" in final_output.error:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.warning(
+                            f"Metal resource limit exceeded (attempt {retry_count}/{max_retries}), "
+                            f"clearing cache and retrying..."
+                        )
+                        # Force clear Metal cache and retry
+                        try:
+                            mx.synchronize()
+                            mx.clear_cache()
+                            # Trigger scheduler cleanup for thorough cache clearing
+                            if hasattr(self.scheduler, '_cleanup_after_request'):
+                                self.scheduler._cleanup_after_request()
+                        except Exception as e:
+                            logger.warning(f"Cache clear failed: {e}")
+                        # Small delay to allow Metal to release resources
+                        await asyncio.sleep(0.1)
+                        continue
+                raise RuntimeError(final_output.error)
 
-        # Cleanup
-        self._cleanup_request(request_id)
+            return final_output
 
-        if final_output is None:
-            raise RuntimeError(f"No output for request {request_id}")
-
-        if final_output.error:
-            raise RuntimeError(final_output.error)
-
-        return final_output
+        # If we exhausted retries, raise the last error
+        raise RuntimeError(f"Metal resource limit exceeded after {max_retries} retries")
 
     def generate_batch_sync(
         self,
