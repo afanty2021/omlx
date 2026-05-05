@@ -1302,6 +1302,46 @@ def init_server(
 
 _KEEPALIVE_SENTINEL = object()
 
+_KEEPALIVE_COMMENT = ": keep-alive\n\n"
+_KEEPALIVE_CHAT_CHUNK = (
+    'data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk",'
+    '"created":0,"model":"keepalive",'
+    '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+)
+_KEEPALIVE_COMPLETION_CHUNK = (
+    'data: {"id":"cmpl-keepalive","object":"text_completion","created":0,'
+    '"model":"keepalive",'
+    '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
+)
+_KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
+
+
+def _resolve_keepalive(protocol: str) -> Optional[str]:
+    """Pick a wire-level keepalive frame for the given API protocol.
+
+    Returns None when the configured mode disables keepalive for this protocol.
+    Modes: "chunk" (default, protocol-aware), "comment" (legacy SSE comment),
+    "off" (no keepalive). Some clients (e.g. OpenClaw / WorkBuddy) cannot parse
+    SSE comment lines, so the chunk mode emits valid no-op events instead.
+    """
+    global_settings = _server_state.global_settings
+    mode = "chunk"
+    if global_settings is not None:
+        mode = getattr(global_settings.server, "sse_keepalive_mode", "chunk")
+    if mode == "off":
+        return None
+    if mode == "comment":
+        return _KEEPALIVE_COMMENT
+    if protocol == "openai_chat":
+        return _KEEPALIVE_CHAT_CHUNK
+    if protocol == "openai_completion":
+        return _KEEPALIVE_COMPLETION_CHUNK
+    if protocol == "anthropic":
+        return _KEEPALIVE_ANTHROPIC_PING
+    if protocol == "openai_responses":
+        return None
+    return None
+
 
 async def _safe_anext(ait):
     """Wrapper for __anext__ that converts StopAsyncIteration to a sentinel.
@@ -1320,13 +1360,16 @@ async def _with_sse_keepalive(
     http_request: Optional["FastAPIRequest"] = None,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
+    keepalive_chunk: Optional[str] = _KEEPALIVE_COMMENT,
 ) -> AsyncIterator[str]:
-    """Wrap an SSE generator to send periodic keep-alive comments.
+    """Wrap an SSE generator to send periodic keepalive frames.
 
     During long prefill (e.g. 90k tokens), no SSE events are emitted,
     causing clients with read timeouts (like Claude Code) to disconnect.
-    This wrapper sends SSE comments (: keep-alive) that are ignored by
-    SSE parsers but keep the HTTP connection alive.
+    This wrapper periodically yields a keepalive frame to hold the
+    connection open. The frame format depends on caller-supplied
+    keepalive_chunk: a legacy SSE comment, a protocol-aware no-op event,
+    or None to disable emission entirely.
 
     When http_request is provided, also polls for client disconnect
     between prefill steps. This detects cancellation during long prefills
@@ -1339,7 +1382,8 @@ async def _with_sse_keepalive(
 
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
-    yield ": keep-alive\n\n"
+    if keepalive_chunk is not None:
+        yield keepalive_chunk
 
     try:
         while True:
@@ -1371,7 +1415,8 @@ async def _with_sse_keepalive(
                 keepalive_elapsed += wait_time
                 if keepalive_elapsed >= interval:
                     keepalive_elapsed = 0.0
-                    yield ": keep-alive\n\n"
+                    if keepalive_chunk is not None:
+                        yield keepalive_chunk
             if task.done():
                 try:
                     result = task.result()
@@ -1665,6 +1710,26 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     return {"status": "ok", "model_id": model_id}
 
 
+@app.post("/v1/models/{model_id}/load")
+async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
+    """Load a discovered model into memory. Blocks until loading completes."""
+    if _server_state.engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    entry = _server_state.engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is not None:
+        return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
+
+    try:
+        await _server_state.engine_pool.get_engine(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
 # =============================================================================
 # Embeddings Endpoint
 # =============================================================================
@@ -1899,6 +1964,7 @@ async def create_completion(
             _with_sse_keepalive(
                 stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("openai_completion"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2219,6 +2285,7 @@ async def create_chat_completion(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("openai_chat"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3477,6 +3544,7 @@ async def create_anthropic_message(
             _with_sse_keepalive(
                 stream_anthropic_messages(engine, messages, request, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("anthropic"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3886,6 +3954,7 @@ async def create_response(
                     **chat_kwargs,
                 ),
                 http_request=http_request,
+                keepalive_chunk=_resolve_keepalive("openai_responses"),
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3978,7 +4047,9 @@ async def create_response(
                     )
                 )
 
-        usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+        usage = build_response_usage(
+            output.prompt_tokens, output.completion_tokens, output.cached_tokens
+        )
 
         response_obj = ResponseObject(
             model=request.model,
@@ -4359,6 +4430,7 @@ async def stream_responses_api(
             "input_tokens": last_output.prompt_tokens,
             "output_tokens": last_output.completion_tokens,
             "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
+            "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
             "output_tokens_details": {"reasoning_tokens": 0},
         }
 

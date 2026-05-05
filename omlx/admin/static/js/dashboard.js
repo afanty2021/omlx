@@ -30,7 +30,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_concurrent_requests: 8 },
@@ -347,6 +347,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
+            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -734,6 +735,7 @@
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
+                            sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             model_fallback: this.globalSettings.model.model_fallback,
@@ -1550,6 +1552,15 @@
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_max_ctx: settings.dflash_max_ctx ?? null,
+                    dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
+                        ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
+                        : 8,
+                    dflash_ssd_cache: settings.dflash_ssd_cache || false,
+                    dflash_compatible: model.dflash_compatible !== false,
+                    dflash_compatibility_reason: model.dflash_compatibility_reason || '',
+                    dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1631,6 +1642,19 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
+                                    ? parseInt(this.modelSettings.dflash_max_ctx)
+                                    : null,
+                                dflash_in_memory_cache: this.modelSettings.dflash_enabled
+                                    ? !!this.modelSettings.dflash_in_memory_cache
+                                    : true,
+                                dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
+                                    ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
+                                    : 8 * (1024 ** 3),
+                                dflash_ssd_cache: this.modelSettings.dflash_enabled
+                                    && !!this.modelSettings.dflash_in_memory_cache
+                                    && !!this.modelSettings.dflash_ssd_cache_available
+                                    && !!this.modelSettings.dflash_ssd_cache,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
@@ -1642,7 +1666,13 @@
                         const data = await response.json();
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
-                            alert(window.t('js.info.model_type_reload_required'));
+                            if (data.auto_reloaded) {
+                                alert(window.t('js.info.model_settings_auto_reloaded'));
+                            } else if (data.auto_unloaded) {
+                                alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else {
+                                alert(window.t('js.info.model_type_reload_required'));
+                            }
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -1694,6 +1724,10 @@
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.dflash_max_ctx = null;
+                        this.modelSettings.dflash_in_memory_cache = true;
+                        this.modelSettings.dflash_in_memory_cache_max_gib = 8;
+                        this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -1831,46 +1865,33 @@
                 }
             },
 
-            get codexCommand() {
+            _launchCmd(tool) {
+                // cli_prefix is always "omlx" or an app-bundle path with no
+                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
+                // in the dashboard command display.
                 const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch codex --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return `${cli} launch ${tool}`;
+            },
+
+            get claudeCommand() {
+                return this._launchCmd('claude');
+            },
+
+            get codexCommand() {
+                return this._launchCmd('codex');
             },
 
             get opencodeCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch opencode --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return this._launchCmd('opencode');
             },
 
             get openclawCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
-                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
-                const parts = [`${this.shellQuote(cli)} launch openclaw --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                parts.push(`--tools-profile ${this.shellQuote(profile)}`);
-                return parts.join(' ');
+                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'coding';
+                return `${this._launchCmd('openclaw')} --tools-profile ${profile}`;
             },
 
             get piCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.pi_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch pi --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return this._launchCmd('pi');
             },
 
             async saveIntegrationSettings() {
@@ -2088,6 +2109,7 @@
                 this.benchUploadResults = [];
                 this.benchUploadDone = null;
                 this.benchUploading = false;
+                this.benchUploadSkipped = null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
@@ -2167,6 +2189,14 @@
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
+                        } else if (data.type === 'upload_skipped') {
+                            this.benchUploadSkipped = { features: data.features || [] };
+                            this.benchUploading = false;
+                            this.benchRunning = false;
+                            this.benchProgress = null;
+                            es.close();
+                            this.benchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;

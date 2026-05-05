@@ -15,6 +15,7 @@ import concurrent.futures
 import copy
 import gc
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from contextlib import contextmanager
@@ -39,6 +40,7 @@ from pathlib import Path
 
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
+from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
 
@@ -691,6 +693,32 @@ class Scheduler:
                 "avg_ms": total / count if count else 0.0,
             }
         return result
+
+    def _periodic_clear_threshold_bytes(self) -> int:
+        """Cache-bytes threshold above which the periodic clear runs.
+
+        Defaults to memory_limit/3 when a process memory limit is set,
+        otherwise an absolute 2 GiB floor. Each periodic clear releases
+        the entire MLX buffer pool in one batch; gating it on accumulated
+        bytes avoids producing IOGPUFamily refcount bursts when the pool
+        is already small.
+        """
+        if self._memory_limit_bytes > 0:
+            return max(self._memory_limit_bytes // 3, 2 * 1024**3)
+        return 2 * 1024**3
+
+    def _should_periodic_clear_cache(self) -> bool:
+        """Decide whether the per-step periodic clear should fire.
+
+        Returns False unless ``mlx_cache_cleanup_interval`` is configured,
+        the step counter just landed on the interval boundary, AND the
+        MLX buffer pool exceeds the threshold. See #978 / #1040 for the
+        kernel panic class this gating is meant to mitigate.
+        """
+        interval = self.config.mlx_cache_cleanup_interval
+        if interval <= 0 or self._step_counter % interval != 0:
+            return False
+        return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
     @staticmethod
     def _collect_arrays_from_extracted_cache(
@@ -2718,6 +2746,9 @@ class Scheduler:
         if n_to_score <= threshold:
             return
 
+        tracker = get_prefill_tracker()
+        model_id = os.path.basename(self.config.model_name.rstrip("/"))
+
         try:
             import time
             from .patches.specprefill import score_tokens, select_chunks
@@ -2737,6 +2768,11 @@ class Scheduler:
                             draft_cached_tokens = block_table.num_tokens
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache fetch failed: {e}")
+
+            # Register tracker entry so the dashboard shows the PP indicator
+            # during draft scoring. The bar sits at 0% (no per-chunk hooks)
+            # but the indicator beats showing "idle" for a multi-second pause.
+            tracker.update(request.request_id, 0, n_to_score, model_id)
 
             t0 = time.monotonic()
             importance, used_cache = score_tokens(
@@ -2793,9 +2829,13 @@ class Scheduler:
             del used_cache
             _sync_and_clear_cache()
 
+            # Mark scoring complete (auto-removes tracker entry).
+            tracker.update(request.request_id, n_to_score, n_to_score, model_id)
+
         except Exception as e:
             logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
             request.specprefill_indices = None
+            tracker.remove(request.request_id)
 
     def _cleanup_specprefill(self, request_id: str) -> None:
         """Clean up SpecPrefill RoPE patches when a request finishes."""
@@ -3264,6 +3304,9 @@ class Scheduler:
             #   BatchGenerator last token: pos = N' + (M - N' - 1) = M - 1
             #   First gen token: pos = (N'+1) + (M - N' - 1) = M
             if request.specprefill_indices is not None:
+                tracker = get_prefill_tracker()
+                model_id = os.path.basename(self.config.model_name.rstrip("/"))
+                total_pp = 0
                 try:
                     from .patches.specprefill import (
                         sparse_prefill, cleanup_rope,
@@ -3277,6 +3320,16 @@ class Scheduler:
                     sp_cache = make_prompt_cache(self.model)
                     all_tokens = tokens_to_process
                     sys_count = getattr(request, '_specprefill_system_tokens', 0)
+
+                    # Register tracker entry so the dashboard shows the PP
+                    # indicator throughout sys + sparse prefill. Denominator
+                    # mirrors the last-token removal applied below so the bar
+                    # ends cleanly at 100%.
+                    sel_list_pre = request.specprefill_indices.tolist()
+                    m_pre = len(all_tokens) - sys_count
+                    n_eff = len(sel_list_pre) - (1 if (m_pre - 1) in sel_list_pre else 0)
+                    total_pp = sys_count + n_eff
+                    tracker.update(request.request_id, 0, total_pp, model_id)
 
                     # Phase 1: system prompt full prefill (if not cached)
                     if sys_count > 0:
@@ -3347,10 +3400,14 @@ class Scheduler:
                     tokens_to_process = all_tokens[-1:]
                     self._specprefill_active_request_id = request.request_id
 
+                    # Mark spec-prefill complete (auto-removes tracker entry).
+                    tracker.update(request.request_id, total_pp, total_pp, model_id)
+
                 except Exception as e:
                     logger.error(f"SpecPrefill sparse prefill failed: {e}")
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
+                    tracker.remove(request.request_id)
                     # Fall through to normal prefill
 
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
@@ -4120,12 +4177,7 @@ class Scheduler:
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
-        should_clear = False
-        if (
-            self.config.mlx_cache_cleanup_interval > 0
-            and self._step_counter % self.config.mlx_cache_cleanup_interval == 0
-        ):
-            should_clear = True
+        should_clear = self._should_periodic_clear_cache()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
         if self._deferred_clear_at is not None and self._step_counter >= self._deferred_clear_at:
