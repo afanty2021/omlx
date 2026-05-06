@@ -18,10 +18,12 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import (
@@ -34,15 +36,12 @@ from mlx_lm.generate import (
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors
 
-from .utils.sampling import make_sampler as omlx_make_sampler
-
-from pathlib import Path
-
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
+from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .exceptions import is_cache_corruption_error
+from .utils.sampling import make_sampler as omlx_make_sampler
 
 
 def _sync_and_clear_cache():
@@ -67,10 +66,11 @@ def _sync_and_clear_cache():
     mx.synchronize()  # default stream
     mx.clear_cache()
 
+
 # Import tiered cache components
 try:
-    from .cache.paged_ssd_cache import PagedSSDCacheManager
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
+    from .cache.paged_ssd_cache import PagedSSDCacheManager
     from .memory_monitor import MemoryMonitor
 
     HAS_TIERED_CACHE = True
@@ -82,8 +82,9 @@ except ImportError:
 
 # Import cache type handlers for hybrid cache support
 try:
-    from .cache.type_registry import CacheTypeRegistry
     from .cache.hybrid_cache import ModelCacheConfig
+    from .cache.type_registry import CacheTypeRegistry
+
     HAS_CACHE_TYPE_HANDLERS = True
 except ImportError:
     CacheTypeRegistry = None
@@ -98,7 +99,11 @@ except ImportError:
 
 # Import protocol-specific output parser support
 try:
-    from .adapter.output_parser import OutputParserFactory, OutputParserSession, detect_output_parser
+    from .adapter.output_parser import (
+        OutputParserFactory,
+        OutputParserSession,
+        detect_output_parser,
+    )
 
     HAS_OUTPUT_PARSER = True
 except ImportError:
@@ -113,12 +118,11 @@ logger = logging.getLogger(__name__)
 class _PrefillAbortedError(Exception):
     """Raised when prefill is interrupted by a pending abort."""
 
-    def __init__(self, aborted_uids: List[int], processed_tokens: int):
+    def __init__(self, aborted_uids: list[int], processed_tokens: int):
         self.aborted_uids = aborted_uids
         self.processed_tokens = processed_tokens
         super().__init__(
-            f"Prefill aborted for UIDs {aborted_uids} "
-            f"at {processed_tokens} tokens"
+            f"Prefill aborted for UIDs {aborted_uids} " f"at {processed_tokens} tokens"
         )
 
 
@@ -135,13 +139,16 @@ class _PrefillAbortedError(Exception):
 # NOTE: Re-enabled in mlx-lm commit dcbf6e3 - GenerationBatch is now available
 _original_generation_batch_step = GenerationBatch._step
 
+
 def _patched_generation_batch_step(self):
     # Build per-batch mRoPE deltas from UID mapping before each step.
     # This handles batch size changes during prompt split/generate.
     model = self.model
-    if (getattr(model, "_uses_mrope", False)
-            and getattr(model, "_uid_rope_deltas", None)
-            and self.uids):
+    if (
+        getattr(model, "_uses_mrope", False)
+        and getattr(model, "_uid_rope_deltas", None)
+        and self.uids
+    ):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
 
@@ -168,13 +175,16 @@ def _patched_generation_batch_step(self):
 
     return result
 
+
 GenerationBatch._step = _patched_generation_batch_step
 
 
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
 try:
     from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+
     from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
+
     if not hasattr(_TQCache, "merge"):
         _TQCache.merge = _BTQCache.merge
 except ImportError:
@@ -193,9 +203,11 @@ _original_ppb_prompt = PromptProcessingBatch.prompt
 
 def _patched_ppb_prompt(self, tokens):
     model = self.model
-    if (getattr(model, "_uses_mrope", False)
-            and getattr(model, "_uid_rope_deltas", None)
-            and self.uids):
+    if (
+        getattr(model, "_uses_mrope", False)
+        and getattr(model, "_uid_rope_deltas", None)
+        and self.uids
+    ):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
     return _original_ppb_prompt(self, tokens)
@@ -205,13 +217,18 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
 # Cache class names known to be sliceable (no boundary snapshots needed).
-_KNOWN_SLICEABLE_CACHE_TYPES = frozenset({
-    "KVCache", "BatchKVCache", "QuantizedKVCache",
-    "TurboQuantKVCache", "BatchTurboQuantKVCache",
-})
+_KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
+    {
+        "KVCache",
+        "BatchKVCache",
+        "QuantizedKVCache",
+        "TurboQuantKVCache",
+        "BatchTurboQuantKVCache",
+    }
+)
 
 
-def _prompt_cache_needs_snapshots(prompt_cache: List[Any]) -> bool:
+def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     """Return True if any layer cache is non-sliceable (needs snapshots).
 
     Checks the cache objects created during prefill. If all layers
@@ -233,10 +250,7 @@ def _cache_layer_token_count(cache_obj: Any) -> int:
     """Return the number of tokens stored in a single cache layer."""
     sub_caches = getattr(cache_obj, "caches", None)
     if isinstance(sub_caches, (list, tuple)) and sub_caches:
-        return max(
-            _cache_layer_token_count(sub_cache)
-            for sub_cache in sub_caches
-        )
+        return max(_cache_layer_token_count(sub_cache) for sub_cache in sub_caches)
 
     offset = getattr(cache_obj, "offset", None)
     if isinstance(offset, (int, float)):
@@ -252,7 +266,7 @@ def _cache_layer_token_count(cache_obj: Any) -> int:
     return 0
 
 
-def _cache_base_sizes(caches: List[Any]) -> int:
+def _cache_base_sizes(caches: list[Any]) -> int:
     """Return the base token count of a single-request cache list."""
     if not caches:
         return 0
@@ -275,11 +289,9 @@ def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
     return val[:, s]
 
 
-def _slice_vlm_extra(
-    extra: Dict[str, Any], n: int
-) -> Dict[str, Any]:
+def _slice_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     """Slice VLM extra kwargs to first n tokens along seq dimension."""
-    sliced: Dict[str, Any] = {}
+    sliced: dict[str, Any] = {}
     for key, val in extra.items():
         if isinstance(val, mx.array) and val.ndim >= 2:
             sliced[key] = _vlm_extra_seq_slice(val, slice(None, n))
@@ -288,19 +300,15 @@ def _slice_vlm_extra(
     return sliced
 
 
-def _advance_vlm_extra(
-    extra: Dict[str, Any], n: int
-) -> Dict[str, Any]:
+def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     """Advance VLM extra kwargs past first n tokens along seq dimension."""
-    advanced: Dict[str, Any] = {}
+    advanced: dict[str, Any] = {}
     for key, val in extra.items():
         if isinstance(val, mx.array) and val.ndim >= 2:
             advanced[key] = _vlm_extra_seq_slice(val, slice(n, None))
         else:
             advanced[key] = val
     return advanced
-
-
 
 
 class SchedulingPolicy(Enum):
@@ -326,13 +334,19 @@ class SchedulerConfig:
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
-    max_cache_blocks: Optional[int] = None  # Auto-calculated from available KV cache memory
-    initial_cache_blocks: int = 256  # Starting blocks (grows dynamically to max_cache_blocks)
+    max_cache_blocks: int | None = (
+        None  # Auto-calculated from available KV cache memory
+    )
+    initial_cache_blocks: int = (
+        256  # Starting blocks (grows dynamically to max_cache_blocks)
+    )
 
     # paged SSD cache settings (oMLX only supports paged SSD-based caching)
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
     # When None, no oMLX caching (mlx-lm BatchGenerator manages KV internally).
-    paged_ssd_cache_dir: Optional[str] = None  # Path for paged SSD cache storage (None = disabled)
+    paged_ssd_cache_dir: str | None = (
+        None  # Path for paged SSD cache storage (None = disabled)
+    )
     hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -355,13 +369,13 @@ class SchedulerOutput:
     """
 
     # Requests scheduled in this step
-    scheduled_request_ids: List[str] = field(default_factory=list)
+    scheduled_request_ids: list[str] = field(default_factory=list)
     # Total tokens scheduled
     num_scheduled_tokens: int = 0
     # Requests that finished in this step
-    finished_request_ids: Set[str] = field(default_factory=set)
+    finished_request_ids: set[str] = field(default_factory=set)
     # Request outputs (tokens generated)
-    outputs: List[RequestOutput] = field(default_factory=list)
+    outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
 
@@ -379,8 +393,8 @@ class _BoundarySnapshotProvider:
         self,
         store: Any,  # Optional[BoundarySnapshotSSDStore]
         request_id: str,
-        valid_tcs: List[int],
-        in_memory_snapshots: Dict[int, Any],
+        valid_tcs: list[int],
+        in_memory_snapshots: dict[int, Any],
         extract_fn: Any,  # Callable — Scheduler._extract_cache_states
     ) -> None:
         self._store = store
@@ -439,7 +453,7 @@ class Scheduler:
         self,
         model: Any,
         tokenizer: Any,
-        config: Optional[SchedulerConfig] = None,
+        config: SchedulerConfig | None = None,
     ):
         """
         Initialize the scheduler.
@@ -462,7 +476,9 @@ class Scheduler:
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
         # that are not in tokenizer.eos_token_id.
-        self._generation_config_eos: Optional[Set[int]] = self._load_generation_config_eos()
+        self._generation_config_eos: set[int] | None = (
+            self._load_generation_config_eos()
+        )
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -472,18 +488,18 @@ class Scheduler:
         self._enlarge_block_size_for_arrays_cache()
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
-        self._turboquant_kv_bits: Optional[float] = None
+        self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
-        self.running: Dict[str, Request] = {}  # Running requests by ID
-        self.requests: Dict[str, Request] = {}  # All requests by ID
-        self.finished_req_ids: Set[str] = set()  # Recently finished
+        self.running: dict[str, Request] = {}  # Running requests by ID
+        self.requests: dict[str, Request] = {}  # All requests by ID
+        self.finished_req_ids: set[str] = set()  # Recently finished
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
-        self._pending_abort_ids: Set[str] = set()
+        self._pending_abort_ids: set[str] = set()
 
         # Memory limits for inline prefill checking.
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
@@ -492,50 +508,50 @@ class Scheduler:
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
 
         # SpecPrefill: draft model for attention-based sparse prefill
-        self._specprefill_draft_model: Optional[Any] = None
+        self._specprefill_draft_model: Any | None = None
         # Track active specprefill request for RoPE cleanup
-        self._specprefill_active_request_id: Optional[str] = None
+        self._specprefill_active_request_id: str | None = None
 
         # Phase timing instrumentation for cache-on overhead diagnostics.
         # Accumulated wall-time per phase + invocation count, dumped at request
         # end or via get_phase_stats(). Adds ~100ns per measurement.
-        self._phase_total_ms: Dict[str, float] = defaultdict(float)
-        self._phase_count: Dict[str, int] = defaultdict(int)
+        self._phase_total_ms: dict[str, float] = defaultdict(float)
+        self._phase_count: dict[str, int] = defaultdict(int)
 
         # Async store_cache executor (G2-async). Offloads the post-finish
         # bulk memcpy (28GB+ per 32k request) off the inference thread so
         # response streaming isn't blocked by it.
-        self._store_cache_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._store_cache_executor: concurrent.futures.ThreadPoolExecutor | None = None
         # Pending (uid, request_id, future) entries waiting for async store
         # to finish before batch_generator.remove() can safely run. Drained
         # at the start of every step.
         self._pending_async_removes: deque = deque()
         # Track in-flight store futures per request_id for lookup wait /
         # shutdown wait.
-        self._inflight_store_futures: Dict[str, concurrent.futures.Future] = {}
+        self._inflight_store_futures: dict[str, concurrent.futures.Future] = {}
 
         # Mapping between our request IDs and BatchGenerator UIDs
-        self.request_id_to_uid: Dict[str, int] = {}
-        self.uid_to_request_id: Dict[int, str] = {}
+        self.request_id_to_uid: dict[str, int] = {}
+        self.uid_to_request_id: dict[int, str] = {}
 
         # BatchGenerator - the actual batching engine
-        self.batch_generator: Optional[BatchGenerator] = None
-        self._current_sampler_params: Optional[Tuple] = None
+        self.batch_generator: BatchGenerator | None = None
+        self._current_sampler_params: tuple | None = None
         # Boundary cache snapshots for stateful non-sliceable caches (e.g., ArraysCache).
         # request_id -> {token_count -> snapshot_cache_or_None}
         # Multiple snapshots per request to support per-block ArraysCache state storage.
         # Values are None when offloaded to SSD via _boundary_snapshot_store.
-        self._boundary_cache_snapshots: Dict[str, Dict[int, Any]] = {}
+        self._boundary_cache_snapshots: dict[str, dict[int, Any]] = {}
         # Lazy detection flag: True/False once determined, None before first check.
-        self._boundary_snapshot_required: Optional[bool] = None
+        self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
-        self._boundary_snapshot_store: Optional["BoundarySnapshotSSDStore"] = None
+        self._boundary_snapshot_store: BoundarySnapshotSSDStore | None = None
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
-        self.paged_cache_manager: Optional[PagedCacheManager] = None
-        self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
-        self.paged_ssd_cache_manager: Optional["PagedSSDCacheManager"] = None
-        self.memory_monitor: Optional["MemoryMonitor"] = None
+        self.paged_cache_manager: PagedCacheManager | None = None
+        self.block_aware_cache: BlockAwarePrefixCache | None = None
+        self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
+        self.memory_monitor: MemoryMonitor | None = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -579,39 +595,43 @@ class Scheduler:
                 thread_name_prefix="omlx-store-cache",
             )
         else:
-            logger.info("oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)")
+            logger.info(
+                "oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)"
+            )
 
         # Streaming detokenizers for proper UTF-8 handling (one per active request)
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
-        self._request_detokenizers: Dict[str, Any] = {}  # request_id → active detokenizer
+        self._request_detokenizers: dict[str, Any] = (
+            {}
+        )  # request_id → active detokenizer
 
         # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
-        self._output_parser_factory: Optional["OutputParserFactory"] = None
-        self._output_parser_kind: Optional[str] = None
-        self._output_parser_sessions: Dict[str, "OutputParserSession"] = {}
+        self._output_parser_factory: OutputParserFactory | None = None
+        self._output_parser_kind: str | None = None
+        self._output_parser_sessions: dict[str, OutputParserSession] = {}
         self._is_harmony_model: bool = False
         if HAS_OUTPUT_PARSER and detect_output_parser is not None:
             try:
                 model_config = None
-                if hasattr(model, 'config'):
+                if hasattr(model, "config"):
                     # model.config may be a Pydantic model or dict
                     try:
-                        if hasattr(model.config, 'model_dump'):
+                        if hasattr(model.config, "model_dump"):
                             model_config = model.config.model_dump()
-                        elif hasattr(model.config, 'dict'):
+                        elif hasattr(model.config, "dict"):
                             model_config = model.config.dict()
                         elif isinstance(model.config, dict):
                             model_config = model.config
                         else:
                             # Try to convert to dict via __dict__
-                            model_config = getattr(model.config, '__dict__', None)
+                            model_config = getattr(model.config, "__dict__", None)
                     except Exception as e:
                         logger.debug(f"Failed to extract model.config: {e}")
-                elif hasattr(model, 'args'):
+                elif hasattr(model, "args"):
                     try:
-                        if hasattr(model.args, 'model_dump'):
+                        if hasattr(model.args, "model_dump"):
                             model_config = model.args.model_dump()
-                        elif hasattr(model.args, '__dict__'):
+                        elif hasattr(model.args, "__dict__"):
                             model_config = model.args.__dict__
                     except Exception as e:
                         logger.debug(f"Failed to extract model.args: {e}")
@@ -658,7 +678,7 @@ class Scheduler:
         # completeMemory() callbacks.  Using max() ensures the window always
         # covers the *latest* completion.
         # None = no deferred clear pending; int = step at which to fire.
-        self._deferred_clear_at: Optional[int] = None
+        self._deferred_clear_at: int | None = None
 
         # Cache XTC special tokens (newline + EOS) — stable per tokenizer.
         # Must be after _is_harmony_model / _generation_config_eos init
@@ -679,7 +699,7 @@ class Scheduler:
             self._phase_total_ms[phase] += (time.perf_counter() - t0) * 1000.0
             self._phase_count[phase] += 1
 
-    def get_phase_stats(self) -> Dict[str, Dict[str, float]]:
+    def get_phase_stats(self) -> dict[str, dict[str, float]]:
         """Return accumulated phase timings for diagnostics.
 
         Returns dict of phase -> {total_ms, count, avg_ms}.
@@ -722,8 +742,8 @@ class Scheduler:
 
     @staticmethod
     def _collect_arrays_from_extracted_cache(
-        extracted_cache: List[Any],
-    ) -> List[Any]:
+        extracted_cache: list[Any],
+    ) -> list[Any]:
         """Collect lazy mx.array references from an _extracted_cache payload.
 
         Used by G2-async to force a single batched mx.eval on the inference
@@ -735,11 +755,11 @@ class Scheduler:
         each layer is {state, meta_state, class_name, cache_type}, where
         state is a tuple of mx.arrays (or nested for CacheList / TurboQuant).
         """
-        arrays: List[Any] = []
+        arrays: list[Any] = []
         for layer in extracted_cache or []:
             if not isinstance(layer, dict):
                 continue
-            state = layer.get('state', ())
+            state = layer.get("state", ())
             if isinstance(state, mx.array):
                 arrays.append(state)
                 continue
@@ -752,13 +772,13 @@ class Scheduler:
                     for sub in item:
                         if isinstance(sub, mx.array):
                             arrays.append(sub)
-                        elif hasattr(sub, '_fields'):
+                        elif hasattr(sub, "_fields"):
                             # NamedTuple state (TurboQuant). Walk fields.
                             for fname in sub._fields:
                                 val = getattr(sub, fname, None)
                                 if isinstance(val, mx.array):
                                     arrays.append(val)
-                elif hasattr(item, '_fields'):
+                elif hasattr(item, "_fields"):
                     for fname in item._fields:
                         val = getattr(item, fname, None)
                         if isinstance(val, mx.array):
@@ -768,13 +788,13 @@ class Scheduler:
     def _async_store_cache_worker(
         self,
         request_id: str,
-        token_sequence_to_store: List[int],
-        cache_to_store: List[Any],
-        model_cache_config: Optional[Any],
-        intermediate_snapshots: Optional[Dict[int, List[Any]]],
-        extra_keys: Optional[Tuple[Any, ...]],
-        extra_key_token_start: Optional[int],
-        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]],
+        token_sequence_to_store: list[int],
+        cache_to_store: list[Any],
+        model_cache_config: Any | None,
+        intermediate_snapshots: dict[int, list[Any]] | None,
+        extra_keys: tuple[Any, ...] | None,
+        extra_key_token_start: int | None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -809,9 +829,7 @@ class Scheduler:
             if self.block_aware_cache is not None:
                 self.block_aware_cache.clear_request_entry(request_id)
         except Exception as e:
-            logger.warning(
-                "Async store_cache failed for %s: %s", request_id, e
-            )
+            logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
     def _drain_pending_async_removes(self) -> None:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -847,7 +865,8 @@ class Scheduler:
             except Exception as e:
                 logger.warning(
                     "Deferred batch_generator.remove(uid=%s) failed: %s",
-                    uid, e,
+                    uid,
+                    e,
                 )
             # Cleanup uid maps now that the slot is reclaimable.
             if uid in self.uid_to_request_id:
@@ -855,6 +874,12 @@ class Scheduler:
             if request_id in self.request_id_to_uid:
                 del self.request_id_to_uid[request_id]
             self._inflight_store_futures.pop(request_id, None)
+            # Boundary snapshots were kept on disk for the worker; safe to
+            # delete now that the future has completed. Cleanup was
+            # deferred from _cleanup_finished to avoid racing the worker's
+            # boundary_snapshot_store.load() calls with rmtree.
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
             # Worker no longer holds extracted_cache — pop request from
             # self.requests and drop the cache buffer references so MLX
             # arrays can be freed.
@@ -887,7 +912,7 @@ class Scheduler:
     def _collect_rotating_window_sizes(
         self,
         cache_obj: Any,
-        window_sizes: Set[int],
+        window_sizes: set[int],
     ) -> None:
         """Collect rotating window sizes recursively from cache objects."""
         sub_caches = getattr(cache_obj, "caches", None)
@@ -901,7 +926,7 @@ class Scheduler:
             if isinstance(max_size, int) and max_size > 0:
                 window_sizes.add(max_size)
 
-    def _detect_rotating_window_sizes(self) -> Set[int]:
+    def _detect_rotating_window_sizes(self) -> set[int]:
         """Detect rotating window sizes from model.make_cache() if available."""
         if not hasattr(self.model, "make_cache"):
             return set()
@@ -915,7 +940,7 @@ class Scheduler:
         if cache_list is None:
             return set()
 
-        window_sizes: Set[int] = set()
+        window_sizes: set[int] = set()
         for cache_obj in cache_list:
             self._collect_rotating_window_sizes(cache_obj, window_sizes)
 
@@ -961,9 +986,7 @@ class Scheduler:
         lo = self._ROTATING_BLOCK_SIZE_MIN
         hi = self._ROTATING_BLOCK_SIZE_MAX
 
-        if window_size >= hi:
-            target_block_size = window_size
-        elif window_size >= lo:
+        if window_size >= hi or window_size >= lo:
             target_block_size = window_size
         else:
             # window_size < lo: pick smallest multiple in [lo, hi]
@@ -1024,8 +1047,7 @@ class Scheduler:
             return
 
         has_arrays_cache = any(
-            self._cache_tree_has_arrays_cache(cache_obj)
-            for cache_obj in cache_list
+            self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
         )
         if not has_arrays_cache:
             return
@@ -1048,12 +1070,11 @@ class Scheduler:
         sub_caches = getattr(cache_obj, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
             return any(
-                Scheduler._cache_tree_has_arrays_cache(sub)
-                for sub in sub_caches
+                Scheduler._cache_tree_has_arrays_cache(sub) for sub in sub_caches
             )
         return type(cache_obj).__name__ in ("ArraysCache", "SizedArraysCache")
 
-    def _load_generation_config_eos(self) -> Optional[Set[int]]:
+    def _load_generation_config_eos(self) -> set[int] | None:
         """Load EOS token IDs from generation_config.json if available."""
         try:
             model_path = getattr(self.tokenizer, "name_or_path", None)
@@ -1061,13 +1082,17 @@ class Scheduler:
                 return None
             import json
             import os
+
             gc_path = os.path.join(model_path, "generation_config.json")
             if not os.path.exists(gc_path):
                 # name_or_path may be a HuggingFace repo ID (e.g. for VLM
                 # tokenizers loaded via AutoProcessor).  Try the HF cache.
                 try:
                     from huggingface_hub import try_to_load_from_cache
-                    cached = try_to_load_from_cache(model_path, "generation_config.json")
+
+                    cached = try_to_load_from_cache(
+                        model_path, "generation_config.json"
+                    )
                     if cached and isinstance(cached, str):
                         gc_path = cached
                     else:
@@ -1086,7 +1111,11 @@ class Scheduler:
             # Only return if there are tokens beyond what tokenizer already provides
             tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
             if tokenizer_eos is not None:
-                existing = {tokenizer_eos} if isinstance(tokenizer_eos, int) else set(tokenizer_eos)
+                existing = (
+                    {tokenizer_eos}
+                    if isinstance(tokenizer_eos, int)
+                    else set(tokenizer_eos)
+                )
                 extra = result - existing
                 if extra:
                     logger.info(
@@ -1099,15 +1128,21 @@ class Scheduler:
             logger.debug(f"Could not load generation_config.json: {e}")
             return None
 
-    def _get_stop_tokens(self) -> Set[int]:
+    def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer and generation_config."""
         stop_tokens = set()
-        if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+        if (
+            hasattr(self.tokenizer, "eos_token_id")
+            and self.tokenizer.eos_token_id is not None
+        ):
             if isinstance(self.tokenizer.eos_token_id, list):
                 stop_tokens.update(self.tokenizer.eos_token_id)
             else:
                 stop_tokens.add(self.tokenizer.eos_token_id)
-        if hasattr(self.tokenizer, 'eos_token_ids') and self.tokenizer.eos_token_ids is not None:
+        if (
+            hasattr(self.tokenizer, "eos_token_ids")
+            and self.tokenizer.eos_token_ids is not None
+        ):
             eos_ids = self.tokenizer.eos_token_ids
             if isinstance(eos_ids, int):
                 stop_tokens.add(eos_ids)
@@ -1142,7 +1177,7 @@ class Scheduler:
         """
         if request_id not in self._request_detokenizers:
             # Always create a fresh detokenizer - no pooling to prevent state contamination
-            if hasattr(self.tokenizer, 'detokenizer'):
+            if hasattr(self.tokenizer, "detokenizer"):
                 detok = self.tokenizer.detokenizer
             elif NaiveStreamingDetokenizer is not None:
                 detok = NaiveStreamingDetokenizer(self.tokenizer)
@@ -1189,7 +1224,9 @@ class Scheduler:
         tokens.extend(self._get_stop_tokens())
         return tokens
 
-    def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
+    def _create_batch_generator(
+        self, sampling_params: SamplingParams
+    ) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
         sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
@@ -1203,15 +1240,21 @@ class Scheduler:
 
         # Create logits processors for repetition/presence/frequency penalties
         logits_processors = make_logits_processors(
-            repetition_penalty=sampling_params.repetition_penalty
-            if sampling_params.repetition_penalty != 1.0
-            else None,
-            presence_penalty=sampling_params.presence_penalty
-            if sampling_params.presence_penalty != 0.0
-            else None,
-            frequency_penalty=sampling_params.frequency_penalty
-            if sampling_params.frequency_penalty != 0.0
-            else None,
+            repetition_penalty=(
+                sampling_params.repetition_penalty
+                if sampling_params.repetition_penalty != 1.0
+                else None
+            ),
+            presence_penalty=(
+                sampling_params.presence_penalty
+                if sampling_params.presence_penalty != 0.0
+                else None
+            ),
+            frequency_penalty=(
+                sampling_params.frequency_penalty
+                if sampling_params.frequency_penalty != 0.0
+                else None
+            ),
         )
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
@@ -1234,9 +1277,7 @@ class Scheduler:
 
         return bg
 
-    def _on_prompt_progress(
-        self, updates: List[Tuple[int, int, int]]
-    ) -> None:
+    def _on_prompt_progress(self, updates: list[tuple[int, int, int]]) -> None:
         """Callback from BatchGenerator's prefill loop.
 
         Called once per prefill chunk (default 2048 tokens) with a list of
@@ -1266,7 +1307,7 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _apply_turboquant_kv_empty(self, prompt_cache: List[Any]) -> None:
+    def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
         """Replace KVCache with empty TurboQuantKVCache before prefill.
 
         NOTE: Not currently called -- see #771. Kept for future use when
@@ -1276,8 +1317,8 @@ class Scheduler:
         the peak memory spike from storing full-precision KV then converting.
         Skips the last KVCache layer if turboquant_skip_last is set.
         """
+        from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
-        from mlx_lm.models.cache import KVCache, CacheList
 
         kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
@@ -1307,7 +1348,7 @@ class Scheduler:
                 f"cache layers set to {bits}-bit{skip_msg}"
             )
 
-    def _apply_turboquant_kv_convert(self, prompt_cache: List[Any]) -> None:
+    def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
         """Convert existing KVCache data to TurboQuantKVCache via from_cache().
 
         NOTE: Not currently called -- see #771. Kept for future use when
@@ -1316,8 +1357,8 @@ class Scheduler:
         Used when an existing cache is provided (e.g. from SSD prefix cache).
         Uses from_cache() to quantize the existing KV data.
         """
+        from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
-        from mlx_lm.models.cache import KVCache, CacheList
 
         kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
@@ -1350,10 +1391,10 @@ class Scheduler:
     def _do_external_prefill(
         self,
         request: "Request",
-        tokens: List[int],
-        existing_cache: Optional[List[Any]],
-        vlm_embeds: Optional[Tuple[mx.array, Dict[str, Any], int]] = None,
-    ) -> Tuple[List[Any], List[int]]:
+        tokens: list[int],
+        existing_cache: list[Any] | None,
+        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
+    ) -> tuple[list[Any], list[int]]:
         """Run prefill externally (outside BatchGenerator) for a single request.
 
         Processes tokens[0:N-1] through the model. The last token tokens[N-1]
@@ -1412,14 +1453,20 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
-        all_boundaries = boundary_enabled  # always stop at every boundary for hybrid models
+        all_boundaries = (
+            boundary_enabled  # always stop at every boundary for hybrid models
+        )
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
         # in a restored RotatingKVCache (e.g. shared layer_meta_states from
         # an earlier store_cache bug). Use cached_tokens which is always
         # derived from block_table.num_tokens and therefore trustworthy.
-        if boundary_enabled and hasattr(request, "cached_tokens") and request.cached_tokens > 0:
+        if (
+            boundary_enabled
+            and hasattr(request, "cached_tokens")
+            and request.cached_tokens > 0
+        ):
             if base_size != request.cached_tokens:
                 logger.debug(
                     "Cache base_size mismatch: computed %d, expected %d "
@@ -1431,8 +1478,8 @@ class Scheduler:
                 base_size = request.cached_tokens
 
         # Prepare VLM embeddings for prefill
-        embeds_array: Optional[mx.array] = None
-        extra_kwargs: Optional[Dict[str, Any]] = None
+        embeds_array: mx.array | None = None
+        extra_kwargs: dict[str, Any] | None = None
         if vlm_embeds is not None:
             embeds_array, extra_kwargs, start_offset = vlm_embeds
             embeds_array = embeds_array[:, start_offset:]  # skip cached portion
@@ -1463,7 +1510,7 @@ class Scheduler:
         prefill_step_size = self.config.prefill_step_size
         uid = self.request_id_to_uid.get(request.request_id)
 
-        emitted_boundaries: Dict[int, int] = {}
+        emitted_boundaries: dict[int, int] = {}
 
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
@@ -1479,7 +1526,7 @@ class Scheduler:
                     n_to_process = min(n_to_process, delta)
                 n_to_process = max(1, n_to_process)
 
-            model_kwargs: Dict[str, Any] = {}
+            model_kwargs: dict[str, Any] = {}
             if embeds_array is not None and embeds_array.shape[1] > 0:
                 model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
                 if extra_kwargs:
@@ -1487,9 +1534,7 @@ class Scheduler:
                         extra_kwargs, n_to_process
                     )
 
-            self.model(
-                input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs
-            )
+            self.model(input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs)
             mx.eval([c.state for c in prompt_cache])
 
             input_arr = input_arr[:, n_to_process:]
@@ -1501,9 +1546,7 @@ class Scheduler:
 
             # Progress callback
             if uid is not None:
-                self._on_prompt_progress(
-                    [(uid, processed_tokens, total_length)]
-                )
+                self._on_prompt_progress([(uid, processed_tokens, total_length)])
 
             # Boundary snapshot emission
             if boundary_enabled:
@@ -1590,16 +1633,14 @@ class Scheduler:
 
         if stop_tokens_set:
             # Each stop token is a single-element sequence.
-            transitions = {
-                "normal": [([t], None) for t in stop_tokens_set]
-            }
+            transitions = {"normal": [([t], None) for t in stop_tokens_set]}
             return SequenceStateMachine(transitions, initial="normal")
         return SequenceStateMachine({}, initial="normal")
 
     def _emit_prefill_boundary_snapshot(
         self,
         request: "Request",
-        prompt_cache: List[Any],
+        prompt_cache: list[Any],
         total_tokens: int,
     ) -> None:
         """Capture boundary snapshot from individual (non-batch) cache.
@@ -1620,7 +1661,7 @@ class Scheduler:
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
-    ) -> Tuple[Callable[[mx.array], mx.array], List[Callable]]:
+    ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
         """Build per-request sampler and logits processors."""
         # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
         # The mlx-lm version decorates categorical_sampling and apply_* with
@@ -1638,29 +1679,35 @@ class Scheduler:
             xtc_special_tokens=self._xtc_special_tokens,
         )
         logits_processors = make_logits_processors(
-            repetition_penalty=sampling_params.repetition_penalty
-            if sampling_params.repetition_penalty != 1.0
-            else None,
-            presence_penalty=sampling_params.presence_penalty
-            if sampling_params.presence_penalty != 0.0
-            else None,
-            frequency_penalty=sampling_params.frequency_penalty
-            if sampling_params.frequency_penalty != 0.0
-            else None,
+            repetition_penalty=(
+                sampling_params.repetition_penalty
+                if sampling_params.repetition_penalty != 1.0
+                else None
+            ),
+            presence_penalty=(
+                sampling_params.presence_penalty
+                if sampling_params.presence_penalty != 0.0
+                else None
+            ),
+            frequency_penalty=(
+                sampling_params.frequency_penalty
+                if sampling_params.frequency_penalty != 0.0
+                else None
+            ),
         )
 
         # Add thinking budget processor for reasoning models
         if (
             sampling_params.thinking_budget is not None
             and request is not None
-            and getattr(request, 'needs_think_prefix', False)
-            and not getattr(request, 'is_harmony_model', False)
+            and getattr(request, "needs_think_prefix", False)
+            and not getattr(request, "is_harmony_model", False)
         ):
             think_end_ids = self._resolve_think_end_token_ids()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
-                think_start_id = self._get_think_token_id('think_start_id')
+                think_start_id = self._get_think_token_id("think_start_id")
                 leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
@@ -1687,7 +1734,9 @@ class Scheduler:
                     )
                     logits_processors.append(processor)
                 else:
-                    logger.warning("Cannot determine vocab_size; skipping grammar constraint")
+                    logger.warning(
+                        "Cannot determine vocab_size; skipping grammar constraint"
+                    )
             except ImportError:
                 logger.warning("xgrammar not installed; skipping grammar constraint")
 
@@ -1721,12 +1770,12 @@ class Scheduler:
         </think> and </longcat_think> automatically.
         """
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
-        think_end_id = self._get_think_token_id('think_end_id')
+        think_end_id = self._get_think_token_id("think_end_id")
         if think_end_id is not None:
             return [think_end_id]
 
         # Tier 2: encode the think_end string
-        think_end_str = getattr(self.tokenizer, 'think_end', '</think>')
+        think_end_str = getattr(self.tokenizer, "think_end", "</think>")
         try:
             ids = self.tokenizer.encode(think_end_str, add_special_tokens=False)
             if ids:
@@ -1737,7 +1786,7 @@ class Scheduler:
         # Tier 3: direct token lookup
         try:
             tid = self.tokenizer.convert_tokens_to_ids("</think>")
-            if tid != getattr(self.tokenizer, 'unk_token_id', None):
+            if tid != getattr(self.tokenizer, "unk_token_id", None):
                 return [tid]
         except (AttributeError, KeyError, TypeError):
             pass
@@ -1757,7 +1806,7 @@ class Scheduler:
         """
         import re
 
-        think_end_str = getattr(self.tokenizer, 'think_end', '</think>')
+        think_end_str = getattr(self.tokenizer, "think_end", "</think>")
 
         # Try to get the chat template text
         template_text = self._get_chat_template_text()
@@ -1769,17 +1818,25 @@ class Scheduler:
         escaped = re.escape(think_end_str)
         # Match patterns like: \n</think>\n\n or </think> in template strings
         match = re.search(
-            r'(\\n|\\r|[\n\r])*' + escaped + r'((?:\\n|\\r|[\n\r])*)',
+            r"(\\n|\\r|[\n\r])*" + escaped + r"((?:\\n|\\r|[\n\r])*)",
             template_text,
         )
         if not match:
             return None, None
 
         # Extract raw leading/trailing whitespace, converting \n escapes to actual newlines
-        raw_leading = (match.group(0).split(think_end_str)[0]
-                       .replace('\\n', '\n').replace('\\r', '\r'))
-        raw_trailing = (match.group(0).split(think_end_str)[1]
-                        .replace('\\n', '\n').replace('\\r', '\r'))
+        raw_leading = (
+            match.group(0)
+            .split(think_end_str)[0]
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+        )
+        raw_trailing = (
+            match.group(0)
+            .split(think_end_str)[1]
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+        )
 
         # Encode to token IDs
         leading_ids = None
@@ -1804,20 +1861,21 @@ class Scheduler:
     def _get_chat_template_text(self) -> str | None:
         """Get chat template text from the tokenizer or model directory."""
         # Try tokenizer's chat_template attribute (Jinja string)
-        ct = getattr(self.tokenizer, '_chat_template', None)
+        ct = getattr(self.tokenizer, "_chat_template", None)
         if ct:
             return ct if isinstance(ct, str) else str(ct)
-        ct = getattr(self.tokenizer, 'chat_template', None)
+        ct = getattr(self.tokenizer, "chat_template", None)
         if ct:
             return ct if isinstance(ct, str) else str(ct)
 
         # Try reading the .jinja file from model directory
         import os
-        model_path = getattr(self.config, 'model_name', None) or ''
-        jinja_path = os.path.join(model_path, 'chat_template.jinja')
+
+        model_path = getattr(self.config, "model_name", None) or ""
+        jinja_path = os.path.join(model_path, "chat_template.jinja")
         if os.path.isfile(jinja_path):
             try:
-                with open(jinja_path, 'r', encoding='utf-8') as f:
+                with open(jinja_path, encoding="utf-8") as f:
                     return f.read()
             except Exception:
                 pass
@@ -1830,11 +1888,11 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        think_start_id = self._get_think_token_id('think_start_id')
+        think_start_id = self._get_think_token_id("think_start_id")
         if think_start_id is None:
             try:
                 think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                if think_start_id == getattr(self.tokenizer, 'unk_token_id', None):
+                if think_start_id == getattr(self.tokenizer, "unk_token_id", None):
                     return False
             except (AttributeError, KeyError, TypeError):
                 return False
@@ -1848,7 +1906,7 @@ class Scheduler:
 
         # <think> found. Check if </think> follows it (disabled thinking pattern).
         last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
-        after_start = last_tokens[last_idx + 1:]
+        after_start = last_tokens[last_idx + 1 :]
 
         if after_start:
             think_end_ids = self._resolve_think_end_token_ids()
@@ -1917,7 +1975,7 @@ class Scheduler:
 
         return False
 
-    def _cache_list_needs_boundary_snapshot(self, cache_list: List[Any]) -> bool:
+    def _cache_list_needs_boundary_snapshot(self, cache_list: list[Any]) -> bool:
         """Return True if any layer cache requires boundary snapshots."""
         if not cache_list:
             return False
@@ -1929,7 +1987,7 @@ class Scheduler:
     def _on_prefill_boundary_snapshot(
         self,
         uid: int,
-        snapshot_cache: List[Any],
+        snapshot_cache: list[Any],
         token_count: int,
     ) -> None:
         """Record boundary snapshots captured during prefill processing."""
@@ -1959,7 +2017,9 @@ class Scheduler:
         # the SSD store is unavailable or the write fails.
         if self._boundary_snapshot_store is not None:
             saved = self._boundary_snapshot_store.save(
-                request_id, token_count, snapshot_cache,
+                request_id,
+                token_count,
+                snapshot_cache,
                 self._extract_cache_states,
             )
             if saved:
@@ -2018,7 +2078,7 @@ class Scheduler:
 
         return self._boundary_snapshot_required
 
-    def _extract_boundary_snapshot(self, uid: int) -> Optional[List[Any]]:
+    def _extract_boundary_snapshot(self, uid: int) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
         Uses BatchGenerator.extract_cache() which returns
@@ -2041,12 +2101,17 @@ class Scheduler:
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
                     return [
-                        c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
-                        else None
+                        (
+                            c
+                            if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
+                            else None
+                        )
                         for c in cache_list
                     ]
         except Exception as e:
-            logger.debug(f"Failed to extract boundary cache snapshot for uid={uid}: {e}")
+            logger.debug(
+                f"Failed to extract boundary cache snapshot for uid={uid}: {e}"
+            )
             return None
 
     def _maybe_capture_boundary_snapshot(self, request: Request, uid: int) -> None:
@@ -2076,15 +2141,21 @@ class Scheduler:
         if self._boundary_snapshot_store is not None:
             with self._phase_timer("boundary_snapshot_save"):
                 saved = self._boundary_snapshot_store.save(
-                    request.request_id, total_tokens, snapshot_cache,
+                    request.request_id,
+                    total_tokens,
+                    snapshot_cache,
                     self._extract_cache_states,
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
             else:
-                self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
+                self._boundary_cache_snapshots[request.request_id][
+                    total_tokens
+                ] = snapshot_cache
         else:
-            self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
+            self._boundary_cache_snapshots[request.request_id][
+                total_tokens
+            ] = snapshot_cache
 
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
@@ -2094,8 +2165,16 @@ class Scheduler:
     def _get_boundary_store_override(
         self,
         request_id: str,
-        full_token_sequence: List[int],
-    ) -> Optional[Tuple[List[int], List[Dict[str, Any]], Optional["ModelCacheConfig"], Dict[int, List[Dict[str, Any]]]]]:
+        full_token_sequence: list[int],
+    ) -> (
+        tuple[
+            list[int],
+            list[dict[str, Any]],
+            Optional["ModelCacheConfig"],
+            dict[int, list[dict[str, Any]]],
+        ]
+        | None
+    ):
         """
         Return boundary-aligned cache payload when final request ends on partial block.
 
@@ -2113,7 +2192,8 @@ class Scheduler:
 
         # Find all valid boundary-aligned snapshot token counts
         valid_counts = sorted(
-            tc for tc in snapshots.keys()
+            tc
+            for tc in snapshots.keys()
             if 0 < tc <= total_tokens and tc % block_size == 0
         )
         if not valid_counts:
@@ -2136,9 +2216,7 @@ class Scheduler:
         latest_snapshot = snapshots[latest_tc]
         if latest_snapshot is None and self._boundary_snapshot_store is not None:
             # Offloaded to SSD — load back.
-            extracted_cache = self._boundary_snapshot_store.load(
-                request_id, latest_tc
-            )
+            extracted_cache = self._boundary_snapshot_store.load(request_id, latest_tc)
             if not extracted_cache:
                 return None
             # Build model_cache_config from the main request cache config
@@ -2167,7 +2245,11 @@ class Scheduler:
             extract_fn=self._extract_cache_states,
         )
 
-        token_sequence = full_token_sequence[:latest_tc] if latest_tc < total_tokens else full_token_sequence
+        token_sequence = (
+            full_token_sequence[:latest_tc]
+            if latest_tc < total_tokens
+            else full_token_sequence
+        )
 
         return (
             token_sequence,
@@ -2178,9 +2260,9 @@ class Scheduler:
 
     @staticmethod
     def _merge_boundary_with_full_cache(
-        boundary_cache: List[Dict[str, Any]],
-        full_cache: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        boundary_cache: list[dict[str, Any]],
+        full_cache: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Fill placeholder layers in boundary cache from full extracted cache.
 
         Boundary snapshots skip sliceable (KVCache) layers to save memory,
@@ -2230,17 +2312,17 @@ class Scheduler:
                 # RotatingKVCache may have keys=None (legacy) or zero-length
                 # keys (hybrid window padding). Both are valid empty states
                 # that will be filled during padding reprocessing.
-                if hasattr(layer_cache, 'keys') and layer_cache.keys is None:
-                    if hasattr(layer_cache, 'max_size'):
+                if hasattr(layer_cache, "keys") and layer_cache.keys is None:
+                    if hasattr(layer_cache, "max_size"):
                         continue  # Valid empty RotatingKVCache (keys=None)
                     return False
-                if hasattr(layer_cache, 'values') and layer_cache.values is None:
-                    if hasattr(layer_cache, 'max_size'):
+                if hasattr(layer_cache, "values") and layer_cache.values is None:
+                    if hasattr(layer_cache, "max_size"):
                         continue  # Valid empty RotatingKVCache (values=None)
                     return False
 
         # Check BatchKVCache structure
-        if hasattr(cache, 'caches'):
+        if hasattr(cache, "caches"):
             if cache.caches is None:
                 return False
             for c in cache.caches:
@@ -2252,9 +2334,10 @@ class Scheduler:
     def _normalize_rotating_snapshot_state(
         self,
         layer_cache: Any,
-        state: Tuple[Any, Any],
+        state: tuple[Any, Any],
         meta_state: Any,
-    ) -> Tuple[Tuple[Any, Any], Tuple[str, str, str, str]]:
+        layer_idx: int | None = None,
+    ) -> tuple[tuple[Any, Any], tuple[str, str, str, str]]:
         """
         Normalize RotatingKVCache state into merge-safe canonical form.
 
@@ -2265,20 +2348,42 @@ class Scheduler:
         max_size. This method canonicalizes to the latest max_size tokens.
         """
         if not isinstance(state, (list, tuple)) or len(state) < 2:
-            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+            return state, (
+                tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+            )
 
         keys = state[0]
         values = state[1]
         if keys is None or values is None or not hasattr(keys, "shape"):
-            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+            return state, (
+                tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+            )
 
         try:
-            keep = int(meta_state[0]) if meta_state and len(meta_state) >= 1 else int(getattr(layer_cache, "keep", 0))
-            max_size = int(meta_state[1]) if meta_state and len(meta_state) >= 2 else int(getattr(layer_cache, "max_size", keys.shape[2]))
-            offset = int(meta_state[2]) if meta_state and len(meta_state) >= 3 else int(getattr(layer_cache, "offset", keys.shape[2]))
-            idx = int(meta_state[3]) if meta_state and len(meta_state) >= 4 else int(getattr(layer_cache, "_idx", keys.shape[2]))
+            keep = (
+                int(meta_state[0])
+                if meta_state and len(meta_state) >= 1
+                else int(getattr(layer_cache, "keep", 0))
+            )
+            max_size = (
+                int(meta_state[1])
+                if meta_state and len(meta_state) >= 2
+                else int(getattr(layer_cache, "max_size", keys.shape[2]))
+            )
+            offset = (
+                int(meta_state[2])
+                if meta_state and len(meta_state) >= 3
+                else int(getattr(layer_cache, "offset", keys.shape[2]))
+            )
+            idx = (
+                int(meta_state[3])
+                if meta_state and len(meta_state) >= 4
+                else int(getattr(layer_cache, "_idx", keys.shape[2]))
+            )
         except Exception:
-            return state, tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+            return state, (
+                tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
+            )
 
         ordered_keys = keys
         ordered_values = values
@@ -2322,7 +2427,9 @@ class Scheduler:
             except Exception:
                 pass
 
-        normalized_len = int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
+        normalized_len = (
+            int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
+        )
         # Force case 1 of _temporal_order: _idx == keys.shape[2] means the
         # buffer is already in temporal order (which is exactly what the
         # oversized trim above produces — the contiguous tail of the most
@@ -2339,9 +2446,11 @@ class Scheduler:
         )
 
         if original_len != normalized_len or idx != normalized_idx:
+            layer_tag = f"layer {layer_idx}: " if layer_idx is not None else ""
             logger.debug(
-                "Normalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
+                "%sNormalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
                 "offset=%s, max_size=%s",
+                layer_tag,
                 original_len,
                 normalized_len,
                 idx,
@@ -2354,8 +2463,8 @@ class Scheduler:
 
     def _extract_cache_states(
         self,
-        raw_cache: List[Any],
-    ) -> Tuple[List[Dict[str, Any]], Optional["ModelCacheConfig"]]:
+        raw_cache: list[Any],
+    ) -> tuple[list[dict[str, Any]], Optional["ModelCacheConfig"]]:
         """
         Extract actual tensor state from each layer cache.
 
@@ -2383,10 +2492,15 @@ class Scheduler:
         # cache objects and would log noisy NoneType warnings.
         model_cache_config = None
         has_none_layers = any(c is None for c in raw_cache)
-        if HAS_CACHE_TYPE_HANDLERS and ModelCacheConfig is not None and not has_none_layers:
+        if (
+            HAS_CACHE_TYPE_HANDLERS
+            and ModelCacheConfig is not None
+            and not has_none_layers
+        ):
             try:
                 model_cache_config = ModelCacheConfig.from_cache_list(
-                    raw_cache, model_name=self.model_name if hasattr(self, 'model_name') else ""
+                    raw_cache,
+                    model_name=self.model_name if hasattr(self, "model_name") else "",
                 )
             except Exception as e:
                 logger.debug(f"Failed to build ModelCacheConfig: {e}")
@@ -2397,12 +2511,14 @@ class Scheduler:
             # (KVCache) that were skipped during capture to save memory.
             # Insert a placeholder to preserve layer index alignment.
             if layer_cache is None:
-                extracted.append({
-                    'state': (),
-                    'meta_state': (),
-                    'class_name': 'KVCache',
-                    'cache_type': 'KVCache',
-                })
+                extracted.append(
+                    {
+                        "state": (),
+                        "meta_state": (),
+                        "class_name": "KVCache",
+                        "cache_type": "KVCache",
+                    }
+                )
                 continue
             try:
                 class_name = type(layer_cache).__name__
@@ -2417,103 +2533,132 @@ class Scheduler:
                         pass
 
                 # CacheList: composite cache with multiple sub-caches
-                if cache_type_name == 'CacheList' or class_name == 'CacheList':
+                if cache_type_name == "CacheList" or class_name == "CacheList":
                     if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
                         try:
-                            handler = CacheTypeRegistry.get_handler_by_class_name('CacheList')
+                            handler = CacheTypeRegistry.get_handler_by_class_name(
+                                "CacheList"
+                            )
                             state_dict = handler.extract_state(layer_cache)
-                            extracted.append({
-                                'state': state_dict.get('sub_states', []),
-                                'meta_state': (
-                                    state_dict.get('sub_class_names', []),
-                                    state_dict.get('sub_meta_states', []),
-                                ),
-                                'class_name': 'CacheList',
-                                'cache_type': 'CacheList',
-                            })
+                            extracted.append(
+                                {
+                                    "state": state_dict.get("sub_states", []),
+                                    "meta_state": (
+                                        state_dict.get("sub_class_names", []),
+                                        state_dict.get("sub_meta_states", []),
+                                    ),
+                                    "class_name": "CacheList",
+                                    "cache_type": "CacheList",
+                                }
+                            )
                         except Exception as e:
                             logger.debug(f"CacheList handler extraction failed: {e}")
-                            extracted.append({
-                                'state': [],
-                                'meta_state': ([], []),
-                                'class_name': 'CacheList',
-                                'cache_type': 'CacheList',
-                            })
+                            extracted.append(
+                                {
+                                    "state": [],
+                                    "meta_state": ([], []),
+                                    "class_name": "CacheList",
+                                    "cache_type": "CacheList",
+                                }
+                            )
                     else:
                         # Fallback: extract sub-cache state/meta without handlers
                         # MUST append to extracted to prevent layer count mismatch (Issue #1)
-                        sub_caches = getattr(layer_cache, 'caches', ())
+                        sub_caches = getattr(layer_cache, "caches", ())
                         sub_states = []
                         sub_class_names = []
                         sub_meta_states = []
                         for sc in sub_caches:
-                            sub_states.append(sc.state if hasattr(sc, 'state') else ())
+                            sub_states.append(sc.state if hasattr(sc, "state") else ())
                             sub_class_names.append(type(sc).__name__)
-                            sub_meta_states.append(getattr(sc, 'meta_state', ()))
-                        extracted.append({
-                            'state': sub_states,
-                            'meta_state': (sub_class_names, sub_meta_states),
-                            'class_name': 'CacheList',
-                            'cache_type': 'CacheList',
-                        })
+                            sub_meta_states.append(getattr(sc, "meta_state", ()))
+                        extracted.append(
+                            {
+                                "state": sub_states,
+                                "meta_state": (sub_class_names, sub_meta_states),
+                                "class_name": "CacheList",
+                                "cache_type": "CacheList",
+                            }
+                        )
                     continue
 
-                if hasattr(layer_cache, 'state'):
+                if hasattr(layer_cache, "state"):
                     state = layer_cache.state
-                    meta = getattr(layer_cache, 'meta_state', ())
+                    meta = getattr(layer_cache, "meta_state", ())
 
-                    if class_name in ('RotatingKVCache', 'BatchRotatingKVCache'):
+                    if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
                         state, meta = self._normalize_rotating_snapshot_state(
                             layer_cache,
                             state,
                             meta,
+                            layer_idx=layer_idx,
                         )
 
-                    # Handle different state formats
-                    if isinstance(state, (list, tuple)) and len(state) >= 2:
-                        # Standard KVCache: (keys, values)
-                        # Or ArraysCache: [conv_state, ssm_state]
-                        first, second = state[0], state[1]
-
-                        # Validate non-None for KVCache types
-                        if class_name in ('KVCache', 'RotatingKVCache', 'BatchKVCache'):
-                            if first is None or second is None:
+                    # Preserve the full state tuple regardless of length.
+                    # Legacy 2-tuple caches (KVCache, RotatingKVCache, ...)
+                    # surface as (keys, values); 3-tuple caches like
+                    # PoolingCache surface as (buf_kv, buf_gate, pooled);
+                    # 4-tuple caches like BatchKVCache surface with the
+                    # extra offset/padding metadata. Downstream
+                    # serialization (paged_ssd_cache, boundary_snapshot)
+                    # is N-tuple aware after the cache architecture
+                    # refactor — see Section 6 of the implementation
+                    # plan.
+                    if isinstance(state, (list, tuple)) and len(state) >= 1:
+                        # Validate non-None for legacy KV-style caches only.
+                        # PoolingCache's buf_kv may legitimately be None
+                        # (fresh cache before any update), so skip the
+                        # null guard for non-KV cache classes.
+                        if (
+                            class_name in ("KVCache", "RotatingKVCache", "BatchKVCache")
+                            and len(state) >= 2
+                        ):
+                            if state[0] is None or state[1] is None:
                                 logger.debug(
                                     f"Layer {layer_idx} ({class_name}) has None keys/values, "
                                     f"skipping cache extraction"
                                 )
                                 return [], None  # Return empty - cache is corrupted
 
-                        extracted.append({
-                            'state': state,
-                            'meta_state': meta,
-                            'class_name': class_name,
-                            'cache_type': cache_type_name,
-                        })
+                        extracted.append(
+                            {
+                                "state": tuple(state),
+                                "meta_state": meta,
+                                "class_name": class_name,
+                                "cache_type": cache_type_name,
+                            }
+                        )
                     else:
-                        # Unexpected state format
+                        # Unexpected state format (e.g. a non-tuple scalar).
                         logger.debug(
                             f"Layer {layer_idx} ({class_name}) has unexpected state format"
                         )
-                        meta = getattr(layer_cache, 'meta_state', ())
-                        extracted.append({
-                            'state': (state, state),  # Duplicate for compatibility
-                            'meta_state': meta,
-                            'class_name': class_name,
-                            'cache_type': cache_type_name,
-                        })
-                elif hasattr(layer_cache, 'cache'):
+                        meta = getattr(layer_cache, "meta_state", ())
+                        # Wrap the scalar so downstream code still gets a
+                        # tuple-shaped state. This path is essentially dead
+                        # in practice — kept defensive only.
+                        extracted.append(
+                            {
+                                "state": (state,),
+                                "meta_state": meta,
+                                "class_name": class_name,
+                                "cache_type": cache_type_name,
+                            }
+                        )
+                elif hasattr(layer_cache, "cache"):
                     # ArraysCache style: state stored in .cache list
                     cache_list = layer_cache.cache
                     if isinstance(cache_list, list) and len(cache_list) >= 2:
                         state = (cache_list[0], cache_list[1])
-                        meta = getattr(layer_cache, 'meta_state', ())
-                        extracted.append({
-                            'state': state,
-                            'meta_state': meta,
-                            'class_name': class_name,
-                            'cache_type': cache_type_name,
-                        })
+                        meta = getattr(layer_cache, "meta_state", ())
+                        extracted.append(
+                            {
+                                "state": state,
+                                "meta_state": meta,
+                                "class_name": class_name,
+                                "cache_type": cache_type_name,
+                            }
+                        )
                     else:
                         logger.debug(
                             f"Layer {layer_idx} ({class_name}) has invalid cache list"
@@ -2526,7 +2671,9 @@ class Scheduler:
                     continue
 
             except Exception as e:
-                logger.debug(f"Failed to extract state from cache layer {layer_idx}: {e}")
+                logger.debug(
+                    f"Failed to extract state from cache layer {layer_idx}: {e}"
+                )
                 continue
 
         if len(extracted) != len(raw_cache):
@@ -2577,18 +2724,24 @@ class Scheduler:
                     request.cached_tokens = block_table.num_tokens
                     request.shared_prefix_blocks = len(block_table.block_ids)
                     # Recalculate remaining_tokens in case block_table was truncated
-                    request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
+                    request.remaining_tokens = request.prompt_token_ids[
+                        block_table.num_tokens :
+                    ]
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
                     # shifts the model state and can change greedy output.
                     if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
-                        if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
+                        if self._cache_list_needs_boundary_snapshot(
+                            request.prompt_cache
+                        ):
                             # Stateful non-sliceable caches (Rotating/Arrays)
                             # cannot be safely converted from N to N-1 state
                             # without cache-type-specific logic.
                             if self.paged_cache_manager is not None:
-                                self.paged_cache_manager.delete_block_table(request.request_id)
+                                self.paged_cache_manager.delete_block_table(
+                                    request.request_id
+                                )
                             request.prompt_cache = None
                             request.block_table = None
                             request.cached_tokens = 0
@@ -2599,7 +2752,9 @@ class Scheduler:
                                 f"stateful cache type, falling back to full prefill "
                                 f"for deterministic kickoff"
                             )
-                        elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                        elif self._trim_prompt_cache_for_generation(
+                            request.prompt_cache
+                        ):
                             request.cached_tokens = max(0, request.cached_tokens - 1)
                             request.remaining_tokens = request.prompt_token_ids[-1:]
                             logger.debug(
@@ -2613,7 +2768,9 @@ class Scheduler:
                             # be safely trimmed by one token (e.g., non-trimmable
                             # recurrent state caches).
                             if self.paged_cache_manager is not None:
-                                self.paged_cache_manager.delete_block_table(request.request_id)
+                                self.paged_cache_manager.delete_block_table(
+                                    request.request_id
+                                )
                             request.prompt_cache = None
                             request.block_table = None
                             request.cached_tokens = 0
@@ -2664,7 +2821,7 @@ class Scheduler:
         )
 
     def set_specprefill_draft_model(
-        self, draft_model: Any, draft_model_name: Optional[str] = None
+        self, draft_model: Any, draft_model_name: str | None = None
     ) -> None:
         """Set the draft model for SpecPrefill scoring.
 
@@ -2673,9 +2830,12 @@ class Scheduler:
         in compute_block_hash() naturally isolates draft blocks from target.
         """
         self._specprefill_draft_model = draft_model
-        self._draft_prefix_cache: Optional[Any] = None
+        self._draft_prefix_cache: Any | None = None
 
-        if self.paged_cache_manager is not None and self.paged_ssd_cache_manager is not None:
+        if (
+            self.paged_cache_manager is not None
+            and self.paged_ssd_cache_manager is not None
+        ):
             try:
                 from .cache.paged_cache import PagedCacheManager
                 from .cache.prefix_cache import BlockAwarePrefixCache
@@ -2713,7 +2873,7 @@ class Scheduler:
         if self._specprefill_draft_model is None:
             return
 
-        specprefill_enabled = getattr(request, '_specprefill_enabled', False)
+        specprefill_enabled = getattr(request, "_specprefill_enabled", False)
         if not specprefill_enabled:
             return
 
@@ -2725,9 +2885,12 @@ class Scheduler:
             return
 
         n_remaining = len(remaining)
-        from .patches.specprefill import DEFAULT_THRESHOLD, DEFAULT_KEEP_RATE
-        threshold = getattr(request, '_specprefill_threshold', None) or DEFAULT_THRESHOLD
-        keep_pct = getattr(request, '_specprefill_keep_pct', None) or DEFAULT_KEEP_RATE
+        from .patches.specprefill import DEFAULT_KEEP_RATE, DEFAULT_THRESHOLD
+
+        threshold = (
+            getattr(request, "_specprefill_threshold", None) or DEFAULT_THRESHOLD
+        )
+        keep_pct = getattr(request, "_specprefill_keep_pct", None) or DEFAULT_KEEP_RATE
 
         # Threshold check on TOTAL remaining (not after system exclusion)
         if n_remaining <= threshold:
@@ -2738,7 +2901,9 @@ class Scheduler:
         # won't include it (effective_system = 0).
         system_end = request.specprefill_system_end
         effective_system = max(0, system_end - request.cached_tokens)
-        tokens_to_score = remaining[effective_system:] if effective_system > 0 else remaining
+        tokens_to_score = (
+            remaining[effective_system:] if effective_system > 0 else remaining
+        )
         n_to_score = len(tokens_to_score)
 
         # If conversation portion is below threshold after system exclusion,
@@ -2751,6 +2916,7 @@ class Scheduler:
 
         try:
             import time
+
             from .patches.specprefill import score_tokens, select_chunks
 
             # Draft prefix cache lookup
@@ -2762,7 +2928,9 @@ class Scheduler:
                         request.request_id, tokens_to_score
                     )
                     if block_table and block_table.num_tokens > 0:
-                        reconstructed = self._draft_prefix_cache.reconstruct_cache(block_table)
+                        reconstructed = self._draft_prefix_cache.reconstruct_cache(
+                            block_table
+                        )
                         if reconstructed:
                             draft_cache = reconstructed
                             draft_cached_tokens = block_table.num_tokens
@@ -2787,7 +2955,9 @@ class Scheduler:
             n_selected = selected.shape[0]
             request.specprefill_indices = selected
             request.specprefill_total_tokens = n_to_score
-            request.specprefill_position_offset = request.cached_tokens + effective_system
+            request.specprefill_position_offset = (
+                request.cached_tokens + effective_system
+            )
             request._specprefill_system_tokens = effective_system
 
             extras = []
@@ -2833,7 +3003,9 @@ class Scheduler:
             tracker.update(request.request_id, n_to_score, n_to_score, model_id)
 
         except Exception as e:
-            logger.error(f"SpecPrefill scoring failed, falling back to normal path: {e}")
+            logger.error(
+                f"SpecPrefill scoring failed, falling back to normal path: {e}"
+            )
             request.specprefill_indices = None
             tracker.remove(request.request_id)
 
@@ -2841,11 +3013,14 @@ class Scheduler:
         """Clean up SpecPrefill RoPE patches when a request finishes."""
         if self._specprefill_active_request_id == request_id:
             from .patches.specprefill import cleanup_rope
+
             cleanup_rope(self.model)
             self._specprefill_active_request_id = None
-            logger.debug(f"SpecPrefill: RoPE restored for finished request {request_id}")
+            logger.debug(
+                f"SpecPrefill: RoPE restored for finished request {request_id}"
+            )
 
-    def _trim_prompt_cache_for_generation(self, cache_list: List[Any]) -> bool:
+    def _trim_prompt_cache_for_generation(self, cache_list: list[Any]) -> bool:
         """Trim each cache layer by one token for exact-hit generation kickoff."""
         if not cache_list:
             return False
@@ -2859,7 +3034,9 @@ class Scheduler:
         """Trim one token from cache object (recursively for CacheList)."""
         sub_caches = getattr(cache_obj, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
-            return all(self._trim_cache_tree_by_one(sub_cache) for sub_cache in sub_caches)
+            return all(
+                self._trim_cache_tree_by_one(sub_cache) for sub_cache in sub_caches
+            )
 
         trim_fn = getattr(cache_obj, "trim", None)
         if not callable(trim_fn):
@@ -2880,7 +3057,7 @@ class Scheduler:
 
         self.batch_generator.remove([uid])
 
-    def _check_pending_aborts_for_uids(self, uids: List[int]) -> List[int]:
+    def _check_pending_aborts_for_uids(self, uids: list[int]) -> list[int]:
         """Return UIDs that have pending aborts.
 
         Called during prefill to detect aborted
@@ -2966,7 +3143,7 @@ class Scheduler:
         # Release blocks for eviction (same as _cleanup_finished)
         if self.paged_cache_manager is not None:
             block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table is None and hasattr(request, 'block_table'):
+            if block_table is None and hasattr(request, "block_table"):
                 block_table = request.block_table
             if block_table:
                 released = self.paged_cache_manager.release_for_eviction(
@@ -2989,9 +3166,9 @@ class Scheduler:
         self._cleanup_output_parser_session(request_id)
 
         # Clean up VLM adapter state to prevent contamination
-        if hasattr(self.model, 'clear_vlm_position_state'):
+        if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
-        if hasattr(self.model, 'clear_pending_embeddings'):
+        if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
         # Drop any boundary snapshot for this request.
@@ -3028,10 +3205,9 @@ class Scheduler:
         Without this, an idle server would never reach the target step and
         stale buffers would accumulate indefinitely.
         """
-        return bool(self.waiting or self.running
-                     or self._deferred_clear_at is not None)
+        return bool(self.waiting or self.running or self._deferred_clear_at is not None)
 
-    def fail_all_requests(self) -> List[str]:
+    def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
 
         Used as a safety net by engine_core when step() raises an
@@ -3044,7 +3220,7 @@ class Scheduler:
         Returns:
             List of failed request IDs.
         """
-        failed_ids: List[str] = []
+        failed_ids: list[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
             req = self.requests.pop(request_id, None)
@@ -3082,7 +3258,7 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _preflight_memory_check(self, request: "Request") -> Optional[str]:
+    def _preflight_memory_check(self, request: "Request") -> str | None:
         """
         Estimate whether prefill would exceed memory limits.
 
@@ -3132,7 +3308,7 @@ class Scheduler:
 
     def _schedule_waiting(
         self,
-    ) -> tuple[List["Request"], List[RequestOutput]]:
+    ) -> tuple[list["Request"], list[RequestOutput]]:
         """
         Move requests from waiting queue to running.
 
@@ -3145,16 +3321,16 @@ class Scheduler:
             Tuple of (scheduled requests, rejected error outputs)
         """
         scheduled = []
-        rejected_outputs: List[RequestOutput] = []
+        rejected_outputs: list[RequestOutput] = []
 
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
-        batch_cache_status: Optional[bool] = None
+        batch_cache_status: bool | None = None
         # Track VLM status: VLM and text-only requests cannot be in the same prefill batch
         # None = not determined yet, True = VLM request, False = text-only request
-        batch_vlm_status: Optional[bool] = None
+        batch_vlm_status: bool | None = None
         # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
-        batch_specprefill_status: Optional[bool] = None
+        batch_specprefill_status: bool | None = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             # Generation memory guard: when requests are already running,
@@ -3171,7 +3347,9 @@ class Scheduler:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "
                         "(%s > %s), %d running",
-                        active, self._memory_limit_bytes, len(self.running),
+                        active,
+                        self._memory_limit_bytes,
+                        len(self.running),
                     )
                     break
 
@@ -3189,7 +3367,10 @@ class Scheduler:
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
             # is falsy in Python. For exact cache match, remaining_tokens=[] but we should
             # pass just the last token so BatchGenerator can start generation.
-            if request.remaining_tokens is not None and len(request.remaining_tokens) == 0:
+            if (
+                request.remaining_tokens is not None
+                and len(request.remaining_tokens) == 0
+            ):
                 # Exact cache match - pass only last token for generation kickoff
                 tokens_to_process = request.prompt_token_ids[-1:]
             elif request.remaining_tokens:
@@ -3214,7 +3395,10 @@ class Scheduler:
             # affects the entire model). Also block scheduling if another
             # specprefill request is already running (offset RoPE active).
             request_is_specprefill = request.specprefill_indices is not None
-            if self._specprefill_active_request_id is not None and not request_is_specprefill:
+            if (
+                self._specprefill_active_request_id is not None
+                and not request_is_specprefill
+            ):
                 # A specprefill request is running — defer all others until it finishes
                 self.waiting.appendleft(request)
                 break
@@ -3308,18 +3492,21 @@ class Scheduler:
                 model_id = os.path.basename(self.config.model_name.rstrip("/"))
                 total_pp = 0
                 try:
+                    import time
+
                     from .patches.specprefill import (
-                        sparse_prefill, cleanup_rope,
-                        _find_attention_layers, _get_attn_module,
+                        _find_attention_layers,
+                        _get_attn_module,
                         _OffsetAdjustedRoPE,
+                        cleanup_rope,
+                        sparse_prefill,
                     )
 
-                    import time
                     t0 = time.monotonic()
 
                     sp_cache = make_prompt_cache(self.model)
                     all_tokens = tokens_to_process
-                    sys_count = getattr(request, '_specprefill_system_tokens', 0)
+                    sys_count = getattr(request, "_specprefill_system_tokens", 0)
 
                     # Register tracker entry so the dashboard shows the PP
                     # indicator throughout sys + sparse prefill. Denominator
@@ -3327,7 +3514,9 @@ class Scheduler:
                     # ends cleanly at 100%.
                     sel_list_pre = request.specprefill_indices.tolist()
                     m_pre = len(all_tokens) - sys_count
-                    n_eff = len(sel_list_pre) - (1 if (m_pre - 1) in sel_list_pre else 0)
+                    n_eff = len(sel_list_pre) - (
+                        1 if (m_pre - 1) in sel_list_pre else 0
+                    )
                     total_pp = sys_count + n_eff
                     tracker.update(request.request_id, 0, total_pp, model_id)
 
@@ -3381,7 +3570,11 @@ class Scheduler:
                     # extra token BatchGenerator will process.
                     for _, layer in _find_attention_layers(self.model):
                         attn = _get_attn_module(layer)
-                        if attn and hasattr(attn, "rope") and isinstance(attn.rope, _OffsetAdjustedRoPE):
+                        if (
+                            attn
+                            and hasattr(attn, "rope")
+                            and isinstance(attn.rope, _OffsetAdjustedRoPE)
+                        ):
                             attn.rope._adjustment -= 1
 
                     N = int(selected.shape[0])
@@ -3513,7 +3706,11 @@ class Scheduler:
                     self.model.register_rope_delta(uid, request.rope_deltas)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
-                cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
+                cache_info = (
+                    f", {request.cached_tokens} cached"
+                    if request.cached_tokens > 0
+                    else ""
+                )
                 cache_used = "with cache" if cache_to_use else "no cache"
                 logger.debug(
                     f"Scheduled request {request.request_id} (uid={uid}) "
@@ -3524,8 +3721,8 @@ class Scheduler:
         return scheduled, rejected_outputs
 
     def _process_batch_responses(
-        self, responses: List[Any]
-    ) -> Tuple[List[RequestOutput], Set[str]]:
+        self, responses: list[Any]
+    ) -> tuple[list[RequestOutput], set[str]]:
         """
         Process responses from BatchGenerator.
 
@@ -3606,16 +3803,16 @@ class Scheduler:
 
             # Prepend <think> tag for first chunk if this is a reasoning model
             # (skip when a protocol parser already manages reasoning formatting)
-            if parser_session is None and getattr(request, 'needs_think_prefix', False):
-                if not getattr(request, 'think_prefix_sent', False):
-                    think_tag = getattr(self.tokenizer, 'think_start', '<think>')
+            if parser_session is None and getattr(request, "needs_think_prefix", False):
+                if not getattr(request, "think_prefix_sent", False):
+                    think_tag = getattr(self.tokenizer, "think_start", "<think>")
                     new_text = think_tag + "\n" + new_text
                     request.think_prefix_sent = True
 
             # Immediately discard logprobs if not requested to free memory (~800KB per response)
             # This prevents accumulation of large MLX arrays during streaming
             if (
-                hasattr(response, 'logprobs')
+                hasattr(response, "logprobs")
                 and response.logprobs is not None
                 and not request.sampling_params.logprobs
             ):
@@ -3688,7 +3885,7 @@ class Scheduler:
 
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
-                raw_cache = getattr(response, 'prompt_cache', None)
+                raw_cache = getattr(response, "prompt_cache", None)
                 if raw_cache is not None:
                     try:
                         # SpecPrefill: sparse KV data can't be stored in
@@ -3699,7 +3896,9 @@ class Scheduler:
                         # For paged cache, extract actual tensor states
                         # This allows cache to survive BatchGenerator recreation
                         elif self.block_aware_cache is not None:
-                            extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
+                            extracted_cache, model_cache_config = (
+                                self._extract_cache_states(raw_cache)
+                            )
                             if extracted_cache:
                                 request._extracted_cache = extracted_cache
                                 request._model_cache_config = model_cache_config
@@ -3721,13 +3920,15 @@ class Scheduler:
                     f"Request {request_id} finished: {response.finish_reason}, "
                     f"{request.num_output_tokens} tokens"
                 )
-                logger.log(5, "Request %s generated text:\n%s", request_id, output.output_text)
+                logger.log(
+                    5, "Request %s generated text:\n%s", request_id, output.output_text
+                )
 
             outputs.append(output)
 
         return outputs, finished_ids
 
-    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
+    def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         # Synchronize pending generation_stream operations before cache storage.
         # store_cache -> mx.save_safetensors triggers implicit mx.eval() which
@@ -3760,19 +3961,26 @@ class Scheduler:
             store_future = None
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
-                    if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
                         try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
+                            full_token_sequence = list(request.prompt_token_ids) + list(
+                                request.output_token_ids
+                            )
                             # For reasoning models, only cache prompt tokens.
                             # Output contains <think> tokens that the API layer
                             # strips before the next turn, so they never match.
-                            if getattr(request, 'needs_think_prefix', False):
+                            if getattr(request, "needs_think_prefix", False):
                                 cacheable_sequence = list(request.prompt_token_ids)
                             else:
                                 cacheable_sequence = full_token_sequence
                             token_sequence_to_store = cacheable_sequence
                             cache_to_store = request._extracted_cache
-                            model_cache_config = getattr(request, '_model_cache_config', None)
+                            model_cache_config = getattr(
+                                request, "_model_cache_config", None
+                            )
                             intermediate_snapshots = None
 
                             # Boundary merge + a batched mx.eval all on the
@@ -3783,7 +3991,10 @@ class Scheduler:
                             # no-op). bfloat16 view+eval inside the worker
                             # then runs on its own default stream, isolated
                             # from generation_stream.
-                            with self._phase_timer("store_cache_main_prep"), mx.stream(generation_stream):
+                            with (
+                                self._phase_timer("store_cache_main_prep"),
+                                mx.stream(generation_stream),
+                            ):
                                 boundary_override = self._get_boundary_store_override(
                                     request_id,
                                     cacheable_sequence,
@@ -3795,8 +4006,10 @@ class Scheduler:
                                         boundary_model_config,
                                         intermediate_snapshots,
                                     ) = boundary_override
-                                    cache_to_store = self._merge_boundary_with_full_cache(
-                                        boundary_cache, request._extracted_cache
+                                    cache_to_store = (
+                                        self._merge_boundary_with_full_cache(
+                                            boundary_cache, request._extracted_cache
+                                        )
                                     )
                                     if boundary_model_config is not None:
                                         model_cache_config = boundary_model_config
@@ -3808,7 +4021,11 @@ class Scheduler:
                                         f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                         f"intermediate snapshots)"
                                     )
-                                pre_eval_arrays = self._collect_arrays_from_extracted_cache(cache_to_store)
+                                pre_eval_arrays = (
+                                    self._collect_arrays_from_extracted_cache(
+                                        cache_to_store
+                                    )
+                                )
                                 if pre_eval_arrays:
                                     with self._phase_timer("store_cache_main_eval"):
                                         mx.eval(*pre_eval_arrays)
@@ -3846,13 +4063,17 @@ class Scheduler:
                                 f"{len(request.output_token_ids)} output)"
                             )
                         except Exception as e:
-                            logger.debug(f"Failed to submit async store for {request_id}: {e}")
+                            logger.debug(
+                                f"Failed to submit async store for {request_id}: {e}"
+                            )
                     else:
                         # No extracted_cache to store, but ensure block leak guard.
                         block_table = None
                         if self.paged_cache_manager:
-                            block_table = self.paged_cache_manager.get_block_table(request_id)
-                            if block_table is None and hasattr(request, 'block_table'):
+                            block_table = self.paged_cache_manager.get_block_table(
+                                request_id
+                            )
+                            if block_table is None and hasattr(request, "block_table"):
                                 block_table = request.block_table
                         if block_table and self.paged_cache_manager:
                             self.paged_cache_manager.release_for_eviction(
@@ -3897,14 +4118,20 @@ class Scheduler:
             self._cleanup_output_parser_session(request_id)
 
             # Clean up VLM adapter state (position_ids, rope_deltas, pending embeddings)
-            if hasattr(self.model, 'clear_vlm_position_state'):
+            if hasattr(self.model, "clear_vlm_position_state"):
                 self.model.clear_vlm_position_state()
-            if hasattr(self.model, 'clear_pending_embeddings'):
+            if hasattr(self.model, "clear_pending_embeddings"):
                 self.model.clear_pending_embeddings()
 
-            # Drop any boundary snapshot for this request.
+            # Drop any boundary snapshot for this request. The in-memory
+            # dict pop is safe — the async store worker holds its own
+            # reference to the snapshot dict via _BoundarySnapshotProvider.
             self._boundary_cache_snapshots.pop(request_id, None)
-            if self._boundary_snapshot_store is not None:
+            # cleanup_request rmtree's the on-disk snapshot directory and
+            # races the worker's boundary_snapshot_store.load() calls. If
+            # an async store_future is in flight, defer cleanup until the
+            # worker finishes (handled in _drain_pending_async_removes).
+            if self._boundary_snapshot_store is not None and store_future is None:
                 self._boundary_snapshot_store.cleanup_request(request_id)
 
             # Track as finished
@@ -3938,9 +4165,7 @@ class Scheduler:
                 count = self._phase_count.get(phase, 0)
                 if count == 0:
                     continue
-                stats_parts.append(
-                    f"{phase}={total_ms:.1f}ms/{count}"
-                )
+                stats_parts.append(f"{phase}={total_ms:.1f}ms/{count}")
             if stats_parts:
                 logger.info("Cache phase timings: %s", ", ".join(stats_parts))
 
@@ -4008,7 +4233,7 @@ class Scheduler:
 
     def _reschedule_running_requests(
         self, is_corruption: bool = False, max_corruption_retries: int = 3
-    ) -> List[str]:
+    ) -> list[str]:
         """Move running requests back to waiting queue for retry.
 
         Args:
@@ -4019,7 +4244,7 @@ class Scheduler:
         Returns:
             List of request IDs that exceeded max retries (corruption only).
         """
-        failed_ids: List[str] = []
+        failed_ids: list[str] = []
         count = 0
         for request_id, request in list(self.running.items()):
             if is_corruption:
@@ -4116,6 +4341,32 @@ class Scheduler:
                     output.finished_request_ids = finished_ids
                     self._cleanup_finished(finished_ids)
 
+                    # Periodic Metal allocator cleanup during long decodes.
+                    # mx.random.categorical inside the sampler allocates a
+                    # tiny scalar via gumbel → uniform on every call.
+                    # omlx ships its own non-compiled sampler
+                    # (omlx/utils/sampling.py) so that RNG state actually
+                    # advances in the server, but the trade-off is that
+                    # those scalars accumulate in the IOGPU residency set
+                    # — macOS aborts at ~4096 entries. Long contexts
+                    # (50k+) decoding thousands of tokens hit that limit
+                    # mid-stream. Synchronise the generation stream first
+                    # so any in-flight Metal command buffer that still
+                    # references buffers we're about to drop has
+                    # completed; the allocator only releases pool entries
+                    # whose ref count is zero, but the sync guarantees
+                    # there is no race window. Decode-only path —
+                    # next_generated() returns nothing during prefill, so
+                    # we never disrupt prefill activation buffers.
+                    self._tokens_since_clear_cache = (
+                        getattr(self, "_tokens_since_clear_cache", 0)
+                        + len(responses)
+                    )
+                    if self._tokens_since_clear_cache >= 1024:
+                        mx.synchronize(generation_stream)
+                        mx.clear_cache()
+                        self._tokens_since_clear_cache = 0
+
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.
             # BatchGenerator is in an inconsistent state (partial
@@ -4134,20 +4385,17 @@ class Scheduler:
         except (TypeError, AttributeError, ValueError) as e:
             if self._is_cache_corruption_error(e):
                 import traceback
+
                 logger.warning(
                     f"Cache corruption detected: {e}, "
                     f"clearing cache and re-prefilling..."
                 )
-                logger.debug(
-                    f"Cache corruption traceback:\n{traceback.format_exc()}"
-                )
+                logger.debug(f"Cache corruption traceback:\n{traceback.format_exc()}")
                 # Full reset: clear batch generator, all caches, VLM state
                 self._recover_from_cache_error()
                 # Reschedule requests for re-prefill from scratch.
                 # Requests exceeding max corruption retries are failed.
-                failed_ids = self._reschedule_running_requests(
-                    is_corruption=True
-                )
+                failed_ids = self._reschedule_running_requests(is_corruption=True)
                 for rid in failed_ids:
                     output.outputs.append(
                         RequestOutput(
@@ -4166,9 +4414,9 @@ class Scheduler:
 
         except Exception as e:
             import traceback
+
             logger.error(
-                f"Error in batch generation step: {e}\n"
-                f"{traceback.format_exc()}"
+                f"Error in batch generation step: {e}\n" f"{traceback.format_exc()}"
             )
             raise
 
@@ -4180,7 +4428,10 @@ class Scheduler:
         should_clear = self._should_periodic_clear_cache()
         # Deferred post-completion cleanup: fire once the step counter reaches
         # the target set by _cleanup_finished() (#435, #557).
-        if self._deferred_clear_at is not None and self._step_counter >= self._deferred_clear_at:
+        if (
+            self._deferred_clear_at is not None
+            and self._step_counter >= self._deferred_clear_at
+        ):
             should_clear = True
             self._deferred_clear_at = None
         if should_clear:
@@ -4193,15 +4444,15 @@ class Scheduler:
 
         return output
 
-    def get_request(self, request_id: str) -> Optional[Request]:
+    def get_request(self, request_id: str) -> Request | None:
         """Get a request by ID."""
         return self.requests.get(request_id)
 
-    def remove_finished_request(self, request_id: str) -> Optional[Request]:
+    def remove_finished_request(self, request_id: str) -> Request | None:
         """Remove a finished request from tracking."""
         return self.requests.pop(request_id, None)
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get scheduler statistics."""
         stats = {
             "num_waiting": len(self.waiting),
@@ -4215,7 +4466,7 @@ class Scheduler:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
         return stats
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
@@ -4268,15 +4519,15 @@ class Scheduler:
 
         # Clear any model-level cache state
         # MLX models may have internal cache references
-        if hasattr(self.model, 'cache'):
+        if hasattr(self.model, "cache"):
             self.model.cache = None
 
         # Some MLX models store cache in layers
-        if hasattr(self.model, 'layers'):
+        if hasattr(self.model, "layers"):
             for layer in self.model.layers:
-                if hasattr(layer, 'cache'):
+                if hasattr(layer, "cache"):
                     layer.cache = None
-                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'cache'):
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "cache"):
                     layer.self_attn.cache = None
 
         # Release model and tokenizer references for GC
@@ -4291,6 +4542,7 @@ class Scheduler:
 
         # Force garbage collection of any lingering cache objects
         import gc
+
         gc.collect()
 
         logger.info("Deep reset completed - all caches cleared")
@@ -4337,9 +4589,9 @@ class Scheduler:
         try:
             # Try to get model config
             config = None
-            if hasattr(self.model, 'config'):
+            if hasattr(self.model, "config"):
                 config = self.model.config
-            elif hasattr(self.model, 'args'):
+            elif hasattr(self.model, "args"):
                 config = self.model.args
 
             if config is None:
@@ -4347,19 +4599,27 @@ class Scheduler:
                 return
 
             # Extract KV cache dimensions
-            num_layers = getattr(config, 'num_hidden_layers', None) or getattr(config, 'n_layer', None)
-            num_kv_heads = getattr(config, 'num_key_value_heads', None) or getattr(config, 'num_attention_heads', None) or getattr(config, 'n_head', None)
-            head_dim = getattr(config, 'head_dim', None)
-            hidden_size = getattr(config, 'hidden_size', None) or getattr(config, 'n_embd', None)
+            num_layers = getattr(config, "num_hidden_layers", None) or getattr(
+                config, "n_layer", None
+            )
+            num_kv_heads = (
+                getattr(config, "num_key_value_heads", None)
+                or getattr(config, "num_attention_heads", None)
+                or getattr(config, "n_head", None)
+            )
+            head_dim = getattr(config, "head_dim", None)
+            hidden_size = getattr(config, "hidden_size", None) or getattr(
+                config, "n_embd", None
+            )
 
             # Calculate head_dim if not directly available
             if head_dim is None and hidden_size and num_kv_heads:
-                num_heads = getattr(config, 'num_attention_heads', None) or num_kv_heads
+                num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
                 head_dim = hidden_size // num_heads
 
             # Determine dtype size
             dtype_size = 2  # Default float16
-            if hasattr(self.model, 'dtype'):
+            if hasattr(self.model, "dtype"):
                 if self.model.dtype == mx.float32:
                     dtype_size = 4
                 elif self.model.dtype == mx.bfloat16:
@@ -4367,17 +4627,18 @@ class Scheduler:
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
             num_attention_heads = (
-                getattr(config, 'num_attention_heads', None)
-                or getattr(config, 'n_head', None)
+                getattr(config, "num_attention_heads", None)
+                or getattr(config, "n_head", None)
                 or num_kv_heads
             )
 
             # Count KVCache layers for hybrid models
             num_kv_cache_layers = num_layers
-            if hasattr(self.model, 'make_cache'):
+            if hasattr(self.model, "make_cache"):
                 try:
                     cache_list = self.model.make_cache()
                     from mlx_lm.models.cache import KVCache
+
                     num_kv_cache_layers = sum(
                         1 for c in cache_list if type(c) is KVCache
                     )
@@ -4428,11 +4689,17 @@ class Scheduler:
 
         # In paged SSD-only mode, paged_ssd_cache_dir is required
         if not self.config.paged_ssd_cache_dir:
-            logger.debug("paged SSD cache not configured (no --ssd-cache-dir specified)")
+            logger.debug(
+                "paged SSD cache not configured (no --ssd-cache-dir specified)"
+            )
             return
 
         try:
-            cache_dir = Path(self.config.paged_ssd_cache_dir) if self.config.paged_ssd_cache_dir else None
+            cache_dir = (
+                Path(self.config.paged_ssd_cache_dir)
+                if self.config.paged_ssd_cache_dir
+                else None
+            )
 
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
@@ -4444,11 +4711,15 @@ class Scheduler:
 
             # Connect paged SSD cache manager to PagedCacheManager
             if self.paged_cache_manager is not None:
-                self.paged_cache_manager.set_paged_ssd_cache_manager(self.paged_ssd_cache_manager)
+                self.paged_cache_manager.set_paged_ssd_cache_manager(
+                    self.paged_ssd_cache_manager
+                )
 
             # Connect paged SSD cache manager to BlockAwarePrefixCache for paged SSD-only mode
             if self.block_aware_cache is not None:
-                self.block_aware_cache.set_paged_ssd_cache_manager(self.paged_ssd_cache_manager)
+                self.block_aware_cache.set_paged_ssd_cache_manager(
+                    self.paged_ssd_cache_manager
+                )
 
             # Initialize boundary snapshot SSD store for offloading
             # non-sliceable cache snapshots during prefill.
@@ -4575,7 +4846,9 @@ class Scheduler:
                 evicted_count += 1
 
         # Estimate bytes freed based on block count
-        estimated_freed = evicted_count * self.memory_monitor.estimate_block_memory(block_size)
+        estimated_freed = evicted_count * self.memory_monitor.estimate_block_memory(
+            block_size
+        )
 
         if evicted_count > 0:
             logger.info(
@@ -4610,7 +4883,11 @@ class Scheduler:
             return False
 
         # Touch the block to update LRU
-        block = self.paged_cache_manager.blocks[block_id] if block_id < len(self.paged_cache_manager.blocks) else None
+        block = (
+            self.paged_cache_manager.blocks[block_id]
+            if block_id < len(self.paged_cache_manager.blocks)
+            else None
+        )
         if block:
             block.touch()
 
@@ -4652,7 +4929,7 @@ class Scheduler:
 
         return verified
 
-    def get_ssd_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_ssd_cache_stats(self) -> dict[str, Any] | None:
         """Get paged SSD + prefix cache observability statistics."""
         stats = {}
 
