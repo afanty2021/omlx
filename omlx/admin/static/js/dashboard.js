@@ -1555,6 +1555,7 @@
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
                     dflash_max_ctx: settings.dflash_max_ctx ?? null,
                     dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
                     dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
@@ -1652,6 +1653,9 @@
                                 dflash_in_memory_cache: this.modelSettings.dflash_enabled
                                     ? !!this.modelSettings.dflash_in_memory_cache
                                     : true,
+                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
+                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
+                                    : 4,
                                 dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
                                     : 8 * (1024 ** 3),
@@ -1731,6 +1735,7 @@
                         this.modelSettings.dflash_draft_quant_bits = null;
                         this.modelSettings.dflash_max_ctx = null;
                         this.modelSettings.dflash_in_memory_cache = true;
+                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.mtp_enabled = false;
@@ -2034,10 +2039,53 @@
                 return '0';
             },
 
+            formatByteCount(bytes) {
+                if (bytes == null || !Number.isFinite(bytes)) return '';
+                if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                return Math.max(0, Math.round(bytes)) + ' B';
+            },
+
             formatTokenCount(n) {
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
+            },
+
+            formatDurationShort(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '—';
+                if (seconds < 1) return seconds.toFixed(1) + 's';
+                if (seconds < 60) return Math.round(seconds) + 's';
+                const minutes = Math.floor(seconds / 60);
+                const rem = Math.round(seconds % 60);
+                if (minutes < 60) return minutes + 'm ' + rem + 's';
+                const hours = Math.floor(minutes / 60);
+                return hours + 'h ' + (minutes % 60) + 'm';
+            },
+
+            formatActivityAge(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '';
+                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+            },
+
+            formatActivityMetadata(activity) {
+                const parts = [];
+                if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
+                if (activity.document_count != null) parts.push(activity.document_count + ' docs');
+                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.text_length != null) parts.push(activity.text_length + ' chars');
+                if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
+                if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
+                if (activity.file_size_bytes != null && activity.file_size_bytes > 0) parts.push(this.formatByteCount(activity.file_size_bytes));
+                return parts.join(' · ');
+            },
+
+            activityDotClass(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return 'bg-green-400 animate-pulse';
+                if (seconds < 15) return 'bg-green-400 animate-pulse';
+                if (seconds < 30) return 'bg-amber-400 animate-pulse';
+                return 'bg-red-400';
             },
 
             get activeModelsMemoryPercent() {

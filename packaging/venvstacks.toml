@@ -15,7 +15,7 @@ runtime = "cpython-3.11"
 requirements = [
     # Core MLX
     "mlx==0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
+    # mlx-lm from commit (ed1fca4, v0.31.3) - aligned with pyproject.toml
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
@@ -53,12 +53,31 @@ requirements = [
     # dflash-mlx v0.1.5.1 (110f261) — runtime_context, prefix cache (L1+L2), verify-specialized int4 qmm
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@110f261",
     "Pillow>=9.0.0",
-    # Grammar-constrained decoding for structured output
-    "xgrammar>=0.1.32",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
     # python-multipart needed by audio routes (File/Form uploads)
     "python-multipart>=0.0.5",
+    # mlx-audio runtime deps (mlx-audio itself installed --no-deps in build.py)
+    "scipy>=1.11.0",
+    "librosa>=0.10.0",
+    "miniaudio>=1.59",
+    "numba>=0.59.0",
+    "pyloudnorm>=0.1.0",
+    "sounddevice>=0.4.6",
+    # mlx-audio [tts] extra deps
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    # mlx-audio [stt] extra deps
+    # transformers 5.x's tokenization_mistral_common imports ReasoningEffort
+    # which only exists in mistral-common>=1.10. Without this floor, the
+    # resolver lands on 1.9.x and WhisperProcessor.from_pretrained() silently
+    # fails (#1072, #1116).
+    "mistral-common[audio]>=1.10",
+    # mlx-audio [sts] extra deps
+    "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
     # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm (v0.31.3)
 ]

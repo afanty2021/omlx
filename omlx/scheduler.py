@@ -501,6 +501,15 @@ class Scheduler:
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: set[str] = set()
 
+        # Lock-free admin snapshot. Published at the end of each step() while
+        # the engine thread is the sole writer of running/waiting; the admin
+        # endpoint reads the dict reference atomically (GIL) and never iterates
+        # the live mutable structures.
+        self._admin_snapshot: dict[str, Any] = {
+            "running_by_id": {},
+            "waiting": [],
+        }
+
         # Memory limits for inline prefill checking.
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
         self._memory_limit_bytes: int = 0  # soft limit
@@ -1285,10 +1294,6 @@ class Scheduler:
         PrefillProgressTracker so the admin dashboard can display per-request
         prefill progress.  Only touches CPU counters — zero GPU overhead.
         """
-        import os
-
-        from .prefill_progress import get_prefill_tracker
-
         tracker = get_prefill_tracker()
         # model_name is a full path; use basename to match engine_pool model_id.
         model_id = os.path.basename(self.config.model_name.rstrip("/"))
@@ -2915,8 +2920,6 @@ class Scheduler:
         model_id = os.path.basename(self.config.model_name.rstrip("/"))
 
         try:
-            import time
-
             from .patches.specprefill import score_tokens, select_chunks
 
             # Draft prefix cache lookup
@@ -2937,10 +2940,35 @@ class Scheduler:
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache fetch failed: {e}")
 
-            # Register tracker entry so the dashboard shows the PP indicator
-            # during draft scoring. The bar sits at 0% (no per-chunk hooks)
-            # but the indicator beats showing "idle" for a multi-second pause.
-            tracker.update(request.request_id, 0, n_to_score, model_id)
+            spec_extra = {
+                "prompt_tokens": request.num_prompt_tokens,
+                "system_tokens": request.specprefill_system_end,
+                "conversation_tokens": request.num_prompt_tokens - request.specprefill_system_end,
+                "cached_tokens": request.cached_tokens,
+            }
+
+            def _score_progress(processed: int, total: int, phase: str) -> None:
+                tracker.update(
+                    request.request_id,
+                    min(processed, total - 1),
+                    total,
+                    model_id,
+                    phase=f"specprefill_{phase}",
+                    detail="scoring draft tokens",
+                    extra=spec_extra,
+                )
+
+            # Register tracker entry and stream draft scoring progress so the
+            # dashboard shows movement during long SpecPrefill scoring pauses.
+            tracker.update(
+                request.request_id,
+                0,
+                n_to_score,
+                model_id,
+                phase="specprefill_scoring",
+                detail="scoring draft tokens",
+                extra=spec_extra,
+            )
 
             t0 = time.monotonic()
             importance, used_cache = score_tokens(
@@ -2948,6 +2976,7 @@ class Scheduler:
                 tokens_to_score,
                 prefill_step_size=self.config.prefill_step_size,
                 existing_cache=draft_cache,
+                progress_callback=_score_progress,
             )
             selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
@@ -2970,6 +2999,21 @@ class Scheduler:
                 f"prompt {total_prompt} = "
                 f"system {system_total} + conv {total_prompt - system_total}, "
                 f"cached {cached}"
+            )
+
+            tracker.update(
+                request.request_id,
+                n_to_score - 1,
+                n_to_score,
+                model_id,
+                phase="specprefill_selected",
+                detail="selected sparse tokens",
+                extra={
+                    **spec_extra,
+                    "scored_tokens": n_to_score,
+                    "selected_tokens": n_selected,
+                    "keep_percent": round(n_selected / n_to_score * 100),
+                },
             )
 
             logger.info(
@@ -3177,8 +3221,6 @@ class Scheduler:
             self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Remove from prefill progress tracker.
-        from .prefill_progress import get_prefill_tracker
-
         get_prefill_tracker().remove(request_id)
 
         # Mark as aborted
@@ -3492,8 +3534,6 @@ class Scheduler:
                 model_id = os.path.basename(self.config.model_name.rstrip("/"))
                 total_pp = 0
                 try:
-                    import time
-
                     from .patches.specprefill import (
                         _find_attention_layers,
                         _get_attn_module,
@@ -3520,13 +3560,56 @@ class Scheduler:
                     total_pp = sys_count + n_eff
                     tracker.update(request.request_id, 0, total_pp, model_id)
 
+                    def _check_specprefill_abort(processed: int) -> None:
+                        if request.request_id in self._pending_abort_ids:
+                            logger.info(
+                                f"SpecPrefill interrupted at {processed}/{total_pp} "
+                                f"tokens: request aborted"
+                            )
+                            tracker.remove(request.request_id)
+                            self.waiting.appendleft(request)
+                            raise _PrefillAbortedError([], processed)
+
                     # Phase 1: system prompt full prefill (if not cached)
                     if sys_count > 0:
                         sys_arr = mx.array(all_tokens[:sys_count])
                         step = self.config.prefill_step_size
+                        sys_processed = 0
+                        spec_sparse_extra = {
+                            "prompt_tokens": request.num_prompt_tokens,
+                            "system_tokens": request.specprefill_system_end,
+                            "conversation_tokens": request.num_prompt_tokens - request.specprefill_system_end,
+                            "cached_tokens": request.cached_tokens,
+                            "scored_tokens": m_pre,
+                            "selected_tokens": n_eff,
+                            "keep_percent": round(n_eff / m_pre * 100)
+                            if m_pre > 0
+                            else 0,
+                        }
                         while sys_arr.size > step:
+                            _check_specprefill_abort(sys_processed)
+                            tracker.update(
+                                request.request_id,
+                                sys_processed,
+                                total_pp,
+                                model_id,
+                                phase="specprefill_system",
+                                detail="system prompt prefill",
+                                extra=spec_sparse_extra,
+                            )
                             self.model(sys_arr[:step][None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
+                            sys_processed += step
+                            _check_specprefill_abort(sys_processed)
+                            tracker.update(
+                                request.request_id,
+                                min(sys_processed, total_pp - 1),
+                                total_pp,
+                                model_id,
+                                phase="specprefill_system",
+                                detail="system prompt prefill",
+                                extra=spec_sparse_extra,
+                            )
                             sys_arr = sys_arr[step:]
                             # Use _sync_and_clear_cache() instead of bare
                             # mx.clear_cache() to flush the generation_stream
@@ -3537,8 +3620,30 @@ class Scheduler:
                             # panic that #435 fixed elsewhere (#557).
                             _sync_and_clear_cache()
                         if sys_arr.size > 0:
+                            _check_specprefill_abort(sys_processed)
+                            final_sys = int(sys_arr.size)
+                            tracker.update(
+                                request.request_id,
+                                sys_processed,
+                                total_pp,
+                                model_id,
+                                phase="specprefill_system",
+                                detail="system prompt prefill",
+                                extra=spec_sparse_extra,
+                            )
                             self.model(sys_arr[None], cache=sp_cache)
                             mx.eval([c.state for c in sp_cache])
+                            sys_processed += final_sys
+                            _check_specprefill_abort(sys_processed)
+                            tracker.update(
+                                request.request_id,
+                                min(sys_processed, total_pp - 1),
+                                total_pp,
+                                model_id,
+                                phase="specprefill_system",
+                                detail="system prompt prefill",
+                                extra=spec_sparse_extra,
+                            )
                         logger.info(
                             f"SpecPrefill: system prompt {sys_count} tokens full prefill"
                         )
@@ -3557,6 +3662,28 @@ class Scheduler:
                         selected_list.remove(last_idx)
                         selected = mx.array(sorted(selected_list))
 
+                    def _sparse_progress(processed: int, total: int) -> None:
+                        _check_specprefill_abort(sys_count + processed)
+                        tracker.update(
+                            request.request_id,
+                            min(sys_count + processed, total_pp - 1),
+                            total_pp,
+                            model_id,
+                            phase="specprefill_sparse",
+                            detail="sparse target prefill",
+                            extra={
+                                "scored_tokens": M,
+                                "selected_tokens": int(selected.shape[0]),
+                                "keep_percent": round(int(selected.shape[0]) / M * 100)
+                                if M > 0
+                                else 0,
+                                "prompt_tokens": request.num_prompt_tokens,
+                                "system_tokens": request.specprefill_system_end,
+                                "conversation_tokens": request.num_prompt_tokens - request.specprefill_system_end,
+                                "cached_tokens": request.cached_tokens,
+                            },
+                        )
+
                     sparse_prefill(
                         self.model,
                         conv_tokens,
@@ -3564,6 +3691,7 @@ class Scheduler:
                         sp_cache,
                         step_size=self.config.prefill_step_size,
                         position_offset=pos_offset,
+                        progress_callback=_sparse_progress,
                     )
                     # sparse_prefill installs _OffsetAdjustedRoPE with
                     # adjustment = M - N'. Subtract 1 to account for the
@@ -3596,6 +3724,11 @@ class Scheduler:
                     # Mark spec-prefill complete (auto-removes tracker entry).
                     tracker.update(request.request_id, total_pp, total_pp, model_id)
 
+                except _PrefillAbortedError:
+                    cleanup_rope(self.model)
+                    request.specprefill_indices = None
+                    tracker.remove(request.request_id)
+                    raise
                 except Exception as e:
                     logger.error(f"SpecPrefill sparse prefill failed: {e}")
                     cleanup_rope(self.model)
@@ -3635,8 +3768,6 @@ class Scheduler:
 
                 # Prefill complete: remove from progress tracker so dashboard
                 # shows "generating" instead of "PP" during decode.
-                from .prefill_progress import get_prefill_tracker
-
                 get_prefill_tracker().remove(request.request_id)
 
                 cache_to_use = prefilled_cache
@@ -3696,8 +3827,11 @@ class Scheduler:
                 uid = uids[0]
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
+                now = time.monotonic()
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING
+                request.generation_started_at = now
+                request.last_activity_at = now
                 self.running[request.request_id] = request
                 scheduled.append(request)
 
@@ -3735,6 +3869,7 @@ class Scheduler:
         outputs = []
         finished_ids = set()
 
+        step_now = time.monotonic()
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
@@ -3743,6 +3878,8 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
+
+            request.last_activity_at = step_now
 
             # Release VLM embeddings after first decode token (prefill is done)
             if request.vlm_inputs_embeds is not None:
@@ -3942,8 +4079,6 @@ class Scheduler:
             self._cleanup_specprefill(rid)
 
         # Remove finished requests from prefill progress tracker.
-        from .prefill_progress import get_prefill_tracker
-
         tracker = get_prefill_tracker()
         for rid in finished_ids:
             tracker.remove(rid)
@@ -4442,7 +4577,30 @@ class Scheduler:
         ):
             gc.collect()
 
+        self._publish_admin_snapshot()
+
         return output
+
+    def _publish_admin_snapshot(self) -> None:
+        """Atomically publish a fresh admin-visible snapshot.
+
+        Called from step() on the engine thread, where running/waiting are
+        not concurrently mutated. The admin endpoint reads the reference via
+        snapshot_for_admin() and never iterates the live structures.
+        """
+        self._admin_snapshot = {
+            "running_by_id": dict(self.running),
+            "waiting": list(self.waiting),
+        }
+
+    def snapshot_for_admin(self) -> dict[str, Any]:
+        """Return the most recently published admin snapshot.
+
+        Reference read is GIL-atomic; the dict itself is no longer mutated
+        after publication. May be one step stale, which is fine for dashboard
+        polling.
+        """
+        return self._admin_snapshot
 
     def get_request(self, request_id: str) -> Request | None:
         """Get a request by ID."""
