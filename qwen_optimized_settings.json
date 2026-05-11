@@ -1,0 +1,44 @@
+{
+  "_comment": "omlx 针对 Qwen3.6-35B-A3B-4bit 的优化配置",
+  "_usage": "复制此文件内容到 ~/.omlx/model_settings.json",
+  "version": 1,
+  "models": {
+    "Qwen3.6-35B-A3B-4bit": {
+      "_comment": "生成参数",
+      "max_tokens": 4096,
+      "max_context_window": 8192,
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 0,
+      "repetition_penalty": 1.0,
+      "force_sampling": false,
+
+      "_comment": "KV 缓存优化（显著减少内存使用）",
+      "turboquant_kv_enabled": true,
+      "turboquant_kv_bits": 3,
+      "turboquant_skip_last": true,
+
+      "_comment": "模型管理",
+      "ttl_seconds": 300,
+      "is_pinned": false,
+      "is_default": true,
+
+      "_comment": "推测解码（需要安装 dflash-mlx）",
+      "dflash_enabled": false,
+      "dflash_draft_model": null,
+      "dflash_draft_quant_bits": null,
+
+      "_comment": "SpecPrefill（MoE 模型稀疏预填充）",
+      "specprefill_enabled": false,
+      "specprefill_draft_model": null,
+      "specprefill_keep_pct": null,
+      "specprefill_threshold": null,
+
+      "_comment": "思考模式（Qwen 3.6+ 支持）",
+      "enable_thinking": null,
+      "preserve_thinking": null,
+      "thinking_budget_enabled": false,
+      "thinking_budget_tokens": null
+    }
+  }
+}
