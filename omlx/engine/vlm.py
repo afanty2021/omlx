@@ -626,6 +626,18 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
+        from ..utils.model_loading import maybe_load_custom_quantization
+
+        # Apply pre-load patches (MTP runtime patch, etc.) before the model
+        # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
+        # is a no-op when the model is incompatible.
+        try:
+            from ..utils.model_loading import maybe_apply_pre_load_patches
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
+        except Exception as e:
+            logger.debug(f"pre-load patches skipped: {e}")
 
         # Build tokenizer config with model-specific fixes (e.g., Gemma 4)
         tokenizer_config = get_tokenizer_config(
@@ -645,6 +657,14 @@ class VLMBatchedEngine(BaseEngine):
 
             _patch_torch_free_image_processor()
             with _strip_audio_config_if_orphaned(Path(self._model_name)):
+                custom_loaded = maybe_load_custom_quantization(
+                    self._model_name,
+                    is_vlm=True,
+                )
+                if custom_loaded is not None:
+                    model, processor = custom_loaded
+                    return model, processor
+
                 return vlm_load(
                     self._model_name,
                     tokenizer_config=tokenizer_config,
@@ -740,7 +760,16 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
+                    from ..utils.model_loading import maybe_load_custom_quantization
+
                     def _load_draft():
+                        custom_loaded = maybe_load_custom_quantization(
+                            specprefill_draft,
+                            is_vlm=False,
+                        )
+                        if custom_loaded is not None:
+                            draft_model, _ = custom_loaded
+                            return draft_model
                         draft_model, _ = mlx_lm_load(specprefill_draft)
                         return draft_model
                     draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
@@ -1601,7 +1630,8 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
+        engine = self._engine
+        request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -1614,7 +1644,7 @@ class VLMBatchedEngine(BaseEngine):
 
         finished_normally = False
         try:
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 if output.finished:
@@ -1635,7 +1665,7 @@ class VLMBatchedEngine(BaseEngine):
         finally:
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
-                await self._engine.abort_request(request_id)
+                await engine.abort_request(request_id)
 
     async def chat(
         self,

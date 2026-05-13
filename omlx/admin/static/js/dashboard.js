@@ -1580,6 +1580,8 @@
                     mtp_enabled: settings.mtp_enabled || false,
                     mtp_compatible: model.mtp_compatible === true,
                     mtp_compatibility_reason: model.mtp_compatibility_reason || '',
+                    is_paroquant: model.is_paroquant === true,
+                    paroquant_reason: model.paroquant_reason || '',
                     vlm_mtp_enabled: settings.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: settings.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
@@ -3021,7 +3023,7 @@
                     return { auto: false, percent: Math.min(99, Math.max(1, percent)) };
                 }
                 // Handle percent format (e.g., "69%")
-                const percent = parseInt(value.replace('%', ''));
+                const percent = parseInt(value.replace(/%/g, ''));
                 if (isNaN(percent)) return { auto: false, percent: 90 };
                 return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
             },

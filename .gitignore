@@ -114,6 +114,9 @@ omlx/admin/tailwindcss-*
 # Git worktrees
 .worktrees/
 
+# UV lockfile
+uv.lock
+
 # User local configurations and tools
 MEMORY/
 benchmark_qwen35.py

@@ -1273,10 +1273,39 @@ class TestTrackedTensor:
         # no-args reverses all axes
         assert t.transpose().transform == "transpose_2_1_0"
 
-    def test_getitem_ellipsis_raises(self):
+    def test_getitem_ellipsis_half_split(self):
+        # Sanitize patterns like gate_up[..., :mid, :] must round-trip through
+        # the tracked-tensor dry run so streaming discovery covers low-RAM
+        # quantization paths (see #1204).
+        t = _TrackedTensor((256, 2048, 384), "F16", sources=["gate_up"])
+        first = t[..., :1024, :]
+        assert first.shape == (256, 1024, 384)
+        assert first.transform == "split_0_2"
+        assert first.axis == 1
+        second = t[..., 1024:, :]
+        assert second.transform == "split_1_2"
+
+    def test_getitem_ellipsis_trailing(self):
+        t = _TrackedTensor((4, 8, 16), "F16", sources=["a"])
+        r = t[..., :4]
+        assert r.shape == (4, 8, 4)
+        assert r.transform == "slice"
+
+    def test_getitem_ellipsis_zero_pad(self):
+        # Ellipsis with no axes to fill (rank already covered)
+        t = _TrackedTensor((4, 8), "F16", sources=["a"])
+        r = t[..., 0:4, :]
+        assert r.shape == (4, 8)
+
+    def test_getitem_ellipsis_middle(self):
+        t = _TrackedTensor((2, 3, 4, 5), "F16", sources=["a"])
+        r = t[0, ..., 2:4]
+        assert r.shape == (3, 4, 2)
+
+    def test_getitem_multiple_ellipsis_raises(self):
         t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
-        with pytest.raises(NotImplementedError):
-            t[..., :2]
+        with pytest.raises(ValueError):
+            t[..., :2, ...]
 
     def test_size_property(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
@@ -1503,6 +1532,50 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
 
         with pytest.raises(RuntimeError, match="auto_proxy_sensitivity is disabled"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                auto_proxy_sensitivity=False,
+            )
+
+    def test_streaming_discovery_failure_with_model_exceeding_ram_raises(
+        self, tmp_path, monkeypatch
+    ):
+        """#1204: discovery failure + model > RAM must hard-fail. The old
+        behaviour was a silent ``logger.error`` followed by the source weight
+        names landing in the output, which loaded with "Received N parameters
+        not in model"."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import settings as _settings
+
+        monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
+
+        # Force a sanitize_fn that fails during the tracked-tensor dry run,
+        # mimicking an indexing pattern _TrackedTensor cannot trace.
+        from omlx import oq as _oq
+
+        def _broken_sanitize(weights):
+            raise NotImplementedError("simulated unsupported indexing pattern")
+
+        monkeypatch.setattr(
+            _oq, "_build_model_sanitizer", lambda *a, **k: _broken_sanitize
+        )
+
+        with pytest.raises(
+            RuntimeError, match="streaming sanitize-plan discovery failed"
+        ):
             quantize_oq_streaming(
                 str(src),
                 str(tmp_path / "out"),
@@ -2063,4 +2136,101 @@ class TestBuildModelSanitizerTextOnly:
 
 
 # =============================================================================
-# Test GPTQ quantization
+# Test _build_proxy_for_sensitivity MTP patch integration
+# =============================================================================
+
+
+class TestBuildProxyForSensitivityMtpPatch:
+    """Tests for the MTP patch gating in _build_proxy_for_sensitivity.
+
+    The function must temporarily activate the MTP patch during
+    ``mlx_lm.convert()`` so that MTP-bearing models (Qwen3.5, DeepSeek-V4)
+    are converted correctly. After conversion the previous MTP state must
+    be restored regardless of success or failure.
+    """
+
+    def _make_mocks(self, patch_return=True, is_active=False, convert_side_effect=None):
+        mock_apply = MagicMock(return_value=patch_return)
+        mock_is_active = MagicMock(return_value=is_active)
+        mock_set_active = MagicMock()
+        mock_convert = MagicMock(side_effect=convert_side_effect)
+        return (
+            MagicMock(
+                apply_mlx_lm_mtp_patch=mock_apply,
+                is_mtp_active=mock_is_active,
+                set_mtp_active=mock_set_active,
+            ),
+            mock_apply, mock_is_active, mock_set_active, mock_convert,
+        )
+
+    def _patch(self, monkeypatch, mtp_mod, mock_convert):
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", mtp_mod)
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
+
+    def test_happy_path_with_active_patch(self, tmp_path, monkeypatch):
+        """MTP patch applied → state toggled → convert called with correct kwargs → state restored."""
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = self._make_mocks()
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        result = _build_proxy_for_sensitivity(
+            "/my/model", dtype="bfloat16", working_dir=str(tmp_path), trust_remote_code=True,
+        )
+
+        assert isinstance(result, Path)
+        assert result.name.startswith("omlx_oq_proxy_")
+        assert result.parent == tmp_path
+
+        mock_apply.assert_called_once()
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[0] == ((True,),)
+        assert mock_set_active.call_args_list[-1] == ((False,),)
+
+        kw = mock_convert.call_args.kwargs
+        assert kw["hf_path"] == "/my/model"
+        assert kw["quantize"] is True
+        assert kw["q_bits"] == _PROXY_QUANT_BITS
+        assert kw["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert kw["q_mode"] == "affine"
+        assert kw["dtype"] == "bfloat16"
+        assert kw["trust_remote_code"] is True
+
+    @pytest.mark.parametrize("prev_state", [False, True])
+    def test_state_restored_on_error(self, tmp_path, monkeypatch, prev_state):
+        """Convert error → finally block restores previous MTP state."""
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
+            convert_side_effect=RuntimeError("boom"), is_active=prev_state,
+        )
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _build_proxy_for_sensitivity(
+                "/fake/model", dtype="float16", working_dir=str(tmp_path),
+            )
+
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[-1] == ((prev_state,),)
+
+    def test_patch_returns_false_no_toggle(self, tmp_path, monkeypatch):
+        """apply_mlx_lm_mtp_patch returns False → no MTP toggle, convert is still called."""
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(patch_return=False)
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        _build_proxy_for_sensitivity(
+            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+        )
+
+        mock_set_active.assert_not_called()
+        mock_convert.assert_called_once()
+
+    def test_import_fails_graceful_degradation(self, tmp_path, monkeypatch):
+        """MTP patch import raises → function proceeds without MTP gating."""
+        mock_convert = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", None)
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
+
+        result = _build_proxy_for_sensitivity(
+            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+        )
+
+        assert isinstance(result, Path)
+        mock_convert.assert_called_once()
