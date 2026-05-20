@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -139,6 +139,9 @@ class ModelSettingsRequest(BaseModel):
     dflash_in_memory_cache_max_entries: int | None = None
     dflash_in_memory_cache_max_bytes: int | None = None
     dflash_ssd_cache: bool | None = None
+    dflash_draft_window_size: int | None = None
+    dflash_draft_sink_size: int | None = None
+    dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -1613,6 +1616,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
             "estimated_size_formatted": format_size(model_info.get("estimated_size", 0)),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
             "pinned": model_info.get("pinned", False),
             "is_default": server_state.default_model == model_id if server_state else False,
             "engine_type": model_info.get("engine_type", "batched"),
@@ -1939,6 +1948,25 @@ async def update_model_settings(
                     ),
                 )
         current_settings.dflash_ssd_cache = ssd_requested
+    if "dflash_draft_window_size" in sent:
+        # 0 / None / negative → fall back to dflash-mlx internal default (1024).
+        value = request.dflash_draft_window_size
+        current_settings.dflash_draft_window_size = (
+            int(value) if value and value > 0 else None
+        )
+    if "dflash_draft_sink_size" in sent:
+        # Negative is invalid; 0 is a legal sink-size (no sink tokens).
+        value = request.dflash_draft_sink_size
+        current_settings.dflash_draft_sink_size = (
+            int(value) if value is not None and value >= 0 else None
+        )
+    if "dflash_verify_mode" in sent:
+        value = request.dflash_verify_mode
+        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
+        # Anything else (including empty string) → revert to dflash default.
+        current_settings.dflash_verify_mode = (
+            value if value in ("dflash", "adaptive", "ddtree", "off") else None
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3483,6 +3511,13 @@ def _build_runtime_cache_observability(
         }
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+    cache_cfg = global_settings.cache
+    try:
+        cfg_disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+    except (ValueError, OSError, TypeError) as exc:
+        logger.warning("Could not read SSD cache max size from config: %s", exc)
+        cfg_disk_max = 0
+
     payload = {
         "base_path": str(global_settings.base_path),
         "ssd_cache_dir": str(cache_dir),
@@ -3491,6 +3526,10 @@ def _build_runtime_cache_observability(
         "total_num_files": 0,
         "total_size_bytes": 0,
         "effective_block_sizes": [],
+        "disk_max_bytes": cfg_disk_max,
+        "hot_cache_max_bytes": 0,
+        "hot_cache_size_bytes": 0,
+        "hot_cache_entries": 0,
     }
 
     engine_pool = _get_engine_pool()
@@ -3602,10 +3641,15 @@ def _build_runtime_cache_observability(
             "last_tokens_to_next_block": last_tokens_to_next_block,
             "num_files": int(ssd_stats.get("num_files", 0) or 0),
             "total_size_bytes": int(ssd_stats.get("total_size_bytes", 0) or 0),
+            "max_size_bytes": int(ssd_stats.get("max_size_bytes", 0) or 0),
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
         }
+
+        cache_rates = runtime_stats.get("cache_rates")
+        if cache_rates:
+            model_payload["cache_rates"] = cache_rates
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -3615,6 +3659,26 @@ def _build_runtime_cache_observability(
             block_sizes.add(block_size)
 
     payload["effective_block_sizes"] = sorted(block_sizes)
+
+    # Aggregate hot-cache and disk-max across models.
+    # hot_cache_max sums across models (each model reserves its own slice of
+    # the same process-wide hot cache budget) so the gauge denominator matches
+    # the summed numerator.  disk_max keeps the config fallback via max()
+    # because a single SSD cache directory is shared — the effective cap is
+    # the largest configured limit, not a per-model sum.
+    hot_cache_max = 0
+    disk_max = payload["disk_max_bytes"]
+    hot_cache_size_total = 0
+    hot_cache_entries_total = 0
+    for m in payload["models"]:
+        hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
+        hot_cache_entries_total += m.get("hot_cache_entries", 0)
+        hot_cache_max += m.get("hot_cache_max_bytes", 0)
+        disk_max = max(disk_max, m.get("max_size_bytes", 0))
+    payload["hot_cache_max_bytes"] = hot_cache_max
+    payload["hot_cache_size_bytes"] = hot_cache_size_total
+    payload["hot_cache_entries"] = hot_cache_entries_total
+    payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache
     # directory directly so the dashboard still shows real disk usage.
@@ -3698,11 +3762,22 @@ def _build_active_models_data() -> dict:
     from ..prefill_progress import get_prefill_tracker
 
     engine_pool = _get_engine_pool()
+    server_state = _get_server_state()
     if engine_pool is None:
         return {
             "models": [],
             "model_memory_used": 0,
             "model_memory_max": 0,
+            "memory_pressure": {
+                "enabled": False,
+                "current_bytes": 0,
+                "soft_bytes": 0,
+                "hard_bytes": 0,
+                "current_formatted": "0.0GB",
+                "soft_formatted": "0.0GB",
+                "hard_formatted": "0.0GB",
+                "pressure_level": "ok",
+            },
             "total_active_requests": 0,
             "total_waiting_requests": 0,
         }
@@ -3710,6 +3785,12 @@ def _build_active_models_data() -> dict:
     now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
+    enforcer = (
+        getattr(server_state, "process_memory_enforcer", None)
+        if server_state is not None
+        else None
+    )
+    enforcer_status = enforcer.get_status() if enforcer is not None else None
     models = []
     total_active = 0
     total_waiting = 0
@@ -3827,6 +3908,12 @@ def _build_active_models_data() -> dict:
             "estimated_size_formatted": format_size(
                 model_info.get("estimated_size", 0)
             ),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
             "loading_elapsed_seconds": loading_elapsed_seconds,
@@ -3847,6 +3934,44 @@ def _build_active_models_data() -> dict:
         "models": models,
         "model_memory_used": status.get("current_model_memory", 0),
         "model_memory_max": status.get("max_model_memory", 0),
+        "memory_pressure": {
+            "enabled": bool(enforcer_status and enforcer_status.get("enabled")),
+            "current_bytes": (
+                enforcer_status.get("current_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "soft_bytes": (
+                enforcer_status.get("soft_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "hard_bytes": (
+                enforcer_status.get("hard_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "current_formatted": (
+                enforcer_status.get("current_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "soft_formatted": (
+                enforcer_status.get("soft_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "hard_formatted": (
+                enforcer_status.get("hard_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "pressure_level": (
+                enforcer_status.get("pressure_level", "ok")
+                if enforcer_status is not None
+                else "ok"
+            ),
+        },
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
     }
@@ -3870,6 +3995,30 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
+def _iter_loaded_schedulers():
+    """Yield (model_id, scheduler) for each loaded model.
+
+    Traverses the internal engine hierarchy: pool entry → async engine →
+    core engine → scheduler.  Both ``clear_ssd_cache`` and
+    ``clear_hot_cache`` share this traversal.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return
+    for model_info in engine_pool.get_status().get("models", []):
+        model_id = model_info.get("id")
+        if not model_id or not model_info.get("loaded"):
+            continue
+        entry = engine_pool._entries.get(model_id)
+        if entry is None or entry.engine is None:
+            continue
+        async_core = getattr(entry.engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+        if scheduler is not None:
+            yield model_id, scheduler
+
+
 @router.post("/api/ssd-cache/clear")
 async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """Clear all SSD cache files for all loaded models.
@@ -3880,38 +4029,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """
     total_deleted = 0
 
-    # Phase 1: clear via loaded models' cache managers (updates in-memory index)
-    engine_pool = _get_engine_pool()
-    if engine_pool is not None:
-        for model_info in engine_pool.get_status().get("models", []):
-            model_id = model_info.get("id")
-            if not model_id or not model_info.get("loaded"):
-                continue
-
-            entry = engine_pool._entries.get(model_id)
-            if entry is None or entry.engine is None:
-                continue
-
-            async_core = getattr(entry.engine, "_engine", None)
-            core = (
-                getattr(async_core, "engine", None) if async_core is not None else None
-            )
-            scheduler = (
-                getattr(core, "scheduler", None) if core is not None else None
-            )
-
-            if scheduler is not None:
-                ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
-                if ssd_manager is not None:
-                    try:
-                        deleted = ssd_manager.clear()
-                        total_deleted += deleted
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to clear SSD cache for model '%s': %s",
-                            model_id,
-                            exc,
-                        )
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is not None:
+            try:
+                total_deleted += ssd_manager.clear()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear SSD cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
 
     # Phase 2: remove any remaining files on disk (covers unloaded models)
     global_settings = _get_global_settings()
@@ -3935,6 +4063,31 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
+
+
+@router.post("/api/hot-cache/clear")
+async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
+    """Clear the in-memory (hot) cache for all loaded models.
+
+    No filesystem fallback needed — hot cache is in-memory only and does
+    not survive process restart.
+    """
+    total_cleared = 0
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
+            try:
+                total_cleared += ssd_manager.clear_hot_cache()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear hot cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+        rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
+        if rate_tracker is not None:
+            rate_tracker.clear()
+    return {"status": "ok", "total_cleared": total_cleared}
 
 
 @router.post("/api/cache/probe")
@@ -4235,9 +4388,30 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    # Filtering
+    min_params: Optional[int] = None,
+    max_params: Optional[int] = None,
+    min_size: Optional[int] = None,  # bytes
+    max_size: Optional[int] = None,  # bytes
+    # Sorting
+    sort_by_size: bool = False,
+    sort_ascending: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
-    """Search HuggingFace models by query."""
+    """Search HuggingFace models by query with filtering and sorting.
+
+    Query Parameters:
+        q: Search query string (required)
+        sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
+        limit: Maximum results (max 100)
+        mlx_only: Restrict to MLX library models
+        min_params: Minimum parameter count
+        max_params: Maximum parameter count
+        min_size: Minimum model size in bytes
+        max_size: Maximum model size in bytes
+        sort_by_size: Sort results by size instead of default sort
+        sort_ascending: Sort in ascending order
+    """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
 
@@ -4249,6 +4423,12 @@ async def search_hf_models(
             sort=sort,
             limit=min(limit, 100),
             mlx_only=mlx_only,
+            min_params=min_params,
+            max_params=max_params,
+            min_size=min_size,
+            max_size=max_size,
+            sort_by_size=sort_by_size,
+            sort_ascending=sort_ascending,
         )
         return result
     except TimeoutError:

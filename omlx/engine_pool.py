@@ -56,6 +56,7 @@ class EngineEntry:
     model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -521,6 +522,7 @@ class EnginePool:
         # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
+        entry.actual_size = None
 
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
@@ -621,6 +623,7 @@ class EnginePool:
         load_started_at = entry.loading_started_at
         load_completed = False
         entry.abort_loading = False
+        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
             if force_lm and effective_type == "vlm":
@@ -759,7 +762,13 @@ class EnginePool:
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"DFlash load failed: {start_error}; "
+                            f"{effective_type} fallback also failed: {fallback_error}"
+                        ) from start_error
                     logger.info(
                         f"Successfully loaded {model_id} as {effective_type} "
                         f"(fallback from DFlash)"
@@ -790,7 +799,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"LM load failed (force_lm=True): {start_error}; "
+                            f"VLM fallback also failed: {fallback_error}"
+                        ) from start_error
 
                     logger.info(
                         f"Successfully loaded {model_id} as VLM "
@@ -819,7 +834,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"VLM load failed: {start_error}; "
+                            f"LLM fallback also failed: {fallback_error}"
+                        ) from start_error
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
@@ -913,9 +934,14 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
+            post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+            observed_delta = max(0, post_load_memory - pre_load_memory)
+            entry.actual_size = observed_delta or entry.estimated_size
+
             logger.info(
                 f"Loaded model: {model_id} "
-                f"(estimated: {format_size(entry.estimated_size)}, "
+                f"(actual: {format_size(entry.actual_size)}, "
+                f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
@@ -992,6 +1018,7 @@ class EnginePool:
                     "is_loading": e.is_loading,
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
+                    "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
