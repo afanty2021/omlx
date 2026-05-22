@@ -17,6 +17,7 @@ import re
 import secrets
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -139,6 +140,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_in_memory_cache_max_entries: int | None = None
     dflash_in_memory_cache_max_bytes: int | None = None
     dflash_ssd_cache: bool | None = None
+    dflash_ssd_cache_max_bytes: int | None = None
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
@@ -1095,11 +1097,11 @@ def get_system_memory_info() -> dict:
         and auto_limit_formatted (80% of total).
     """
     try:
-        # macOS: use sysctl to get physical memory
-        import subprocess
-
+        # macOS: use sysctl to get physical memory. Invoke by absolute path —
+        # sysctl lives in /usr/sbin, which isn't on PATH in some headless
+        # launchd contexts (brew services). See issue #1322.
         result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1948,6 +1950,10 @@ async def update_model_settings(
                     ),
                 )
         current_settings.dflash_ssd_cache = ssd_requested
+    if "dflash_ssd_cache_max_bytes" in sent and request.dflash_ssd_cache_max_bytes:
+        current_settings.dflash_ssd_cache_max_bytes = int(
+            request.dflash_ssd_cache_max_bytes
+        )
     if "dflash_draft_window_size" in sent:
         # 0 / None / negative → fall back to dflash-mlx internal default (1024).
         value = request.dflash_draft_window_size
@@ -2165,6 +2171,7 @@ async def update_model_settings(
             or "dflash_in_memory_cache_max_entries" in sent
             or "dflash_in_memory_cache_max_bytes" in sent
             or "dflash_ssd_cache" in sent
+            or "dflash_ssd_cache_max_bytes" in sent
             # trust_remote_code is plumbed at model load time; toggling it on
             # an already-loaded engine has no effect until reload.
             or "trust_remote_code" in sent
