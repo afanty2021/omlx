@@ -600,6 +600,8 @@ class SchedulerConfig:
     policy: SchedulingPolicy = SchedulingPolicy.FCFS
     # BatchGenerator settings (passed directly to mlx-lm)
     completion_batch_size: int = 32
+    # Per-forward embedding input chunk size
+    embedding_batch_size: int = 32
     prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
@@ -2425,6 +2427,7 @@ class Scheduler:
             except RuntimeError as e:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
+                self._release_paged_cache_for_request(rid)
                 self.requests.pop(rid, None)
                 get_prefill_tracker().remove(rid)
                 # Drop Metal cache pool buffers held by the aborted chunk's
@@ -2518,13 +2521,23 @@ class Scheduler:
         During external prefill we have direct access to per-layer cache
         objects (not BatchKVCache). Extract non-sliceable layers for
         boundary snapshot storage.
+
+        Pass ``request_id`` directly. The request is mid-prefill and has
+        not been inserted into ``BatchGenerator`` yet, so
+        ``request_id_to_uid`` has no entry for it. The earlier shape
+        routed through ``self.request_id_to_uid.get(request_id, -1)`` →
+        ``uid_to_request_id.get(-1)`` → ``None`` → silent return,
+        dropping every snapshot. For ArraysCache / GDN / hybrid models
+        that made every non-last block store a placeholder, and the
+        next identical-prompt request rejected the cache and re-
+        prefilled from scratch.
         """
         snapshot_cache = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
         ]
         self._on_prefill_boundary_snapshot(
-            self.request_id_to_uid.get(request.request_id, -1),
+            request.request_id,
             snapshot_cache,
             total_tokens,
         )
@@ -2856,20 +2869,23 @@ class Scheduler:
 
     def _on_prefill_boundary_snapshot(
         self,
-        uid: int,
+        request_id: str,
         snapshot_cache: list[Any],
         token_count: int,
     ) -> None:
-        """Record boundary snapshots captured during prefill processing."""
+        """Record boundary snapshots captured during prefill processing.
+
+        Called from ``_emit_prefill_boundary_snapshot`` at each block
+        boundary crossed during prefill. Keyed by ``request_id`` rather
+        than ``uid`` because the request has not been inserted into
+        ``BatchGenerator`` yet and the uid mapping does not exist —
+        routing through it dropped every snapshot silently (#TBD).
+        """
         if self.block_aware_cache is None:
             return
 
         block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
-            return
-
-        request_id = self.uid_to_request_id.get(uid)
-        if request_id is None:
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
@@ -4749,6 +4765,7 @@ class Scheduler:
                     f"Request {request.request_id} rejected by prefill "
                     f"memory guard: {preflight_error}"
                 )
+                self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
                 rejected_outputs.append(
                     RequestOutput(
@@ -5024,6 +5041,7 @@ class Scheduler:
                             request.request_id,
                             e,
                         )
+                        self._release_paged_cache_for_request(request.request_id)
                         self.requests.pop(request.request_id, None)
                         get_prefill_tracker().remove(request.request_id)
                         # Drop Metal cache pool buffers held by the aborted
@@ -5075,6 +5093,7 @@ class Scheduler:
                     logger.error("Prefill failed for %s: %s", request.request_id, e)
                     self.uid_to_request_id.pop(temp_uid, None)
                     self.request_id_to_uid.pop(request.request_id, None)
+                    self._release_paged_cache_for_request(request.request_id)
                     self.requests.pop(request.request_id, None)
                     get_prefill_tracker().remove(request.request_id)
                     # Drop Metal cache pool buffers held by the aborted
@@ -5456,6 +5475,24 @@ class Scheduler:
             outputs.append(output)
 
         return outputs, finished_ids
+
+    def _release_paged_cache_for_request(self, request_id: str) -> None:
+        """Drop a request's paged-cache footprint on rejection paths.
+
+        ``add_request`` routes through ``block_aware_cache.fetch_cache``
+        which records the request in ``_request_tables`` and increments
+        ref counts on every prefix-matched paged-cache block. The normal
+        completion path releases that state in ``_cleanup_finished``;
+        the prefill-rejection paths in ``_advance_chunked_prefills`` /
+        ``_schedule_waiting`` must do the same or rejected requests
+        leak block refs (pinning the paged cache and compounding the
+        very memory pressure that triggered the rejection) and orphan
+        ``_request_tables`` entries.
+        """
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.release_cache(request_id)
+        elif self.paged_cache_manager is not None:
+            self.paged_cache_manager.delete_block_table(request_id)
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
@@ -6245,6 +6282,27 @@ class Scheduler:
                 logger.debug("Could not extract model config for memory estimation")
                 return
 
+            # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
+            # language-model dimensions under a sub-config. Prefer
+            # ``text_config`` / ``language_config`` / ``llm_config`` when ANY
+            # of them exposes the LM layer count, even if the top-level config
+            # also has one — on some VLM packs (older Gemma-3, certain Llava /
+            # HF auto-wrappers) the top-level field refers to the *vision
+            # encoder*, not the LM, and accepting it silently miscalibrates
+            # the SDPA-peak estimate by a constant factor (a 40-layer LM
+            # wrapped in a 33-layer vision tower under-estimates by ~20 %).
+            # Probe both ``num_hidden_layers`` and the legacy ``n_layer`` alias
+            # so a GPT-style nested config is also picked up. Falls back to the
+            # top-level config only when no sub-config has either field.
+            for sub_attr in ("text_config", "language_config", "llm_config"):
+                sub = getattr(config, sub_attr, None)
+                if sub is not None and (
+                    getattr(sub, "num_hidden_layers", None)
+                    or getattr(sub, "n_layer", None)
+                ):
+                    config = sub
+                    break
+
             # Extract KV cache dimensions
             num_layers = getattr(config, "num_hidden_layers", None) or getattr(
                 config, "n_layer", None
@@ -6348,12 +6406,24 @@ class Scheduler:
                 else None
             )
 
+            # Pass current model identity so stale blocks from a prior model
+            # version (e.g., 30-layer cache after an upgrade to 40 layers via
+            # #1404) are unlinked at startup instead of triggering a layer
+            # mismatch reject on every prefix lookup. See #1413.
+            expected_num_layers = (
+                self.block_aware_cache.expected_num_layers
+                if self.block_aware_cache is not None
+                else 0
+            )
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
+                expected_model_name=self.config.model_name or "",
+                expected_num_layers=expected_num_layers,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager

@@ -614,6 +614,8 @@ class PagedSSDCacheManager(CacheManager):
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
+        expected_model_name: str = "",
+        expected_num_layers: int = 0,
     ):
         """
         Initialize the SSD cache manager.
@@ -626,11 +628,21 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            expected_model_name: Current model name. Blocks saved for a
+                different model name are unlinked at startup. Empty string
+                disables this check (backwards compatible).
+            expected_num_layers: Current cache-layer count. Blocks saved with
+                a different num_layers are unlinked at startup. 0 disables
+                this check (backwards compatible). Catches stale blocks left
+                over after a model upgrade changes its effective layer count
+                (e.g., #1404 attaching MTPModule changed 30 → 40 layers).
         """
         self._cache_dir = cache_dir
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._hot_cache_only = hot_cache_only
+        self._expected_model_name = expected_model_name
+        self._expected_num_layers = expected_num_layers
         self._lock = threading.RLock()
 
         # Disk usage cache for dynamic effective max size (30s TTL)
@@ -889,11 +901,20 @@ class PagedSSDCacheManager(CacheManager):
         return self._cache_dir / subdir / filename
 
     def _scan_existing_files(self) -> None:
-        """Scan cache directory for existing files and build index."""
+        """Scan cache directory for existing files and build index.
+
+        Unlinks blocks whose stored metadata (num_layers / model_name) does
+        not match the currently loaded model. Without this, an oMLX upgrade
+        that changes a model's effective layer count would leave the old
+        blocks on disk forever, hitting the layer-mismatch reject path on
+        every prefix lookup (see #1413).
+        """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
         scanned = 0
         indexed = 0
+        invalidated = 0
+        invalidated_bytes = 0
         errors = 0
 
         for subdir in self.SUBDIR_CHARS:
@@ -905,17 +926,53 @@ class PagedSSDCacheManager(CacheManager):
                 scanned += 1
                 try:
                     metadata = self._read_file_metadata(file_path)
-                    if metadata:
-                        self._index.add(metadata)
-                        indexed += 1
+                    if metadata is None:
+                        continue
+                    if self._is_stale_block(metadata):
+                        file_size = metadata.file_size
+                        try:
+                            file_path.unlink(missing_ok=True)
+                            invalidated += 1
+                            invalidated_bytes += file_size
+                        except OSError as e:
+                            logger.warning(
+                                f"Failed to unlink stale SSD block "
+                                f"{file_path}: {e}"
+                            )
+                            errors += 1
+                        continue
+                    self._index.add(metadata)
+                    indexed += 1
                 except Exception as e:
                     logger.warning(f"Failed to read {file_path}: {e}")
                     errors += 1
 
-        logger.info(
+        log_msg = (
             f"SSD cache scan complete: scanned={scanned}, indexed={indexed}, "
             f"errors={errors}, total_size={format_bytes(self._index.total_size)}"
         )
+        if invalidated > 0:
+            log_msg += (
+                f", invalidated_stale={invalidated} blocks "
+                f"({format_bytes(invalidated_bytes)})"
+            )
+        logger.info(log_msg)
+
+    def _is_stale_block(self, metadata: PagedSSDBlockMetadata) -> bool:
+        """Return True if the block was saved for a different model or
+        layer count than the currently loaded model.
+
+        Returns False whenever the matching expected field is not provided
+        or the metadata side is missing, so existing callers that omit the
+        new init args see no behavior change.
+        """
+        if self._expected_model_name and metadata.model_name:
+            if metadata.model_name != self._expected_model_name:
+                return True
+        if self._expected_num_layers > 0 and metadata.num_layers > 0:
+            if metadata.num_layers != self._expected_num_layers:
+                return True
+        return False
 
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
         """

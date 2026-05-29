@@ -18,6 +18,8 @@ import argparse
 import faulthandler
 import sys
 
+from ._version import __version__
+
 
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
@@ -32,6 +34,8 @@ def _has_cli_overrides(args) -> bool:
     if hasattr(args, "host") and args.host is not None:
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
+        return True
+    if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
         return True
     if hasattr(args, "mcp_config") and args.mcp_config is not None:
         return True
@@ -128,6 +132,14 @@ def serve_command(args):
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
 
+    # Validate before persisting CLI overrides, so invalid flags never poison
+    # settings.json.
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        sys.exit(1)
+
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
@@ -152,13 +164,6 @@ def serve_command(args):
     crash_log_path = log_dir / "crash.log"
     _crash_file = open(crash_log_path, "a")
     faulthandler.enable(file=_crash_file, all_threads=True)
-
-    # Validate settings
-    errors = settings.validate()
-    if errors:
-        for error in errors:
-            print(f"Configuration error: {error}")
-        sys.exit(1)
 
     # Import server and config
     from .server import app, init_server
@@ -499,6 +504,12 @@ Examples:
   omlx launch codex --model qwen3.5
         """,
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=__version__,
+        help="Print the oMLX version and exit",
+    )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Serve command (multi-model)
@@ -556,6 +567,12 @@ Example directory structure:
         type=int,
         default=None,
         help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=None,
+        help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
     )
 
     # paged SSD cache options
