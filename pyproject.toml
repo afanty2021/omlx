@@ -74,8 +74,9 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (f96138e) - Gemma4 MTP server batching (PR #1166), speculative utils refactor (PR #1169), Qwen native MTP drafter, MiniCPM-V 4.6
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    # mlx-vlm from commit (11001b6) - LFM2 MoE (#1237), HRM-Text (#1238), masked diffusion controls (#1235), FLUX.2 editing (#1236), Bonsai quality, FLUX.2 base/klein (#1232), LLaDA2.X (#1230)
+    # Using local path for development (from /Users/berton/Github/mlx-vlm)
+    "mlx-vlm @ file:///Users/berton/Github/mlx-vlm",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
     # Using local path for development (from /Users/berton/Github/dflash-mlx)
