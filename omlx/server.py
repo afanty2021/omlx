@@ -81,6 +81,7 @@ from .api.anthropic_utils import (
     create_text_delta_event,
     create_thinking_delta_event,
     map_finish_reason_to_stop_reason,
+    request_has_cache_control,
 )
 
 # Import from new modular API
@@ -1059,10 +1060,19 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority: model setting > global setting.
+    Priority (#1308):
+        1. Explicit per-model setting (admin UI / settings.json override).
+        2. Context length discovered from the model's ``config.json`` at
+           server startup (``max_position_embeddings`` etc.); without
+           this tier the server would advertise the 32 K global default
+           even for models that declare 256 K+ natively.
+        3. Global default from ``SamplingConfig`` — last-resort fallback
+           for models whose config files don't expose a context length.
 
     Returns:
-        Max context window token count, or None if not set.
+        Max context window token count, or ``None`` if no tier resolves
+        (only possible when neither the model nor the global default
+        provides a value, which shouldn't happen in practice).
     """
     # Resolve alias so per-model settings are found by real model ID
     model_id = resolve_model_id(model_id)
@@ -1073,6 +1083,12 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
 
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
+
+    pool = _server_state.engine_pool
+    if model_id and pool is not None:
+        entry = pool.get_entry(model_id)
+        if entry is not None and entry.model_context_length is not None:
+            return entry.model_context_length
 
     return _server_state.sampling.max_context_window
 
@@ -1730,6 +1746,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                         "function_calling": True,
                         "max_tokens": max_tok,
                     },
+                    max_model_len=get_max_context_window(model_id),
                 )
             )
 
@@ -2629,6 +2646,8 @@ def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
     protocol structure (thinking tags, channel markers, etc.) and patches
     the user's grammar into the output slot.
     """
+    from omlx._torch_stub import install as _install_torch_stub
+    _install_torch_stub()
     import xgrammar as xgr
 
     reasoning = not (
@@ -3210,6 +3229,13 @@ async def stream_anthropic_messages(
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
 
+    # Does the client opt into Anthropic's cache_control accounting?
+    # When yes, message_start.input_tokens reports the post-partition value
+    # (0 here, since we approximate the whole prompt as belonging to the
+    # cache_control region — the final message_delta refines with the real
+    # cache hit count). When no, input_tokens carries the full prompt count.
+    uses_cache_control = request_has_cache_control(request)
+
     # Calculate input tokens before streaming starts
     # This is needed for message_start event
     estimated_input_tokens = 0
@@ -3232,7 +3258,11 @@ async def stream_anthropic_messages(
     yield create_message_start_event(
         message_id=message_id,
         model=request.model,
-        input_tokens=scale_anthropic_tokens(estimated_input_tokens, request.model),
+        input_tokens=(
+            0
+            if uses_cache_control
+            else scale_anthropic_tokens(estimated_input_tokens, request.model)
+        ),
     )
 
     # 3. Stream content with thinking/content separation
@@ -3475,7 +3505,7 @@ async def stream_anthropic_messages(
         output_tokens=actual_output_tokens,
         input_tokens=actual_input_tokens,
         cached_tokens=actual_cached_tokens,
-        prefix_cache_enabled=engine.prefix_cache_enabled,
+        request_uses_cache_control=uses_cache_control,
     )
 
     # Record metrics
@@ -3784,7 +3814,7 @@ async def create_anthropic_message(
             tool_calls=tool_calls,
             thinking=cleaned_thinking if cleaned_thinking else None,
             cached_tokens=scale_anthropic_tokens(output.cached_tokens, request.model),
-            prefix_cache_enabled=engine.prefix_cache_enabled,
+            request_uses_cache_control=request_has_cache_control(request),
         )
 
         return response.model_dump_json()

@@ -109,7 +109,7 @@ paroquant = [
     "paroquant==0.1.14; python_version >= '3.11'",
 ]
 # Internal extra consumed by packaging/build.py to populate the
-# venvstacks mlx-framework layer's requirements list. Listed here as the
+# venvstacks mlx-base layer's requirements list. Listed here as the
 # single source of truth so the layer-template venvstacks.toml stays
 # version-free. End-users don't `pip install omlx[bundle]`; this is for
 # the macOS .app build pipeline.

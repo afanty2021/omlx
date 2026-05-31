@@ -111,6 +111,25 @@ def apply() -> bool:
             "mtp.norm.weight",
         )
 
+        # MTP-head norms can ship in a different convention than the backbone,
+        # even MIXED within the head (JANG MXFP4 Qwen3.6 bundles keep
+        # ``mtp.norm`` in MLX's +1 convention while the per-layer head norms
+        # remain raw-HF, mean ~= 0). The backbone-only conv1d signal never
+        # shifts those head norms, so every head RMSNorm multiplies by ~0 and
+        # MTP draft acceptance collapses to ~0%. Decide PER-KEY for MTP norms
+        # from each weight's own magnitude (raw-HF center ~0, MLX-shifted ~1).
+        # Mirrors the fix in mlx_lm_mtp/qwen35_model.py. The magnitude is
+        # unreadable during oQ streaming plan discovery (the weight is a
+        # no-data ``_TrackedTensor`` and ``mx.mean(...).item()`` raises), so
+        # fall back to the shape-based ``should_shift_norm_weights`` there, or
+        # the +1 shift is dropped from the plan and the oQ output ships
+        # unshifted MTP norms (the ~0% acceptance bug, baked into the artifact).
+        def _mtp_norm_is_raw_hf(_w, _fallback):
+            try:
+                return float(mx.mean(_w.astype(mx.float32)).item()) < 0.5
+            except Exception:
+                return _fallback
+
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
@@ -135,10 +154,17 @@ def apply() -> bool:
                 # monkey-patch in omlx.oq when called with _TrackedTensor;
                 # the instance method on the tracker doesn't exist.
                 value = mx.moveaxis(value, 2, 1)
-            if should_shift_norm_weights and any(
-                key.endswith(sfx) for sfx in norm_keys
-            ):
-                if value.ndim == 1:
+            if value.ndim == 1 and any(key.endswith(sfx) for sfx in norm_keys):
+                # ``key`` is already remapped to ``language_model.mtp.*`` for
+                # MTP weights here, so test the ``mtp.`` substring.
+                if "mtp." in key:
+                    # Per-key: a head norm may still be raw-HF even when a
+                    # sibling head norm (e.g. mtp.norm) is already shifted.
+                    # Under oQ tracking the magnitude is unreadable, so fall
+                    # back to the backbone signal (same for a raw-HF source).
+                    if _mtp_norm_is_raw_hf(value, should_shift_norm_weights):
+                        value = value + 1.0
+                elif should_shift_norm_weights:
                     value = value + 1.0
 
             sanitized_weights[key] = value

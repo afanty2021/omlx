@@ -340,6 +340,11 @@ class ProcessMemoryEnforcer:
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
+        # Engine types we've already complained about in
+        # ``_propagate_memory_limit``'s "scheduler unreachable" path.
+        # Prevents the per-poll warning from spamming logs while keeping
+        # the first occurrence loud enough to alert CI / oncall.
+        self._scheduler_resolve_warned: set[str] = set()
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -503,6 +508,29 @@ class ProcessMemoryEnforcer:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
 
+    def _get_abort_limit_bytes(self) -> int:
+        """Stable physical cap used to ABORT an in-flight prefill.
+
+        Deliberately excludes the dynamic ceiling: that value jitters every
+        poll with other-app pressure, and a transient dip must not kill a
+        near-complete prefill whose usage actually fits the physical envelope.
+        We use ``min(static_ceiling, metal_cap)`` — exactly the limit
+        ``start()`` arms via ``mx.set_wired_limit`` — so allocating up to it
+        cannot trigger a Metal clamp/panic. The dynamic ceiling still governs
+        chunk-size throttling and admission elsewhere; this is only the
+        last-resort kill threshold.
+
+        Returns 0 when the guard is disabled (callers treat 0 as "no limit"
+        and fall back to the dynamic hard limit).
+        """
+        if not self._prefill_memory_guard:
+            return 0
+        static_ceiling = self._get_static_ceiling()
+        metal_cap = get_effective_metal_cap_bytes()
+        if metal_cap > 0:
+            return min(static_ceiling, metal_cap)
+        return static_ceiling
+
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
         ceiling = self._get_hard_limit_bytes()
@@ -582,17 +610,45 @@ class ProcessMemoryEnforcer:
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
             scheduler = self._resolve_scheduler(entry)
-            if scheduler is not None:
-                scheduler._memory_limit_bytes = soft_limit
-                scheduler._memory_hard_limit_bytes = ceiling
-                scheduler._prefill_memory_guard = self._prefill_memory_guard
-                scheduler._admission_paused = admission_paused
-                scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
-                scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
-                bg = getattr(scheduler, "batch_generator", None)
-                if bg is not None and hasattr(bg, "_memory_limit_bytes"):
-                    bg._memory_limit_bytes = soft_limit
-                    bg._memory_hard_limit_bytes = ceiling
+            if scheduler is None:
+                engine = getattr(entry, "engine", None)
+                if engine is None:
+                    # Discovered-but-not-loaded entry. There is no
+                    # scheduler to propagate to yet and that is normal,
+                    # not a wrapper break, so skip silently. Warning here
+                    # would fire on a routine startup before any model is
+                    # loaded and turn the signal into noise.
+                    continue
+                # Silent no-op was the failure mode that originally hid
+                # the dead memory guard: a wrapper-chain change made
+                # ``_resolve_scheduler()`` return None on a loaded engine
+                # and the loop kept iterating without complaining. Surface
+                # it now — once per engine type per enforcer lifetime so
+                # the regression is loud in CI / oncall but a misconfigured
+                # engine polled every second doesn't spam.
+                engine_type = type(engine).__name__
+                if engine_type not in self._scheduler_resolve_warned:
+                    self._scheduler_resolve_warned.add(engine_type)
+                    logger.warning(
+                        "ProcessMemoryEnforcer: could not resolve "
+                        "scheduler for engine type %s — prefill memory "
+                        "guard will not propagate to this engine. "
+                        "Verify the wrapper chain "
+                        "(engine._engine.engine.scheduler) still holds.",
+                        engine_type,
+                    )
+                continue
+            scheduler._memory_limit_bytes = soft_limit
+            scheduler._memory_hard_limit_bytes = ceiling
+            scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
+            scheduler._prefill_memory_guard = self._prefill_memory_guard
+            scheduler._admission_paused = admission_paused
+            scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
+            scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
+            bg = getattr(scheduler, "batch_generator", None)
+            if bg is not None and hasattr(bg, "_memory_limit_bytes"):
+                bg._memory_limit_bytes = soft_limit
+                bg._memory_hard_limit_bytes = ceiling
 
     def _walk_store_cache_caps(self) -> None:
         """Walk each scheduler's store-cache gate one step per poll (#1383).
@@ -767,9 +823,26 @@ class ProcessMemoryEnforcer:
                             for e in self._engine_pool._entries.values()
                         )
                         if has_loaded:
+                            # Nothing to evict (all pinned) and no load to
+                            # abort — but the resident footprint may still hold
+                            # reclaimable Metal transients from a finished turn.
+                            # Ask each loaded scheduler to trim them between
+                            # turns. This only sets a flag; the actual reclaim
+                            # runs on the inference thread when it is idle, so
+                            # we never touch Metal from the enforcer thread.
+                            requested = 0
+                            for entry in self._engine_pool._entries.values():
+                                sched = self._resolve_scheduler(entry)
+                                if sched is not None and hasattr(
+                                    sched, "request_idle_reclaim"
+                                ):
+                                    sched.request_idle_reclaim()
+                                    requested += 1
                             logger.warning(
-                                "Hard memory pressure but all loaded models "
-                                "are pinned and no loads in progress."
+                                "Hard memory pressure, all loaded models "
+                                "pinned and no loads in progress: requested "
+                                "idle reclaim on %d scheduler(s).",
+                                requested,
                             )
                         else:
                             logger.warning(

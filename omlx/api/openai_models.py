@@ -383,6 +383,10 @@ class ModelInfo(BaseModel):
     owned_by: str = "omlx"
     # Optional capabilities for Claude Code compatibility
     capabilities: Optional[Dict[str, Any]] = None
+    # vLLM-compatible extension: lets OpenAI-style clients discover the
+    # effective context window from the listing without a separate call
+    # to /v1/models/status (see #1308).
+    max_model_len: int | None = None
 
 
 class ModelsResponse(BaseModel):

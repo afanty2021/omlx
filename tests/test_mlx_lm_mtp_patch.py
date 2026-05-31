@@ -207,6 +207,141 @@ class TestQwen35Model:
         assert seen["n_confirmed"] == 3
 
 
+class TestQwen35MtpNormShift:
+    """Per-key +1 RMSNorm shift for mixed-convention MTP checkpoints (PR #1507).
+
+    Some pre-quantized Qwen3.6 MXFP4 bundles ship MTP-head norms in a mixed
+    convention: ``mtp.norm`` already in MLX's +1 convention (mean ~1.27) while
+    the per-layer head norms are still raw-HF (mean ~0). The backbone-only
+    conv1d signal evaluates False for such a checkpoint, so the old global
+    flag left the raw-HF head norms unshifted and MTP acceptance collapsed to
+    ~0%. The fix decides the shift per-key from each weight's own magnitude.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        try:
+            from omlx.patches.mlx_lm_mtp import qwen35_model
+        except ImportError:
+            pytest.skip("omlx.patches.mlx_lm_mtp not importable")
+        if not qwen35_model.apply():
+            pytest.skip("qwen35_model patch refused to apply")
+
+    def _model(self):
+        from mlx_lm.models.qwen3_5 import TextModel
+
+        m = TextModel.__new__(TextModel)
+        m.mtp = SimpleNamespace()  # presence keeps mtp.* keys in sanitize
+        m.args = SimpleNamespace(tie_word_embeddings=False)
+        return m
+
+    @staticmethod
+    def _first(arr):
+        return float(arr[0])
+
+    def test_mixed_convention_shifts_only_raw_hf_mtp_norms(self):
+        """No unsanitized conv1d (backbone already MLX) -> should_shift False.
+        Raw-HF head norms get +1, already-MLX siblings are left untouched."""
+        import mlx.core as mx
+
+        m = self._model()
+        weights = {
+            # Already-MLX (mean >= 0.5) -> must NOT shift.
+            "mtp.norm.weight": mx.full((16,), 1.27),
+            "mtp.layers.0.self_attn.q_norm.weight": mx.full((16,), 0.75),
+            "mtp.layers.0.self_attn.k_norm.weight": mx.full((16,), 0.74),
+            # Raw-HF (mean < 0.5) -> must shift by +1.
+            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
+            "mtp.layers.0.post_attention_layernorm.weight": mx.full((16,), 0.21),
+            "mtp.pre_fc_norm_embedding.weight": mx.full((16,), -0.44),
+            "mtp.pre_fc_norm_hidden.weight": mx.full((16,), -0.17),
+        }
+        out = m.sanitize(weights)
+        g = self._first
+
+        # Already-MLX siblings left untouched.
+        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+        assert abs(g(out["mtp.layers.0.self_attn.q_norm.weight"]) - 0.75) < 1e-3
+        assert abs(g(out["mtp.layers.0.self_attn.k_norm.weight"]) - 0.74) < 1e-3
+        # Raw-HF head norms shifted by +1.
+        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
+        assert abs(g(out["mtp.layers.0.post_attention_layernorm.weight"]) - 1.21) < 1e-3
+        assert abs(g(out["mtp.pre_fc_norm_embedding.weight"]) - 0.56) < 1e-3
+        assert abs(g(out["mtp.pre_fc_norm_hidden.weight"]) - 0.83) < 1e-3
+
+    def test_pure_raw_hf_shifts_backbone_and_mtp(self):
+        """Unsanitized conv1d present -> should_shift True. Backbone and all
+        raw-HF MTP norms get +1 (matches the legacy global-flag behavior)."""
+        import mlx.core as mx
+
+        m = self._model()
+        weights = {
+            # shape[-1] != 1 marks a raw-HF checkpoint -> should_shift True.
+            "model.layers.0.self_attn.conv1d.weight": mx.zeros((8, 4, 3)),
+            "model.layers.0.input_layernorm.weight": mx.full((16,), 0.05),
+            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
+            "mtp.norm.weight": mx.full((16,), 0.27),
+        }
+        out = m.sanitize(weights)
+        g = self._first
+
+        assert abs(g(out["model.layers.0.input_layernorm.weight"]) - 1.05) < 1e-3
+        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
+        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+
+    def test_pure_mlx_leaves_everything_untouched(self):
+        """Already-converted checkpoint: no conv1d signal and all norms in the
+        +1 convention -> nothing is shifted (idempotent re-sanitize)."""
+        import mlx.core as mx
+
+        m = self._model()
+        weights = {
+            "model.layers.0.input_layernorm.weight": mx.full((16,), 1.05),
+            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 1.04),
+            "mtp.norm.weight": mx.full((16,), 1.27),
+        }
+        out = m.sanitize(weights)
+        g = self._first
+
+        assert abs(g(out["model.layers.0.input_layernorm.weight"]) - 1.05) < 1e-3
+        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
+        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+
+    def test_oq_discovery_keeps_mtp_norm_shift_on_raw_hf_source(self):
+        """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
+        placeholders where the per-key magnitude can't be read. The helper
+        must fall back to the shape-based conv1d signal so the +1 shift is
+        recorded as a replayable ``add`` for MTP norms (a raw-HF source).
+        Otherwise the shift is dropped from the plan and the oQ-quantized
+        artifact ships unshifted MTP norms (regression guard for the fix)."""
+        import mlx.core as mx
+
+        from omlx.oq import _discover_sanitize_plan
+
+        m = self._model()
+
+        class _FakeIdx:
+            def __init__(self, meta):
+                self._meta = meta
+
+            def logical_metadata(self):
+                return self._meta
+
+        # conv1d shape[-1] != 1 marks a raw-HF source -> should_shift True.
+        meta = {
+            "model.layers.0.self_attn.conv1d.weight": ((2048, 4, 4), mx.float32),
+            "model.layers.0.input_layernorm.weight": ((16,), mx.float32),
+            "mtp.layers.0.input_layernorm.weight": ((16,), mx.float32),
+            "mtp.norm.weight": ((16,), mx.float32),
+        }
+        plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
+
+        # Backbone and MTP norms alike must carry the replayable +1 add.
+        assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
+        assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
+        assert plan["mtp.norm.weight"]["transform"] == "add"
+
+
 class TestQwen35MoeSanitize:
     """Regression tests for the MoE MTP sanitize patch (qwen3_5_moe.Model)."""
 

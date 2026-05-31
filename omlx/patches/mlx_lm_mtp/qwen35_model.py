@@ -532,6 +532,33 @@ def _patch_text_model(q35: Any) -> None:
         )
         should_shift_norm_weights = has_unsanitized_conv1d
 
+        # MTP-head norms can use a *different* convention than the backbone,
+        # and can even be MIXED within the head itself. Observed in JANG MXFP4
+        # Qwen3.6 bundles: ``mtp.norm`` is already in MLX's +1 convention
+        # (mean ~= 1.27) while the per-layer head norms (input_layernorm /
+        # post_attention_layernorm / pre_fc_norm_*) are still in raw-HF
+        # convention (mean ~= 0). The backbone-only ``has_unsanitized_conv1d``
+        # signal evaluates False for such a checkpoint, so the +1 shift is
+        # never applied to the head norms; every RMSNorm in the head then
+        # multiplies by ~0, collapsing the head output to ~flat logits and
+        # driving MTP draft acceptance to ~0% (no speedup, MTP effectively
+        # disabled). A single global "shift or not" flag is wrong for the
+        # head, so decide PER-KEY for MTP norms from each weight's own
+        # magnitude: raw-HF RMSNorm weights center near 0, MLX-shifted near 1.
+        # The magnitude can't be read during oQ's streaming plan discovery
+        # (the weight is a no-data ``_TrackedTensor`` placeholder and
+        # ``mx.mean(...).item()`` raises), so fall back to the shape-based
+        # ``should_shift_norm_weights`` there — otherwise the +1 shift is
+        # dropped from the discovered plan and the oQ output ships unshifted
+        # MTP norms (the same ~0% acceptance bug, baked into the artifact).
+        import mlx.core as _mx
+
+        def _mtp_norm_is_raw_hf(_w, _fallback):
+            try:
+                return float(_mx.mean(_w.astype(_mx.float32)).item()) < 0.5
+            except Exception:
+                return _fallback
+
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
@@ -562,10 +589,19 @@ def _patch_text_model(q35: Any) -> None:
         for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(
-                k.endswith(sfx) for sfx in norm_keys
-            ):
-                if v.ndim == 1:
+            if v.ndim == 1 and any(k.endswith(sfx) for sfx in norm_keys):
+                # Note: keys may be prefixed (e.g. ``language_model.mtp.*``)
+                # when the outer Model wraps language_model, so test the
+                # ``mtp.`` substring rather than anchoring with startswith.
+                if "mtp." in k:
+                    # Per-key decision: a head norm may still be raw-HF even
+                    # when a sibling head norm (e.g. mtp.norm) is already in
+                    # the +1 convention. Shift only the raw-HF ones. Under oQ
+                    # tracking the magnitude is unreadable, so fall back to the
+                    # backbone signal (same result for a raw-HF source).
+                    if _mtp_norm_is_raw_hf(v, should_shift_norm_weights):
+                        weights[k] = v + 1.0
+                elif should_shift_norm_weights:
                     weights[k] = v + 1.0
         return weights
 
