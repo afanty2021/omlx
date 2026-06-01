@@ -11,7 +11,7 @@ import socket
 import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -300,22 +300,77 @@ class TestLaunchCommandFunction:
             tools_profile="coding",
         )
 
-        with patch("requests.get", side_effect=[health_response, status_response]):
-            with patch("omlx.integrations.get_integration", return_value=integration):
-                with patch("omlx.settings.GlobalSettings.load", return_value=settings):
-                    launch_command(args)
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
 
-        integration.launch.assert_called_once_with(
-            port=8000,
+        integration.launch.assert_called_once()
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.host == "127.0.0.1"
+        assert ctx.port == 8000
+        assert ctx.api_key == "test-key"
+        assert ctx.model == "qwen2.5-vl"
+        assert ctx.tools_profile == "coding"
+        assert ctx.context_window == 32768
+        assert ctx.max_tokens == 8192
+        assert ctx.model_type == "vlm"
+        assert ctx.extra_args == ()
+
+    def test_launch_command_resolves_alias_status_metadata(self):
+        """Alias model IDs should keep status metadata from the real model."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen2.5-vl-raw",
+                    "model_alias": "gpt-4o",
+                    "model_type": "vlm",
+                    "max_context_window": 32768,
+                    "max_tokens": 8192,
+                    "enable_thinking": False,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="opencode",
+            host=None,
+            port=None,
             api_key="test-key",
-            model="qwen2.5-vl",
-            host="127.0.0.1",
+            model="gpt-4o",
             tools_profile="coding",
-            context_window=32768,
-            max_tokens=8192,
-            model_type="vlm",
-            extra_args=None,
         )
+
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.model == "gpt-4o"
+        assert ctx.context_window == 32768
+        assert ctx.max_tokens == 8192
+        assert ctx.model_type == "vlm"
+        assert ctx.reasoning is False
 
     def test_launch_command_forwards_extra_args(self):
         """Unknown CLI tokens (e.g. --resume <id>) should reach integration.launch."""
@@ -354,13 +409,15 @@ class TestLaunchCommandFunction:
             tools_profile="coding",
         )
 
-        with patch("requests.get", side_effect=[health_response, status_response]):
-            with patch("omlx.integrations.get_integration", return_value=integration):
-                with patch("omlx.settings.GlobalSettings.load", return_value=settings):
-                    launch_command(args, extra_args=["--resume", "abc123"])
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args, extra_args=["--resume", "abc123"])
 
-        _, kwargs = integration.launch.call_args
-        assert kwargs["extra_args"] == ["--resume", "abc123"]
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.extra_args == ("--resume", "abc123")
 
 
 class TestLaunchArgvParsing:

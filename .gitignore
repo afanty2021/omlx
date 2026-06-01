@@ -120,6 +120,9 @@ docs/native_app_architecture.md
 # UV lockfile
 uv.lock
 
+# generated TurboQuant memory report (machine-specific)
+tq_batch_memory.md
+
 # User local configurations and tools
 MEMORY/
 benchmark_qwen35.py

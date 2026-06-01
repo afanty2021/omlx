@@ -62,6 +62,8 @@ class OutputParserFactory:
     kind: str
     create_session: Callable[[Any], OutputParserSession]
     stop_token_ids: set[int] = field(default_factory=set)
+    thinking_end_text: str | None = None
+    thinking_end_trailing_text: str | None = None
 
 
 class HarmonyOutputParserSession:
@@ -205,6 +207,8 @@ def detect_output_parser(
             kind="harmony",
             create_session=HarmonyOutputParserSession,
             stop_token_ids=temp_parser.get_stop_token_ids(),
+            thinking_end_text="<|end|>",
+            thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
         )
 
     if is_gemma4_model(model_name, model_config):
@@ -218,7 +222,8 @@ def detect_output_parser(
         return OutputParserFactory(
             kind="gemma4",
             create_session=Gemma4OutputParserSession,
-            stop_token_ids=stop_ids,
+            stop_token_ids=set(),
+            thinking_end_text="<channel|>",
         )
 
     return None

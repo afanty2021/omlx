@@ -43,6 +43,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -295,6 +296,25 @@ async def verify_api_key(
     return True
 
 
+def _reset_boundary_snapshots_for_server() -> None:
+    """Reset ephemeral boundary snapshots at server lifecycle boundaries."""
+    engine_pool = _server_state.engine_pool
+    if engine_pool is None:
+        return
+
+    scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+    cache_dir = getattr(scheduler_config, "paged_ssd_cache_dir", None)
+    if not cache_dir:
+        return
+
+    try:
+        from .cache.boundary_snapshot_store import reset_boundary_snapshot_root
+
+        reset_boundary_snapshot_root(Path(cache_dir))
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.warning("Failed to reset boundary snapshot directory: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
@@ -324,6 +344,8 @@ async def lifespan(app: FastAPI):
                 logger.info("Auto-detected server aliases: %s", detected)
         except Exception as exc:  # pragma: no cover - never block startup
             logger.warning("Server alias auto-detection failed: %s", exc)
+
+    _reset_boundary_snapshots_for_server()
 
     # Startup: Preload pinned models
     if _server_state.engine_pool is not None:
@@ -410,6 +432,7 @@ async def lifespan(app: FastAPI):
         logger.info("MCP manager stopped")
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.shutdown()
+        _reset_boundary_snapshots_for_server()
         logger.info("Engine pool shutdown")
 
 
@@ -1772,6 +1795,8 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         max_tokens = _server_state.sampling.max_tokens
         if _server_state.settings_manager:
             ms = _server_state.settings_manager.get_settings(model_id)
+            if ms and ms.model_alias:
+                m["model_alias"] = ms.model_alias
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
         m["max_tokens"] = max_tokens
@@ -2200,10 +2225,12 @@ async def create_chat_completion(
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
     reasoning_parser = None
+    settings_guided_grammar = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
         max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
+        settings_guided_grammar = _settings_guided_grammar(ms)
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
         forced_keys = set(ms.forced_ct_kwargs or [])
@@ -2258,11 +2285,21 @@ async def create_chat_completion(
     # Compile grammar for structured output (logit-level enforcement).
     # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
     response_format = request.response_format
-    if request.structured_outputs is not None or response_format:
+    guided_grammar = _effective_guided_grammar(
+        structured_outputs=request.structured_outputs,
+        response_format=response_format,
+        request_guided_grammar=request.guided_grammar,
+        settings_guided_grammar=settings_guided_grammar,
+    )
+    structured_outputs = _normalize_structured_outputs(
+        request.structured_outputs,
+        guided_grammar,
+    )
+    if structured_outputs is not None or response_format:
         await engine.start()
     compiled_grammar = _compile_grammar_for_request(
         engine,
-        structured_outputs=request.structured_outputs,
+        structured_outputs=structured_outputs,
         response_format=response_format,
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
@@ -2549,6 +2586,42 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+def _normalize_structured_outputs(structured_outputs=None, guided_grammar: str | None = None):
+    """Fold guided_grammar into the existing structured_outputs grammar shape."""
+    if structured_outputs is not None:
+        return structured_outputs
+    if guided_grammar:
+        return {"grammar": guided_grammar}
+    return None
+
+
+def _settings_guided_grammar(settings) -> str | None:
+    """Return a non-empty enabled model-level guided grammar."""
+    if not settings:
+        return None
+    if not getattr(settings, "guided_grammar_enabled", False):
+        return None
+    grammar = getattr(settings, "guided_grammar", None)
+    if not grammar:
+        return None
+    grammar = grammar.strip()
+    return grammar or None
+
+
+def _effective_guided_grammar(
+    structured_outputs=None,
+    response_format=None,
+    request_guided_grammar: str | None = None,
+    settings_guided_grammar: str | None = None,
+) -> str | None:
+    """Choose the request grammar alias or eligible model default."""
+    if request_guided_grammar:
+        return request_guided_grammar
+    if structured_outputs is None and response_format is None:
+        return settings_guided_grammar
+    return None
 
 
 def _build_format_element(structured_outputs=None, response_format=None):

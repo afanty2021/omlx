@@ -277,7 +277,10 @@ def serve_command(args):
         )
 
         print(f"Starting server at http://{settings.server.host}:{settings.server.port}")
-        uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        try:
+            uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        except KeyboardInterrupt:
+            pass
     finally:
         # Uvicorn closes sockets during normal shutdown; this covers failures
         # after bind succeeds but before the server takes ownership.
@@ -292,7 +295,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     """
     import requests
 
-    from .integrations import get_integration, list_integrations
+    from .integrations import IntegrationContext, get_integration, list_integrations
     from .settings import GlobalSettings
 
     tool_name = args.tool
@@ -344,7 +347,10 @@ def launch_command(args, extra_args: list[str] | None = None):
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
             for m in resp.json().get("models", []):
-                models_status_map[m["id"]] = m
+                if m_id := m.get("id"):
+                    models_status_map[m_id] = m
+                if model_alias := m.get("model_alias"):
+                    models_status_map[model_alias] = m
     except Exception:
         pass
 
@@ -388,24 +394,22 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
-    context_window = model_info.get("max_context_window")
-    max_tokens = model_info.get("max_tokens")
-    model_type = model_info.get("model_type")
-
-    # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
-    tools_profile = getattr(args, "tools_profile", "coding")
-    integration.launch(
+    ctx = IntegrationContext(
+        host=connect_host,
         port=port,
         api_key=api_key,
         model=model,
-        host=connect_host,
-        tools_profile=tools_profile,
-        context_window=context_window,
-        max_tokens=max_tokens,
-        model_type=model_type,
-        extra_args=extra_args,
+        context_window=model_info.get("max_context_window"),
+        max_tokens=model_info.get("max_tokens"),
+        model_type=model_info.get("model_type"),
+        reasoning=model_info.get("enable_thinking"),
+        tools_profile=getattr(args, "tools_profile", "coding"),
+        extra_args=tuple(extra_args or ()),
     )
+
+    # Launch
+    print(f"Launching {integration.display_name} with model {model}...")
+    integration.launch(ctx)
 
 
 def diagnose_menubar() -> int:

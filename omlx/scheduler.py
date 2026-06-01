@@ -654,12 +654,13 @@ class SchedulerOutput:
 
 
 class _BoundarySnapshotProvider:
-    """Dict-like lazy loader for boundary snapshots.
+    """Dict-like loader for extracted boundary snapshots.
 
     Used by ``store_cache()`` to load snapshots from SSD one block at a time
-    instead of extracting all intermediate snapshots into memory at once.
-    Implements ``__bool__``, ``__contains__``, and ``__getitem__`` to be a
-    drop-in replacement for ``Dict[int, List[Dict[str, Any]]]``.
+    or serve pre-extracted in-memory snapshots. In-memory snapshots must already
+    be in the ``_extract_cache_states`` dict format so this provider can be used
+    safely from the async store-cache worker without touching raw MLX cache
+    objects on the wrong thread.
     """
 
     def __init__(
@@ -668,13 +669,11 @@ class _BoundarySnapshotProvider:
         request_id: str,
         valid_tcs: list[int],
         in_memory_snapshots: dict[int, Any],
-        extract_fn: Any,  # Callable — Scheduler._extract_cache_states
     ) -> None:
         self._store = store
         self._request_id = request_id
         self._valid_tcs = set(valid_tcs)
         self._in_memory = in_memory_snapshots
-        self._extract_fn = extract_fn
 
     def __contains__(self, tc: int) -> bool:
         return tc in self._valid_tcs
@@ -682,9 +681,7 @@ class _BoundarySnapshotProvider:
     def __getitem__(self, tc: int) -> Any:
         snap = self._in_memory.get(tc)
         if snap is not None:
-            # In-memory fallback (SSD write failed).
-            extracted, _ = self._extract_fn(snap)
-            return extracted
+            return snap
         if self._store is not None:
             return self._store.load(self._request_id, tc)
         return None
@@ -694,6 +691,13 @@ class _BoundarySnapshotProvider:
 
     def __bool__(self) -> bool:
         return bool(self._valid_tcs)
+
+    def iter_in_memory_extracted(self):
+        """Yield pre-extracted in-memory snapshots for pre-evaluation."""
+        for tc in sorted(self._valid_tcs):
+            snap = self._in_memory.get(tc)
+            if snap is not None:
+                yield snap
 
 
 class Scheduler:
@@ -915,11 +919,18 @@ class Scheduler:
                 self.block_aware_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
                 )
-                logger.info(
-                    f"paged SSD cache enabled: {self.config.paged_ssd_cache_dir}, "
-                    f"block_size={self.config.paged_cache_block_size}, "
-                    f"max_blocks={max_blocks}"
-                )
+                if self.config.hot_cache_only:
+                    logger.info(
+                        f"hot-cache-only mode enabled: "
+                        f"block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={max_blocks}"
+                    )
+                else:
+                    logger.info(
+                        f"paged SSD cache enabled: {self.config.paged_ssd_cache_dir}, "
+                        f"block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={max_blocks}"
+                    )
 
             # Async store_cache executor: single worker so submissions are
             # serialized (matches the original synchronous order) and we
@@ -1138,24 +1149,30 @@ class Scheduler:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
-        - mx.async_eval() was called on the inference thread for all
-          KV cache arrays, dispatching materialization asynchronously
-          without blocking the inference thread. async_eval completes
-          Metal command enqueueing before returning, so all commands
-          are submitted by the time executor.submit() runs.
-        - This worker calls mx.synchronize(self._stream) via the
-          _safe_sync_stream helper to wait on the same stream where
-          mx.async_eval dispatched the arrays. A bare mx.synchronize()
-          with no args only blocks on the default stream (gpu:0) and
-          would leave the dispatched per-engine stream's work
-          unsynchronized, racing the buffer-protocol access below
-          (#1437). Stream objects are not thread-local in MLX (Metal
-          device is a global singleton), so mx.synchronize(stream) is
-          safe cross-thread; it just calls waitUntilCompleted on the
-          command buffer.
-        - bfloat16 view+eval inside _extract_tensor_bytes runs on this
-          worker's default mx stream, isolated from self._stream;
-          the underlying buffer is read-only at this point.
+        - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
+          the inference thread for all KV cache arrays in cache_to_store, so
+          they are fully materialized concrete buffers before this worker
+          runs. This is the load-bearing invariant: MLX streams ARE
+          thread-local (each engine's generation stream is created via
+          mx.new_thread_local_stream on the inference thread). A KV array
+          left lazy and bound to self._stream cannot be materialized on this
+          worker thread — _extract_block_tensor_slice (slices) and
+          _extract_tensor_bytes (bf16 -> uint16 view) would re-dispatch the
+          source op to self._stream's index, which does NOT exist on this
+          thread, aborting the process ("There is no Stream(gpu, N) in
+          current thread"). Boundary snapshots get the same treatment via
+          _eval_snapshot_cache at capture time.
+        - Because the sources are concrete, the worker's own slice/view ops
+          consume materialized buffers and bind their new ops to the
+          always-present default stream (gpu,0). The _safe_sync_stream call
+          below is now belt-and-suspenders (the owner already drained the
+          work); correctness no longer depends on its cross-thread
+          mx.synchronize, whose "no Stream" RuntimeError it tolerantly
+          swallows.
+        - All mx-buffer access here is held under _mx_buffer_access_lock,
+          serializing the bf16 view+eval and the buffer-protocol reads
+          against inference-thread _sync_and_clear_cache (which also takes
+          that lock), so mx.clear_cache cannot reclaim a buffer mid-read.
         - batch_generator.remove(uid) is deferred until this worker
           completes (handled by _drain_pending_async_removes).
 
@@ -1515,9 +1532,9 @@ class Scheduler:
         if self._generation_config_eos is not None:
             stop_tokens.update(self._generation_config_eos)
 
-        # Add protocol-specific stop tokens (e.g. Harmony action stops)
-        if self._output_parser_factory is not None:
-            stop_tokens.update(self._output_parser_factory.stop_token_ids)
+        # Protocol parsers need to observe their own stop tokens so they can
+        # apply channel-aware handling (for example, Harmony analysis end
+        # should continue into the final channel).
 
         return stop_tokens
 
@@ -1575,13 +1592,16 @@ class Scheduler:
         self._output_parser_sessions.pop(request_id, None)
 
     def _get_xtc_special_tokens(self) -> list[int]:
-        """Get special tokens to exclude from XTC sampling (newline + EOS).
+        """Get special tokens to exclude from XTC sampling.
 
-        Reuses _get_stop_tokens() for EOS coverage (includes generation_config.json
-        tokens) so XTC exclusions stay consistent with stop-token logic.
+        Parser-owned stop tokens stay out of BatchGenerator stop-token matching
+        so protocol parsers can handle them channel-aware, but XTC must still
+        protect them from diversity masking.
         """
         tokens = self.tokenizer.encode("\n")
         tokens.extend(self._get_stop_tokens())
+        if self._output_parser_factory is not None:
+            tokens.extend(self._output_parser_factory.stop_token_ids)
         return tokens
 
     def _create_batch_generator(
@@ -1664,15 +1684,36 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
-        """Replace KVCache with empty TurboQuantKVCache before prefill.
+    def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
+        """True if every cache layer can be safely TurboQuant-converted for
+        continuous batching.
 
-        NOTE: Not currently called -- see #771. Kept for future use when
-        TurboQuantKVCache implements merge()/maybe_trim_front().
+        Only plain KVCache (and CacheList of KVCache, for VLM) implement the
+        merge/filter/extract/extend batch protocol that the monkey-patched
+        TurboQuantKVCache.merge relies on inside BatchGenerator. Chunked- and
+        rotating-attention caches (Llama-4, sliding-window) need
+        maybe_trim_front / rotating semantics that BatchTurboQuantKVCache does
+        not provide, so those models stay fp16 — no crash, no TurboQuant.
+        """
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        def _ok(c: Any) -> bool:
+            if isinstance(c, KVCache):
+                return True
+            if isinstance(c, CacheList):
+                return all(_ok(inner) for inner in c.caches)
+            return False
+
+        return bool(prompt_cache) and all(_ok(c) for c in prompt_cache)
+
+    def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
+        """Replace empty KVCache layers with empty TurboQuantKVCache.
 
         Tokens are quantized on the fly during update_and_fetch, avoiding
         the peak memory spike from storing full-precision KV then converting.
-        Skips the last KVCache layer if turboquant_skip_last is set.
+        Used only when there is no prefill history to preserve (the single
+        last token is quantized during insert()'s prompt step). Skips the
+        last KVCache layer if turboquant_skip_last is set.
         """
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
@@ -1706,13 +1747,13 @@ class Scheduler:
             )
 
     def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert existing KVCache data to TurboQuantKVCache via from_cache().
+        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
 
-        NOTE: Not currently called -- see #771. Kept for future use when
-        TurboQuantKVCache implements merge()/maybe_trim_front().
-
-        Used when an existing cache is provided (e.g. from SSD prefix cache).
-        Uses from_cache() to quantize the existing KV data.
+        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
+        cache): the completed full-precision KV is quantized once, so prefill
+        hidden states stay exact and quantization error only enters at
+        decode-time reads. This is the key difference from #717/#771, which
+        quantized on the fly during prefill and corrupted hidden states.
         """
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
@@ -1775,13 +1816,17 @@ class Scheduler:
         """
         n_tokens = len(tokens)
         if n_tokens <= 1:
-            # Nothing to prefill, return cache + tokens as-is
+            # Nothing to prefill, return cache + tokens as-is.
             cache = existing_cache or make_prompt_cache(self.model)
-            # NOTE: Do NOT apply TurboQuant here. TurboQuantKVCache does not
-            # support merge(), which is called by _merge_caches() inside
-            # BatchGenerator when insert() creates a PromptProcessingBatch.
-            # TurboQuant conversion must happen inside BatchGenerator after
-            # the batch cache is created, not on individual per-request caches.
+            # TurboQuant: a TQ cache here makes _merge_caches() build a
+            # BatchTurboQuantKVCache (via the monkey-patched merge), so the
+            # one decode token quantizes against TQ history. An empty fresh
+            # cache gets empty TQ layers; a restored cache preserves its data.
+            if self._turboquant_kv_bits is not None and self._turboquant_eligible(cache):
+                if existing_cache is None:
+                    self._apply_turboquant_kv_empty(cache)
+                else:
+                    self._apply_turboquant_kv_convert(cache)
             return cache, tokens
 
         # Create or reuse cache
@@ -1790,14 +1835,10 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # NOTE: TurboQuant conversion is NOT applied during external prefill.
-        # TurboQuantKVCache does not support merge() or maybe_trim_front(),
-        # so passing it to insert() would fail in _merge_caches() or cause
-        # AttributeError in chunked-attention models (e.g. Llama-4-Scout).
-        # Additionally, on-the-fly quantization during prefill causes
-        # precision loss that corrupts hidden states across layers (#771).
-        # Prefill runs with standard KVCache; TurboQuant quantization
-        # happens inside BatchGenerator during the decode phase.
+        # TurboQuant runs in fp16 during the prefill loop below and is
+        # quantized once at the end (see the _apply_turboquant_kv_convert call
+        # before the return). Chunked/rotating models are gated out by
+        # _turboquant_eligible and stay fp16.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -2047,6 +2088,15 @@ class Scheduler:
         if vlm_embeds is not None and _saved_rope_deltas is not None:
             self.model._language_model._rope_deltas = _saved_rope_deltas
         request._prefill_saved_rope_deltas = None
+
+        # Quantize the completed fp16 KV cache to TurboQuant for decode.
+        # Done here (after the prefill loop, after boundary snapshots are
+        # captured fp16) so prefill hidden states stay exact and the paged-SSD
+        # format is unchanged. _merge_caches() then builds a
+        # BatchTurboQuantKVCache when this request is inserted. Gated to dense
+        # KVCache models — chunked/rotating caches stay fp16.
+        if self._turboquant_kv_bits is not None and self._turboquant_eligible(prompt_cache):
+            self._apply_turboquant_kv_convert(prompt_cache)
 
         return prompt_cache, last_token
 
@@ -2843,21 +2893,29 @@ class Scheduler:
         if (
             sampling_params.thinking_budget is not None
             and request is not None
-            and getattr(request, "needs_think_prefix", False)
-            and not getattr(request, "is_harmony_model", False)
+            and (
+                getattr(request, "needs_think_prefix", False)
+                or self._get_output_parser_thinking_end_text() is not None
+            )
         ):
             think_end_ids = self._resolve_think_end_token_ids()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
                 think_start_id = self._get_think_token_id("think_start_id")
-                leading_ids, trailing_ids = self._resolve_think_close_pattern()
+                leading_ids, trailing_ids = self._resolve_think_close_pattern(
+                    self._get_output_parser_thinking_end_text()
+                )
+                parser_trailing_ids = self._resolve_output_parser_thinking_trailing_ids()
+                if parser_trailing_ids is not None:
+                    trailing_ids = parser_trailing_ids
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
                     budget=sampling_params.thinking_budget,
                     think_start_token_id=think_start_id,
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
+                    token_to_piece=self._thinking_budget_token_to_piece,
                 )
                 logits_processors.append(processor)
 
@@ -2906,12 +2964,91 @@ class Scheduler:
         except (ValueError, TypeError):
             return None
 
+    def _get_output_parser_thinking_end_text(self) -> str | None:
+        """Return parser-provided thinking close text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_end_text", None)
+
+    def _encode_thinking_marker(self, text: str) -> list[int] | None:
+        """Encode a parser/tokenizer thinking marker into token IDs."""
+        try:
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = self.tokenizer.encode(text)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+        if ids:
+            return list(ids)
+        return None
+
+    def _thinking_budget_token_to_piece(self, token_id: int) -> str | bytes | None:
+        """Best-effort token piece lookup for UTF-8-safe budget forcing."""
+        try:
+            token = self.tokenizer.convert_ids_to_tokens(token_id)
+            if token is not None:
+                byte_piece = self._token_piece_to_bytes(token)
+                return byte_piece if byte_piece is not None else token
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+
+        try:
+            return self.tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            try:
+                return self.tokenizer.decode([token_id])
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _token_piece_to_bytes(self, token: str) -> bytes | None:
+        """Convert byte-fallback tokenizer pieces to raw bytes when possible."""
+        import re
+
+        byte_fallback = re.fullmatch(r"(?:<0x[0-9A-Fa-f]{2}>)+", token)
+        if byte_fallback is not None:
+            return bytes(
+                int(match.group(1), 16)
+                for match in re.finditer(r"<0x([0-9A-Fa-f]{2})>", token)
+            )
+
+        byte_decoder = getattr(self.tokenizer, "byte_decoder", None)
+        if isinstance(byte_decoder, dict) and token:
+            try:
+                return bytes(byte_decoder[ch] for ch in token)
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        return None
+
+    def _resolve_output_parser_thinking_trailing_ids(self) -> list[int] | None:
+        """Resolve parser-provided tokens that should follow a forced close."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+
+        trailing_text = getattr(factory, "thinking_end_trailing_text", None)
+        if not trailing_text:
+            return None
+
+        return self._encode_thinking_marker(trailing_text)
+
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.
 
         Uses mlx-lm's built-in think_end_id which supports both
         </think> and </longcat_think> automatically.
         """
+        parser_think_end = self._get_output_parser_thinking_end_text()
+        if parser_think_end is not None:
+            return self._encode_thinking_marker(parser_think_end)
+
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
         think_end_id = self._get_think_token_id("think_end_id")
         if think_end_id is not None:
@@ -2936,7 +3073,9 @@ class Scheduler:
 
         return None
 
-    def _resolve_think_close_pattern(self) -> tuple[list[int] | None, list[int] | None]:
+    def _resolve_think_close_pattern(
+        self, think_end_str: str | None = None
+    ) -> tuple[list[int] | None, list[int] | None]:
         """Detect leading/trailing tokens around </think> from the chat template.
 
         Different models use different patterns:
@@ -2949,7 +3088,8 @@ class Scheduler:
         """
         import re
 
-        think_end_str = getattr(self.tokenizer, "think_end", "</think>")
+        if think_end_str is None:
+            think_end_str = getattr(self.tokenizer, "think_end", None) or "</think>"
 
         # Try to get the chat template text
         template_text = self._get_chat_template_text()
@@ -3127,6 +3267,26 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
+        """Force the leaf KV tensors of an in-memory boundary snapshot concrete.
+
+        Runs on the capturing (owner/inference) thread. The store-cache worker
+        later re-extracts and slices these via _BoundarySnapshotProvider; MLX
+        streams are thread-local, so any leaf op still lazy at that point would
+        re-dispatch to this thread's stream index, which does not exist on the
+        worker -> SIGABRT. Extracting + eval'ing the leaves here (under this
+        thread's stream, where that stream lives) makes the worker's slicing
+        operate exclusively on already-materialized buffers, which bind their
+        new ops to the always-present default stream (gpu,0).
+        """
+        if not snapshot_cache:
+            return
+        extracted, _ = self._extract_cache_states(snapshot_cache)
+        leaves = self._collect_arrays_from_extracted_cache(extracted)
+        if leaves:
+            with mx.stream(self._stream):
+                mx.eval(*leaves)
+
     def _on_prefill_boundary_snapshot(
         self,
         request_id: str,
@@ -3171,8 +3331,16 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
+                # In-memory fallback: this snapshot will be sliced later on the
+                # store-cache worker thread (via _BoundarySnapshotProvider ->
+                # _extract_cache_states). MLX streams are thread-local, so the
+                # worker cannot materialize a lazy op bound to THIS (owner) thread's
+                # stream. Force it concrete now, on the capturing thread, so the
+                # worker only ever slices already-evaluated buffers.
+                self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
         else:
+            self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
 
         self._boundary_snapshot_required = True
@@ -3295,10 +3463,18 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
             else:
+                # In-memory fallback: the store-cache worker slices this snapshot
+                # off-thread (via _BoundarySnapshotProvider -> _extract_cache_states).
+                # MLX streams are thread-local, so force the leaves concrete now on
+                # the capturing thread; otherwise the worker re-dispatches a lazy op
+                # to this thread's stream index -> "no Stream(gpu, N)" -> SIGABRT.
+                # Mirrors _on_prefill_boundary_snapshot's in-memory fallback.
+                self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request.request_id][
                     total_tokens
                 ] = snapshot_cache
         else:
+            self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request.request_id][
                 total_tokens
             ] = snapshot_cache
@@ -3359,6 +3535,12 @@ class Scheduler:
             return None
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
+        #
+        # In-memory snapshots are raw mlx-lm cache objects. They must be
+        # converted to the extracted dict format here on the engine MLX thread.
+        # The async store-cache worker does not own the generation stream; if it
+        # touches raw Rotating/Arrays cache state, MLX can abort with
+        # "There is no Stream(gpu, X) in current thread" (#1568).
         latest_snapshot = snapshots[latest_tc]
         if latest_snapshot is None and self._boundary_snapshot_store is not None:
             # Offloaded to SSD — load back.
@@ -3379,16 +3561,29 @@ class Scheduler:
         else:
             return None
 
-        # Build lazy-loading provider for intermediate snapshots.
-        # Each snapshot is loaded from SSD one-at-a-time during
-        # store_cache() instead of extracting all at once.
+        # Build provider for intermediate snapshots. SSD-backed snapshots remain
+        # lazy-loaded, but in-memory snapshots are extracted eagerly on this
+        # engine thread before the provider is handed to the async worker.
         intermediate_tcs = [tc for tc in valid_counts if tc != latest_tc]
+        provider_tcs: list[int] = []
+        extracted_in_memory: dict[int, list[dict[str, Any]]] = {}
+        for tc in intermediate_tcs:
+            snap = snapshots.get(tc)
+            if snap is None:
+                if self._boundary_snapshot_store is not None:
+                    provider_tcs.append(tc)
+                continue
+
+            extracted_snapshot, _ = self._extract_cache_states(snap)
+            if extracted_snapshot:
+                extracted_in_memory[tc] = extracted_snapshot
+                provider_tcs.append(tc)
+
         intermediate_snapshots = _BoundarySnapshotProvider(
             store=self._boundary_snapshot_store,
             request_id=request_id,
-            valid_tcs=intermediate_tcs,
-            in_memory_snapshots=snapshots,
-            extract_fn=self._extract_cache_states,
+            valid_tcs=provider_tcs,
+            in_memory_snapshots=extracted_in_memory,
         )
 
         token_sequence = (
@@ -5459,8 +5654,9 @@ class Scheduler:
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
 
-            # NOTE: TurboQuant KV conversion is not applied during prefill.
-            # See _do_external_prefill() comment for rationale (#771).
+            # TurboQuant KV is quantized at the end of _do_external_prefill
+            # (fp16 prefill → quantize once); _merge_caches() turns the per
+            # request TQ cache into a BatchTurboQuantKVCache on insert.
 
             # VLM MTP routing: if a gemma4_assistant drafter is attached, run
             # an extra last-token forward to capture hidden + shared_kv_states,
@@ -5596,6 +5792,7 @@ class Scheduler:
                 if parser_result.is_stop and not is_finished:
                     is_finished = True
                     is_stop = True
+                    response.finish_reason = "stop"
 
                 should_record_token = (
                     parser_result.record_token
@@ -5865,10 +6062,13 @@ class Scheduler:
                             # Inference-thread store_cache prep, timed as
                             # three sub-phases (boundary / collect / dispatch)
                             # mirroring boundary_capture_* granularity.
-                            # async_eval dispatches KV array materialization
-                            # without blocking; the worker calls
-                            # mx.synchronize() to wait before extracting
-                            # bytes.
+                            # The dispatch phase does a FULL mx.eval (not
+                            # async_eval) so the KV arrays are concrete on THIS
+                            # thread before the store-cache worker slices/views
+                            # them. MLX streams are thread-local; a lazy op left
+                            # for the worker to materialize re-dispatches to this
+                            # thread's stream index, which is absent on the worker
+                            # -> SIGABRT. See the dispatch-phase comment below.
                             with mx.stream(self._stream):
                                 with self._phase_timer("store_cache_main_boundary"):
                                     boundary_override = self._get_boundary_store_override(
@@ -5903,19 +6103,50 @@ class Scheduler:
                                             cache_to_store
                                         )
                                     )
+                                    if intermediate_snapshots is not None:
+                                        for snapshot_cache in (
+                                            intermediate_snapshots.iter_in_memory_extracted()
+                                        ):
+                                            pre_eval_arrays.extend(
+                                                self._collect_arrays_from_extracted_cache(
+                                                    snapshot_cache
+                                                )
+                                            )
                                 with self._phase_timer("store_cache_main_dispatch"):
                                     if pre_eval_arrays:
-                                        mx.async_eval(*pre_eval_arrays)
+                                        # FULL eval (not async_eval) on the owner
+                                        # thread. MLX streams are thread-local:
+                                        # these KV arrays carry self._stream
+                                        # (a per-engine ThreadLocalStream created
+                                        # on THIS thread). The store-cache worker
+                                        # later slices them (_extract_block_tensor_slice)
+                                        # and views bf16->uint16 (_extract_tensor_bytes);
+                                        # if the source op is still LAZY at that
+                                        # point, materializing it on the worker
+                                        # re-dispatches to self._stream's index,
+                                        # which does not exist on the worker thread
+                                        # -> "There is no Stream(gpu, N) in current
+                                        # thread" -> std::terminate -> SIGABRT.
+                                        # Forcing concrete materialization here
+                                        # means every downstream worker op consumes
+                                        # an already-evaluated buffer and binds its
+                                        # own new ops to the always-present default
+                                        # stream (gpu,0). The big host memcpy
+                                        # (bytes(memoryview(...))) and the disk
+                                        # write stay on the worker — only the GPU
+                                        # completion fence moves onto this thread.
+                                        mx.eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
-                                # Hand the store-cache write to the background
-                                # executor without ever blocking the generation
-                                # step. The gate only counts in-flight writes;
-                                # backpressure is applied at admission in
-                                # _schedule_waiting (in_flight >= cap defers new
-                                # prefills) so cache persistence never stalls
-                                # token generation (#1496). note_submitted is
-                                # called before submit so a fast worker whose
+                                # Hand host memcpy and disk write to the
+                                # background executor after the owner thread
+                                # has materialized KV arrays. The gate only
+                                # counts in-flight writes; backpressure is
+                                # applied at admission in _schedule_waiting
+                                # (in_flight >= cap defers new prefills) so
+                                # cache persistence does not wait in the token
+                                # loop after submission (#1496). note_submitted
+                                # is called before submit so a fast worker whose
                                 # done callback fires immediately still
                                 # decrements a counted slot.
                                 gate = self._store_cache_gate
@@ -6842,12 +7073,19 @@ class Scheduler:
                         "Failed to initialize boundary snapshot SSD store: %s", e
                     )
 
-            logger.info(
-                f"paged SSD cache enabled: "
-                f"cache_dir={self.config.paged_ssd_cache_dir}, "
-                f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
-                f"block_size={self.config.paged_cache_block_size} tokens"
-            )
+            if self.config.hot_cache_only:
+                logger.info(
+                    f"hot-cache-only mode enabled: "
+                    f"hot_cache_max={self._format_bytes(self.config.hot_cache_max_size)}, "
+                    f"block_size={self.config.paged_cache_block_size} tokens"
+                )
+            else:
+                logger.info(
+                    f"paged SSD cache enabled: "
+                    f"cache_dir={self.config.paged_ssd_cache_dir}, "
+                    f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
+                    f"block_size={self.config.paged_cache_block_size} tokens"
+                )
 
         except Exception as e:
             logger.error(f"Failed to initialize paged SSD cache: {e}")

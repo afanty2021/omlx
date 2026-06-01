@@ -31,6 +31,8 @@
 # Usage:
 #   apps/omlx-mac/Scripts/build.sh                    # Release, auto-rebuild donor when stale
 #   apps/omlx-mac/Scripts/build.sh debug              # Debug build instead
+#   apps/omlx-mac/Scripts/build.sh swift              # rebuild Swift app only; reuse existing _export/
+#   apps/omlx-mac/Scripts/build.sh swift debug        # Debug Swift app rebuild; reuse existing _export/
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
@@ -48,16 +50,27 @@
 
 set -euo pipefail
 
-CONFIG="${1:-Release}"
-case "$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')" in
-    debug)   CONFIG=Debug ;;
-    release) CONFIG=Release ;;
-    *) echo "error: unknown configuration '$CONFIG' (expected debug|release)" >&2; exit 2 ;;
-esac
+SWIFT_REBUILD=0
+if [ "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" = "swift" ]; then
+    SWIFT_REBUILD=1
+    shift
+fi
+
+CONFIG=Release
+if [ $# -gt 0 ]; then
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+        debug)   CONFIG=Debug; shift ;;
+        release) CONFIG=Release; shift ;;
+        --*) ;;
+        *)
+            echo "error: unknown configuration '$1' (expected swift|debug|release)" >&2
+            exit 2
+            ;;
+    esac
+fi
 
 BARE=0
 REBUILD_DONOR=auto    # auto | force | never
-shift || true
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
@@ -66,6 +79,10 @@ for arg in "$@"; do
         *) echo "error: unknown flag '$arg'" >&2; exit 2 ;;
     esac
 done
+if [ "$SWIFT_REBUILD" -eq 1 ] && [ "$REBUILD_DONOR" = "force" ]; then
+    echo "error: swift cannot be combined with --rebuild-donor; use release --rebuild-donor." >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -94,6 +111,10 @@ ok()   { printf "${GREEN}[build.sh]${RESET} %s\n" "$*"; }
 warn() { printf "${YELLOW}[build.sh]${RESET} %s\n" "$*"; }
 die()  { printf "${RED}[build.sh ERROR]${RESET} %s\n" "$*" >&2; exit 1; }
 
+if [ "$SWIFT_REBUILD" -eq 1 ] && [ "$BARE" -eq 0 ] && [ ! -d "$LOCAL_EXPORT" ]; then
+    die "Swift rebuild requires existing venvstacks export at $LOCAL_EXPORT. Run build.sh release first."
+fi
+
 # --- Resolve donor: pick a layer source and (re)build via venvstacks if stale
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
@@ -120,6 +141,19 @@ _rebuild_venvstacks_export() {
 }
 
 resolve_donor_layers() {
+    # Fast Swift rebuild mode reuses an already-built venvstacks export.
+    # It intentionally refuses to rebuild or fall back to /Applications.
+    if [ "$SWIFT_REBUILD" -eq 1 ]; then
+        if [ ! -d "$LOCAL_EXPORT" ]; then
+            die "Swift rebuild requires existing venvstacks export at $LOCAL_EXPORT. Run build.sh release first."
+        fi
+        DONOR_LAYERS="$LOCAL_EXPORT"
+        DONOR_SOURCE="$LOCAL_EXPORT (swift rebuild, no venvstacks rebuild)"
+        _local_export_fresh \
+            || warn "Local export fingerprint mismatch; using stale layers (swift rebuild)."
+        return
+    fi
+
     # Explicit OMLX_DONOR_APP override → use it, skip rebuild logic entirely.
     if [ -n "$OMLX_DONOR_APP_SET" ]; then
         [ -d "$OMLX_DONOR_APP" ] || die "OMLX_DONOR_APP set but not found: $OMLX_DONOR_APP"
