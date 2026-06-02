@@ -46,7 +46,7 @@ struct ServerScreen: View {
                                   defaultValue: "Port",
                                   comment: "Row label for the server port field"),
                     sublabel: String(localized: "server.row.port.sub",
-                                     defaultValue: "Default 8080. Server restarts on save.",
+                                     defaultValue: "Default 8000. Server restarts on save.",
                                      comment: "Sublabel under the Port field"),
                     isLast: true
                 ) {
@@ -197,9 +197,7 @@ struct ServerHeroCard: View {
                 .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
-                    Text(String(localized: "server.hero.title",
-                                defaultValue: "oMLX Server",
-                                comment: "Hero card title on Server and Status screens"))
+                    Text(title)
                         .font(.omlxText(18, weight: .semibold))
                         .foregroundStyle(theme.text)
                     StatusPill(status: pillStatus)
@@ -212,17 +210,10 @@ struct ServerHeroCard: View {
             buttons
         }
         .padding(18)
-        // Hero card surface: subtle accent gradient over a glass/material
-        // fill that's clipped to the rounded-rect outline. The gradient stays
-        // on top so the green/blue accent reads on both macOS 15 (over
-        // .thickMaterial) and macOS 26 (over real liquid glass).
+        // Hero card surface follows the grouped Settings style. Status is
+        // carried by the pill/actions, not by a colored background wash.
         .background(heroBackground)
-        .appGlass(.strong, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-        )
         .padding(.horizontal, 14)
         .padding(.bottom, 14)
     }
@@ -328,23 +319,13 @@ struct ServerHeroCard: View {
 
     @ViewBuilder
     private var heroBackground: some View {
-        if theme.isDark {
-            LinearGradient(
-                colors: [
-                    Color(rgb24: 0x30D158, opacity: 0.08),
-                    Color(rgb24: 0x0A84FF, opacity: 0.06),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        } else {
-            LinearGradient(
-                colors: [
-                    Color(rgb24: 0xF4FAF6),
-                    Color(rgb24: 0xF4F7FC),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        }
+        theme.groupBg
+    }
+
+    private var title: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        let trimmed = version?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "oMLX" : "oMLX \(trimmed)"
     }
 }
 
@@ -668,7 +649,7 @@ private struct HintFooter: View {
 @MainActor
 final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
-    @Published var portText: String = "8080"
+    @Published var portText: String = "8000"
     @Published var logLevel: String = "info"
 
     // Phase 4 — Advanced disclosure.
@@ -694,7 +675,7 @@ final class ServerScreenVM: ObservableObject {
     /// Last applied (effective) values used to build endpoint URLs. Distinct
     /// from `host`/`portText` so the URLs don't flicker mid-edit.
     @Published var effectiveHost: String = "127.0.0.1"
-    @Published var effectivePort: Int = 8080
+    @Published var effectivePort: Int = 8000
 
     /// Apply-button baselines: snapshots of each Apply-managed draft taken
     /// after a successful `load()` or `applyServerSettings()`. The button's
@@ -703,7 +684,7 @@ final class ServerScreenVM: ObservableObject {
     ///
     /// Listen Address / Log Level / SSE Keep-Alive Mode auto-apply via the
     /// `bind()` wrapper and don't need baselines here.
-    private var baselinePortText: String = "8080"
+    private var baselinePortText: String = "8000"
     private var baselineSamplingContextText: String = "32768"
     private var baselineSamplingMaxTokensText: String = "32768"
     private var baselineSamplingTemperatureText: String = "1.0"
