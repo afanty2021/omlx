@@ -37,7 +37,7 @@
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
-                huggingface: { endpoint: '' },
+                huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
@@ -786,6 +786,7 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
                             network_no_proxy: this.globalSettings.network.no_proxy,
@@ -3365,8 +3366,8 @@
             // Memory guard tier → live hard ceiling (GB) for the selected tier.
             // Mirrors ProcessMemoryEnforcer._get_hard_limit_bytes:
             //   static_ceiling  = total - tier.static_reserve
-            //   dynamic_ceiling = omlx_phys_footprint + system_available - tier.other_app_reserve
-            //   final = min(static, dynamic)
+            //   dynamic_ceiling = omlx_phys + free + inactive + active * ratio
+            //   final = min(static, dynamic, metal_cap)
             // The static / dynamic inputs come from the global-settings
             // response and reflect the moment that response was fetched.
             // Warning shown below the breakdown when the kernel
@@ -3465,9 +3466,11 @@
                 // Static / metal cap for the final clamp shown to the user.
                 const totalGB = (sys.total_memory_bytes || 0) / GB;
                 const staticReserveGB =
-                    totalGB < 16
-                        ? 4
-                        : { safe: 12, balanced: 8, aggressive: 6, custom: 8 }[tier] ?? 8;
+                    tier === 'custom'
+                        ? 2
+                        : totalGB < 16
+                            ? 4
+                            : { safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
                 const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 

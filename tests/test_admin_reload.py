@@ -49,6 +49,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = ["/path/to/models"]
         global_settings.model.model_dir = "/path/to/models"
+        global_settings.get_effective_model_dirs = MagicMock(
+            return_value=["/path/to/models"]
+        )
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
 
@@ -124,6 +127,7 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = ["/bad/path"]
         global_settings.model.model_dir = "/bad/path"
+        global_settings.get_effective_model_dirs = MagicMock(return_value=["/bad/path"])
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
 
@@ -155,6 +159,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = []
         global_settings.model.model_dir = "/fallback/path"
+        global_settings.get_effective_model_dirs = MagicMock(
+            return_value=["/fallback/path"]
+        )
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
 

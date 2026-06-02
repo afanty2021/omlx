@@ -17,6 +17,7 @@ Supports:
 import contextlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -278,6 +279,17 @@ class DiscoveredModel:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    source_type: str = "local"  # "local" or "hf_cache"
+    source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
+
+
+@dataclass(frozen=True)
+class HfCacheEntry:
+    """Resolved HuggingFace Hub cache entry."""
+
+    snapshot_path: Path
+    model_id: str
+    source_repo_id: str
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -775,34 +787,108 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
-def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
+def _decode_hf_cache_model_id(path: Path) -> tuple[str, str] | None:
+    """Decode models--org--repo into (route_safe_id, repo_id)."""
+    name = path.name
+    if not name.startswith("models--"):
+        return None
+
+    encoded = name[len("models--"):]
+    if not encoded:
+        return None
+
+    parts = encoded.split("--")
+    if len(parts) == 1:
+        return parts[0], parts[0]
+
+    repo_name = "--".join(parts[1:])
+    return f"{parts[0]}--{repo_name}", f"{parts[0]}/{repo_name}"
+
+
+def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
 
-    Returns (snapshot_path, model_name) or None if not a valid HF cache entry.
+    Returns an HfCacheEntry or None if not a valid HF model cache entry.
     """
-    name = path.name
-    if not name.startswith("models--") or name.count("--") < 2:
+    decoded = _decode_hf_cache_model_id(path)
+    if decoded is None:
+        return None
+    model_id, source_repo_id = decoded
+
+    snapshots_dir = path / "snapshots"
+    if not snapshots_dir.is_dir():
         return None
 
-    # "models--Org--Name" → "Name"
-    model_name = name.split("--", 2)[2]
+    for ref_name in ("main", "master"):
+        try:
+            commit_hash = (path / "refs" / ref_name).read_text().strip()
+        except OSError:
+            continue
+        snapshot = snapshots_dir / commit_hash
+        if snapshot.is_dir():
+            return HfCacheEntry(snapshot, model_id, source_repo_id)
 
+    snapshots = [p for p in snapshots_dir.iterdir() if p.is_dir()]
+    if not snapshots:
+        return None
+    if len(snapshots) == 1:
+        return HfCacheEntry(snapshots[0], model_id, source_repo_id)
+
+    snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+    return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+
+def _safetensors_has_mlx_metadata(path: Path) -> bool:
+    """Return True if any model safetensors shard declares MLX format."""
     try:
-        commit_hash = (path / "refs" / "main").read_text().strip()
-    except OSError:
-        return None
+        from safetensors import safe_open
+    except Exception as e:
+        logger.debug(f"safetensors import failed while checking {path}: {e}")
+        return False
 
-    snapshot = path / "snapshots" / commit_hash
-    if not snapshot.is_dir():
-        return None
+    for shard in sorted(path.glob("model*.safetensors")):
+        try:
+            with safe_open(str(shard), framework="numpy") as f:
+                metadata = f.metadata() or {}
+        except Exception as e:
+            logger.debug(f"Could not read safetensors metadata from {shard}: {e}")
+            continue
+        if str(metadata.get("format", "")).lower() == "mlx":
+            return True
+    return False
 
-    return snapshot, model_name
+
+_MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
+
+
+def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+    """Heuristic for HF cache entries that can be loaded without conversion."""
+    if not _is_model_dir(model_dir):
+        return False
+    if not list(model_dir.glob("model*.safetensors")):
+        logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
+        return False
+    if _safetensors_has_mlx_metadata(model_dir):
+        return True
+
+    repo_lower = source_repo_id.lower()
+    if repo_lower.startswith("mlx-community/") or _MLX_NAME_RE.search(source_repo_id):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible by repo name: {source_repo_id}"
+        )
+        return True
+
+    logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
+    return False
 
 
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
     model_id: str,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
     try:
@@ -850,6 +936,8 @@ def _register_model(
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
             model_context_length=model_context_length,
+            source_type=source_type,
+            source_repo_id=source_repo_id,
         )
 
         size_gb = estimated_size / (1024**3)
@@ -915,9 +1003,17 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                snapshot_path, model_name = hf_resolved
-                if _is_model_dir(snapshot_path):
-                    _register_model(models, snapshot_path, model_name)
+                if _is_hf_cache_mlx_compatible(
+                    hf_resolved.snapshot_path,
+                    hf_resolved.source_repo_id,
+                ):
+                    _register_model(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
                 continue
 
             # Level 2: organization folder — scan children

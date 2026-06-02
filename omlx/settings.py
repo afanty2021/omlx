@@ -117,7 +117,7 @@ class ServerSettings:
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
         return cls(
-            host=data.get("host", "127.0.0.1"),
+            host=data.get("host", data.get("bind_address", "127.0.0.1")),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
@@ -442,15 +442,22 @@ class HuggingFaceSettings:
     """HuggingFace Hub configuration settings."""
 
     endpoint: str = ""  # Empty string = use HF default (https://huggingface.co)
+    hf_cache_enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"endpoint": self.endpoint}
+        return {
+            "endpoint": self.endpoint,
+            "hf_cache_enabled": self.hf_cache_enabled,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> HuggingFaceSettings:
         """Create from dictionary."""
-        return cls(endpoint=data.get("endpoint", ""))
+        return cls(
+            endpoint=data.get("endpoint", ""),
+            hf_cache_enabled=data.get("hf_cache_enabled", True),
+        )
 
 
 @dataclass
@@ -856,6 +863,10 @@ class GlobalSettings:
         # HuggingFace settings
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
+        if hf_cache_enabled := os.getenv("OMLX_HF_CACHE_ENABLED"):
+            self.huggingface.hf_cache_enabled = (
+                hf_cache_enabled.strip().lower() in {"1", "true", "yes", "on"}
+            )
 
         # ModelScope settings
         if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
@@ -938,6 +949,8 @@ class GlobalSettings:
         # HuggingFace settings
         if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
             self.huggingface.endpoint = args.hf_endpoint
+        if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
+            self.huggingface.hf_cache_enabled = args.hf_cache_enabled
 
         # ModelScope settings
         if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
@@ -952,6 +965,43 @@ class GlobalSettings:
             self.network.no_proxy = args.no_proxy
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
+
+    def get_hf_cache_dir(self) -> Path:
+        """Return the standard HuggingFace Hub cache directory."""
+        if hf_hub_cache := os.getenv("HF_HUB_CACHE"):
+            return Path(hf_hub_cache).expanduser().resolve()
+        if hf_home := os.getenv("HF_HOME"):
+            return (Path(hf_home).expanduser() / "hub").resolve()
+        return (Path.home() / ".cache" / "huggingface" / "hub").resolve()
+
+    def get_effective_model_dirs(self, model_dirs: list[str] | None = None) -> list[Path]:
+        """Return model directories in discovery order, including HF cache."""
+        if model_dirs is None:
+            configured = self.model.get_model_dirs(self.base_path)
+        elif model_dirs:
+            configured = [Path(d).expanduser().resolve() for d in model_dirs]
+        else:
+            configured = [self.base_path / "models"]
+        effective: list[Path] = []
+        seen: set[Path] = set()
+
+        def add(path: Path, *, require_exists: bool = False) -> None:
+            resolved = path.expanduser().resolve()
+            if require_exists and not resolved.exists():
+                return
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            effective.append(resolved)
+
+        if configured:
+            add(configured[0])
+        if self.huggingface.hf_cache_enabled:
+            add(self.get_hf_cache_dir(), require_exists=True)
+        for directory in configured[1:]:
+            add(directory)
+
+        return effective
 
     def save(self) -> None:
         """Save current settings to the settings file."""

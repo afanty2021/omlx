@@ -42,6 +42,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct ModelSettings: Codable, Equatable, Sendable {
         let modelDirs: [String]?
+        let modelDir: String?
         let modelFallback: Bool?
     }
 
@@ -93,6 +94,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// the value via env var (HF_ENDPOINT) so the HF library picks it up.
     struct HuggingFaceDTO: Codable, Equatable, Sendable {
         let endpoint: String
+        let hfCacheEnabled: Bool?
     }
 
     /// Mirrors `omlx.settings.SamplingSettings`. The full server surface
@@ -216,6 +218,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// HF_ENDPOINT env var to the HF default (huggingface.co). Patches in-
     /// place via `omlx/admin/routes.py:2804`.
     var hfEndpoint: String? = nil
+    /// Discover MLX-compatible models from the standard Hugging Face Hub
+    /// local cache. Server default is true.
+    var hfCacheEnabled: Bool? = nil
 
     /// ModelScope mirror endpoint. Empty string = use modelscope.cn.
     /// Patched via `ms_endpoint` (encoder converts to snake_case).
@@ -245,6 +250,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// When the requested model isn't loaded, fall back to any loaded
     /// model rather than 404.
     var modelFallback: Bool? = nil
+    /// Ordered model roots. The first directory is the primary download
+    /// target; all entries are scanned for local models.
+    var modelDirs: [String]? = nil
 
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil
