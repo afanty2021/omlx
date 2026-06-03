@@ -16,9 +16,20 @@ Usage:
 
 import argparse
 import faulthandler
+import math
 import sys
 
 from ._version import __version__
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than 0")
+    return parsed
 
 
 def _has_cli_overrides(args) -> bool:
@@ -36,6 +47,10 @@ def _has_cli_overrides(args) -> bool:
     if hasattr(args, "log_level") and args.log_level is not None:
         return True
     if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
+        return True
+    if hasattr(args, "memory_guard") and args.memory_guard is not None:
+        return True
+    if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
         return True
     if hasattr(args, "mcp_config") and args.mcp_config is not None:
         return True
@@ -613,6 +628,21 @@ Example directory structure:
         type=int,
         default=None,
         help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
+    )
+
+    # Memory guard options
+    serve_parser.add_argument(
+        "--memory-guard",
+        type=str,
+        choices=["safe", "balanced", "aggressive"],
+        default=None,
+        help="Memory guard tier. safe reserves more system memory; aggressive allows more oMLX memory use. (default: balanced)",
+    )
+    serve_parser.add_argument(
+        "--memory-guard-gb",
+        type=_positive_float,
+        default=None,
+        help="Custom memory guard ceiling in GB. Sets memory guard tier to custom.",
     )
 
     # paged SSD cache options

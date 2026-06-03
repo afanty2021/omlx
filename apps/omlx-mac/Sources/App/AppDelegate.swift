@@ -133,6 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.terminate(nil)
             }
         }
+        services.updates.setPresentUpdateConfirmation { [weak self] in
+            self?.presentAppView()
+        }
         if !isRunningUnitTests {
             do {
                 try ShellEnvWriter.ensureCLIShim()

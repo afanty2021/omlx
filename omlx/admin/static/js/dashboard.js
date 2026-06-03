@@ -707,6 +707,9 @@
                         this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
+                        this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
+                            this.globalSettings.cache.hot_cache_max_size
+                        );
                         this.hotCachePercent = this.parseHotCacheToPercent(
                             this.globalSettings.cache.hot_cache_max_size,
                             this.globalSettings.system.total_memory_bytes
@@ -776,7 +779,9 @@
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
-                            hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
+                            hot_cache_max_size: this.normalizeHotCacheMaxSize(
+                                this.globalSettings.cache.hot_cache_max_size
+                            ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
@@ -3585,6 +3590,12 @@
             },
 
             // Parse hot cache size string to percent of total memory
+            normalizeHotCacheMaxSize(value) {
+                const normalized = String(value ?? '').trim();
+                if (!normalized || normalized.toLowerCase() === 'auto') return '0';
+                return normalized;
+            },
+
             parseHotCacheToPercent(hotCacheStr, totalBytes) {
                 if (!hotCacheStr || hotCacheStr === '0' || !totalBytes || totalBytes === 0) {
                     return 0;

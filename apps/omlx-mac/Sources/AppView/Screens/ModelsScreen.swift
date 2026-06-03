@@ -375,7 +375,7 @@ final class ModelsScreenVM: ObservableObject {
     private func refresh() async {
         guard let client else { return }
         do {
-            self.allModels = try await client.listModels().models
+            self.allModels = sortModelsByName(try await client.listModels().models)
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -385,6 +385,19 @@ final class ModelsScreenVM: ObservableObject {
 }
 
 // MARK: - Helpers
+
+func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
+    models.enumerated().sorted { lhs, rhs in
+        switch lhs.element.id.localizedCaseInsensitiveCompare(rhs.element.id) {
+        case .orderedAscending:
+            return true
+        case .orderedDescending:
+            return false
+        case .orderedSame:
+            return lhs.offset < rhs.offset
+        }
+    }.map(\.element)
+}
 
 func formatBytes(_ bytes: Int64) -> String {
     var v = Double(bytes)

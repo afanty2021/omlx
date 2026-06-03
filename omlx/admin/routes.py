@@ -351,6 +351,30 @@ def _format_cache_size(size_bytes: int) -> str:
     return f"{mb:.0f}MB"
 
 
+def _parse_hot_cache_max_size(value: str) -> int:
+    """Parse hot cache max size. Hot cache does not support an auto sentinel."""
+    from ..config import parse_size
+
+    normalized = value.strip()
+    if normalized.lower() == "auto":
+        raise ValueError(
+            "Invalid hot_cache_max_size: 'auto' is not supported; "
+            "use '0' to disable or a size like '8GB'"
+        )
+
+    try:
+        size = parse_size(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Invalid hot_cache_max_size: {exc}") from exc
+
+    if size < 0:
+        raise ValueError(
+            "Invalid hot_cache_max_size: must be '0' to disable "
+            "or a non-negative size"
+        )
+    return size
+
+
 _PAROQUANT_REASON = (
     "Not supported on paroquant models yet (compatibility not verified)"
 )
@@ -544,6 +568,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     """
     from pathlib import Path
 
+    from ..model_discovery import model_directory_access_error
     from ..server import _server_state
 
     if _server_state.engine_pool is None:
@@ -552,10 +577,9 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     # Validate all model directories
     for model_dir in model_dirs:
         model_path = Path(model_dir).expanduser().resolve()
-        if not model_path.exists():
-            return False, f"Model directory does not exist: {model_dir}"
-        if not model_path.is_dir():
-            return False, f"Path is not a directory: {model_dir}"
+        access_error = model_directory_access_error(model_path)
+        if access_error is not None:
+            return False, access_error
 
     pool = _server_state.engine_pool
 
@@ -749,7 +773,7 @@ async def _apply_cache_settings_runtime(
 
     # Apply hot cache max size
     if hot_cache_max_size is not None:
-        hot_bytes = 0 if hot_cache_max_size == "0" else parse_size(hot_cache_max_size)
+        hot_bytes = _parse_hot_cache_max_size(hot_cache_max_size)
         old_hot = pool._scheduler_config.hot_cache_max_size
         pool._scheduler_config.hot_cache_max_size = hot_bytes
         if hot_bytes != old_hot:
@@ -2832,8 +2856,6 @@ async def update_global_settings(
         HTTPException: 401 if not authenticated, 503 if server not initialized,
                       400 if validation fails.
     """
-    from ..config import parse_size
-
     global_settings = _get_global_settings()
 
     if global_settings is None:
@@ -2995,6 +3017,12 @@ async def update_global_settings(
         logger.info(
             f"Chunked prefill {'enabled' if request.chunked_prefill else 'disabled'}"
         )
+
+    if request.hot_cache_max_size is not None:
+        try:
+            _parse_hot_cache_max_size(request.hot_cache_max_size)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Apply cache settings
     cache_changed = False
@@ -3554,7 +3582,7 @@ def _parse_commits_from_pyproject(
     # Match: "mlx-lm @ git+https://github.com/.../mlx-lm@<sha>"
     pattern = r'"(\S+)\s*@\s*git\+https://[^@"]+@([0-9a-f]{7,40})"'
     for match in re.finditer(pattern, content):
-        pkg_name = match.group(1).strip().lower()
+        pkg_name = match.group(1).strip().lower().split("[", 1)[0]
         sha = match.group(2)
         if pkg_name in packages:
             repo_url = packages[pkg_name]

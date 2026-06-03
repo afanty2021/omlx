@@ -293,6 +293,12 @@ Models are auto-detected by type. You can also download models directly from the
 # Start with default settings (memory guard tier = balanced, manage via admin UI)
 omlx serve --model-dir ~/models
 
+# Choose a memory guard tier at startup
+omlx serve --model-dir ~/models --memory-guard safe
+
+# Set a custom memory guard ceiling in GB
+omlx serve --model-dir ~/models --memory-guard-gb 48
+
 # Enable SSD cache for KV blocks
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 

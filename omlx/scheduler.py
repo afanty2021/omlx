@@ -820,6 +820,7 @@ class Scheduler:
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
         self._prefill_safe_zone_ratio: float = 0.80
         self._prefill_min_chunk_tokens: int = 32
+        self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -1946,7 +1947,7 @@ class Scheduler:
             )
 
             # Pre-chunk safety guard: NEVER submit a chunk whose predicted peak
-            # would breach the margined physical cap. The Metal command-buffer
+            # would breach the prefill safety cap. The Metal command-buffer
             # OOM is an async, uncatchable SIGABRT, so it must be prevented
             # before submission — a post-chunk check is too late. Falls back to
             # min_chunk after a reclaim; raises gracefully only if even the
@@ -2123,11 +2124,12 @@ class Scheduler:
     # ``current`` (it is eval'd into residency after the forward pass).
     _PREFILL_HEADROOM_SAFETY: float = 0.90
 
-    # Fraction of the physical abort cap we allow a chunk's predicted PEAK to
-    # reach. The remaining headroom is reserved for Metal command-buffer
-    # overhead: a chunk whose peak lands on the wired limit can make Metal
-    # abort the command buffer asynchronously (kIOGPUCommandBufferCallbackError
-    # OutOfMemory) — an uncatchable SIGABRT — so we keep a hard margin below it.
+    # Default fraction of the physical abort cap we allow a chunk's predicted
+    # PEAK to reach. ProcessMemoryEnforcer can override this per tier. The
+    # remaining headroom is reserved for Metal command-buffer overhead: a chunk
+    # whose peak lands on the wired limit can make Metal abort the command
+    # buffer asynchronously (kIOGPUCommandBufferCallbackError OutOfMemory) —
+    # an uncatchable SIGABRT — so we keep a hard margin below it.
     _PREFILL_ABORT_MARGIN: float = 0.90
 
     # Safety multiplier on the predicted per-chunk transient. The transient
@@ -2166,14 +2168,20 @@ class Scheduler:
         return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
 
     def _prefill_abort_cap(self) -> int:
-        """Margined physical cap a chunk's predicted peak must stay under.
+        """Safety cap a chunk's predicted peak must stay under.
 
         Uses the stable abort limit (min(static, metal_cap)) with a margin so
         we never submit a chunk that could trip the async Metal OOM. Falls back
         to the dynamic hard limit before the abort limit is propagated.
         """
         cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
-        return int(cap * self._PREFILL_ABORT_MARGIN) if cap > 0 else 0
+        return int(cap * self._prefill_abort_margin) if cap > 0 else 0
+
+    def _prefill_abort_description(self) -> tuple[int, int, float]:
+        """Return (base cap, safety cap, margin) for diagnostics."""
+        base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
+        safety_cap = self._prefill_abort_cap()
+        return base_cap, safety_cap, self._prefill_abort_margin
 
     def _guard_prefill_chunk(
         self,
@@ -2193,7 +2201,7 @@ class Scheduler:
         does NOT contain "Memory limit exceeded", so ``_requeue_or_fail_prefill``
         fails it fast with a clear error rather than looping a doomed retry.
         """
-        cap = self._prefill_abort_cap()
+        base_cap, cap, margin = self._prefill_abort_description()
         if cap <= 0:
             return n_tokens
         min_chunk = max(1, self._prefill_min_chunk_tokens)
@@ -2206,17 +2214,23 @@ class Scheduler:
         if current + self._predicted_chunk_transient(min_chunk, kv_len) > cap:
             logger.warning(
                 "[guard:%s] context too large at progress=%d kv_len=%d: "
-                "%.2fGB + min-chunk transient exceeds physical cap %.2fGB",
+                "%.2fGB + min-chunk transient exceeds prefill safety cap "
+                "%.2fGB (%d%% of effective ceiling %.2fGB)",
                 loop_label,
                 progress,
                 kv_len,
                 current / 1024**3,
                 cap / 1024**3,
+                round(margin * 100),
+                base_cap / 1024**3,
             )
             raise RuntimeError(
                 "Prefill context too large for available memory "
                 f"(pre-chunk guard at {progress} tokens, kv_len={kv_len}): "
-                f"would exceed physical cap {cap / 1024**3:.1f}GB"
+                "predicted peak would exceed prefill safety cap "
+                f"{cap / 1024**3:.1f}GB "
+                f"({round(margin * 100)}% of effective ceiling "
+                f"{base_cap / 1024**3:.1f}GB)"
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
@@ -2303,7 +2317,7 @@ class Scheduler:
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
-        # throttle target and the margined physical cap, so the peak can never
+        # throttle target and the prefill safety cap, so the peak can never
         # reach the Metal wall (the uncatchable async OOM).
         safe_target = int(hard_cap * self._PREFILL_HEADROOM_SAFETY)
         abort_cap = self._prefill_abort_cap()

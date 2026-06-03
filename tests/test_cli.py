@@ -139,6 +139,20 @@ class TestServeCommandOptions:
         assert "--max-model-memory" not in result.stdout
         assert "--max-process-memory" not in result.stdout
 
+    def test_serve_has_memory_guard_options(self):
+        """Test that serve command exposes memory guard controls."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "serve", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "--memory-guard" in result.stdout
+        assert "--memory-guard-gb" in result.stdout
+        assert "safe" in result.stdout
+        assert "balanced" in result.stdout
+        assert "aggressive" in result.stdout
+
     def test_serve_no_model_specific_options(self):
         """Test that serve command does not have model-specific options (managed via admin page)."""
         result = subprocess.run(
@@ -572,6 +586,8 @@ class TestServeCommandFunctions:
             "sse_keepalive_mode": None,
             "max_concurrent_requests": None,
             "embedding_batch_size": None,
+            "memory_guard": None,
+            "memory_guard_gb": None,
             "paged_ssd_cache_dir": None,
             "paged_ssd_cache_max_size": None,
             "hot_cache_max_size": None,
@@ -678,6 +694,50 @@ class TestServeCommandFunctions:
 
         assert result.returncode != 0
         assert "embedding_batch_size" in result.stdout
+        assert not (tmp_path / "settings.json").exists()
+
+    def test_invalid_memory_guard_gb_is_not_persisted(self, tmp_path):
+        """Invalid custom memory guard values should fail before saving settings.json."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omlx.cli",
+                "serve",
+                "--base-path",
+                str(tmp_path),
+                "--memory-guard-gb",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode != 0
+        assert "--memory-guard-gb" in result.stderr
+        assert not (tmp_path / "settings.json").exists()
+
+    def test_non_finite_memory_guard_gb_is_rejected(self, tmp_path):
+        """NaN and infinity must not be accepted as custom memory ceilings."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omlx.cli",
+                "serve",
+                "--base-path",
+                str(tmp_path),
+                "--memory-guard-gb",
+                "nan",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode != 0
+        assert "finite number" in result.stderr
         assert not (tmp_path / "settings.json").exists()
 
     def test_serve_exits_on_port_conflict_before_importing_server(
@@ -797,6 +857,8 @@ class TestHasCliOverrides:
             "host": None,
             "log_level": None,
             "embedding_batch_size": None,
+            "memory_guard": None,
+            "memory_guard_gb": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -828,6 +890,14 @@ class TestHasCliOverrides:
     def test_embedding_batch_size_explicit(self):
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(embedding_batch_size=4)) is True
+
+    def test_memory_guard_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(memory_guard="safe")) is True
+
+    def test_memory_guard_gb_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(memory_guard_gb=48.0)) is True
 
     def test_hf_cache_explicit(self):
         from omlx.cli import _has_cli_overrides

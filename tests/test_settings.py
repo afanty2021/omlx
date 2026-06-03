@@ -344,6 +344,11 @@ class TestCacheSettings:
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
 
+    def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
+        """Legacy hot_cache_max_size=auto should load as disabled."""
+        settings = CacheSettings.from_dict({"hot_cache_max_size": "auto"})
+        assert settings.hot_cache_max_size == "0"
+
     def test_initial_cache_blocks_custom(self):
         """Test custom initial_cache_blocks value."""
         settings = CacheSettings(initial_cache_blocks=8192)
@@ -716,6 +721,22 @@ class TestGlobalSettings:
 
         assert settings.get_effective_model_dirs() == [primary.resolve()]
 
+    def test_cli_override_memory_guard_tier(self, tmp_path):
+        """CLI memory guard tier should override loaded settings."""
+        args = Namespace(memory_guard="safe", memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.memory_guard_tier == "safe"
+        assert settings.memory.memory_guard_custom_ceiling_gb == 0.0
+
+    def test_cli_override_memory_guard_gb_sets_custom_tier(self, tmp_path):
+        """CLI memory guard GB should select custom tier automatically."""
+        args = Namespace(memory_guard=None, memory_guard_gb=48.0)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.memory_guard_tier == "custom"
+        assert settings.memory.memory_guard_custom_ceiling_gb == 48.0
+
     def test_load_from_file(self):
         """Test loading settings from JSON file."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -915,6 +936,29 @@ class TestGlobalSettings:
             assert len(resolved_dirs) == 1
             assert resolved_dirs[0] == valid_models.resolve()
 
+    def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Test that existing but unreadable model dirs are skipped."""
+        base = tmp_path / "omlx"
+        valid_models = tmp_path / "valid_models"
+        unreadable = tmp_path / "unreadable_models"
+        unreadable.mkdir()
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable.resolve():
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        settings = GlobalSettings(base_path=base)
+        settings.model.model_dirs = [str(valid_models), str(unreadable)]
+        settings.ensure_directories()
+
+        resolved_dirs = settings.model.get_model_dirs(base)
+        assert resolved_dirs == [valid_models.resolve()]
+
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""
         settings = GlobalSettings()
@@ -973,6 +1017,13 @@ class TestGlobalSettings:
             errors = settings.validate()
             assert not any("memory_guard_tier" in e for e in errors)
 
+        settings = GlobalSettings()
+        settings.memory.memory_guard_tier = "custom"
+        settings.memory.memory_guard_custom_ceiling_gb = 48.0
+        errors = settings.validate()
+        assert not any("memory_guard_tier" in e for e in errors)
+        assert not any("memory_guard_custom_ceiling_gb" in e for e in errors)
+
     def test_validate_memory_guard_tier_invalid(self):
         """Test validation flags unknown tier values."""
         settings = GlobalSettings()
@@ -998,6 +1049,24 @@ class TestGlobalSettings:
         settings.cache.ssd_cache_max_size = "not-a-size"
         errors = settings.validate()
         assert any("ssd_cache_max_size" in e.lower() for e in errors)
+
+    def test_validate_hot_cache_size(self):
+        """Hot cache accepts explicit sizes only; auto is SSD-cache-only."""
+        settings = GlobalSettings()
+        settings.cache.hot_cache_max_size = "0"
+        assert not any("hot_cache_max_size" in e for e in settings.validate())
+
+        settings.cache.hot_cache_max_size = "8GB"
+        assert not any("hot_cache_max_size" in e for e in settings.validate())
+
+        settings.cache.hot_cache_max_size = "auto"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e for e in errors)
+        assert any("auto" in e for e in errors)
+
+        settings.cache.hot_cache_max_size = "not-a-size"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e for e in errors)
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""

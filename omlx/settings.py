@@ -275,12 +275,16 @@ class CacheSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CacheSettings:
         """Create from dictionary."""
+        hot_cache_max_size = data.get("hot_cache_max_size", "0")
+        if isinstance(hot_cache_max_size, str) and hot_cache_max_size.lower() == "auto":
+            hot_cache_max_size = "0"
+
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
-            hot_cache_max_size=data.get("hot_cache_max_size", "0"),
+            hot_cache_max_size=hot_cache_max_size,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -925,6 +929,13 @@ class GlobalSettings:
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
 
+        # Memory guard settings
+        if hasattr(args, "memory_guard") and args.memory_guard is not None:
+            self.memory.memory_guard_tier = args.memory_guard
+        if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
+            self.memory.memory_guard_tier = "custom"
+            self.memory.memory_guard_custom_ceiling_gb = float(args.memory_guard_gb)
+
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
             self.cache.enabled = args.cache_enabled
@@ -1038,6 +1049,8 @@ class GlobalSettings:
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
+        from .model_discovery import model_directory_access_error
+
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
@@ -1057,17 +1070,22 @@ class GlobalSettings:
         # Model directories - skip unavailable paths (e.g. disconnected external drive)
         valid_dirs = []
         for directory in self.model.get_model_dirs(self.base_path):
-            if directory.exists():
-                valid_dirs.append(str(directory))
+            if not directory.exists():
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    logger.debug(f"Created directory: {directory}")
+                except OSError as e:
+                    logger.warning(
+                        f"Model directory unavailable, skipping: {directory} ({e})"
+                    )
+                    continue
+
+            access_error = model_directory_access_error(directory)
+            if access_error is not None:
+                logger.warning(f"Model directory unavailable, skipping: {access_error}")
                 continue
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"Created directory: {directory}")
-                valid_dirs.append(str(directory))
-            except OSError as e:
-                logger.warning(
-                    f"Model directory unavailable, skipping: {directory} ({e})"
-                )
+
+            valid_dirs.append(str(directory))
 
         # Update model_dirs to only include valid paths
         self.model.model_dirs = valid_dirs
@@ -1150,6 +1168,19 @@ class GlobalSettings:
                     errors.append("ssd_cache_max_size must be positive")
             except ValueError as e:
                 errors.append(f"Invalid ssd_cache_max_size: {e}")
+
+        try:
+            hot_cache_size = parse_size(self.cache.hot_cache_max_size)
+            if hot_cache_size < 0:
+                errors.append("hot_cache_max_size must be non-negative")
+        except ValueError as e:
+            if self.cache.hot_cache_max_size.strip().lower() == "auto":
+                errors.append(
+                    "Invalid hot_cache_max_size: 'auto' is not supported; "
+                    "use '0' to disable or a size like '8GB'"
+                )
+            else:
+                errors.append(f"Invalid hot_cache_max_size: {e}")
 
         if self.cache.initial_cache_blocks <= 0:
             errors.append(

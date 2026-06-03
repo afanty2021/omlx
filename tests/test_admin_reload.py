@@ -2,6 +2,7 @@
 """Tests for admin reload models functionality."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -180,3 +181,34 @@ class TestReloadModels:
                     mock_apply.assert_called_once_with(["/fallback/path"])
         finally:
             _restore_mocks(originals)
+
+
+class TestApplyModelDirsRuntime:
+    """Tests for runtime model directory application."""
+
+    def test_rejects_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Unreadable model dirs should return a user-facing error."""
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == model_dir.resolve():
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        mock_server_state = MagicMock()
+        mock_server_state.engine_pool = MagicMock()
+        mock_server_state.settings_manager = None
+
+        with patch.object(omlx.server, "_server_state", mock_server_state):
+            success, msg = asyncio.run(
+                admin_routes._apply_model_dirs_runtime([str(model_dir)])
+            )
+
+        assert success is False
+        assert "not readable" in msg
+        mock_server_state.engine_pool.discover_models.assert_not_called()

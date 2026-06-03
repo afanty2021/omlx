@@ -76,7 +76,8 @@ def test_chunk_transient_zero_when_model_info_missing():
 
 
 def _throttle_ctx(*, current, hard, soft_ratio=0.80, samples_bpt=None,
-                  monitor=None, min_chunk=32, abort=None, reclaim_to=None):
+                  monitor=None, min_chunk=32, abort=None, reclaim_to=None,
+                  abort_margin=Scheduler._PREFILL_ABORT_MARGIN):
     """Build a minimal stand-in carrying the attributes / bound methods that
     _adaptive_chunk_size and _guard_prefill_chunk read. `_fake_current` is the
     value the patched memory probes report; `reclaim_to` (if set) is what a
@@ -91,6 +92,7 @@ def _throttle_ctx(*, current, hard, soft_ratio=0.80, samples_bpt=None,
         _memory_abort_limit_bytes=int(abort if abort is not None else hard),
         _prefill_safe_zone_ratio=soft_ratio,
         _prefill_min_chunk_tokens=min_chunk,
+        _prefill_abort_margin=abort_margin,
         _prefill_transient_tracker=tracker,
         memory_monitor=monitor,
         _PREFILL_STEP_TIERS=Scheduler._PREFILL_STEP_TIERS,
@@ -103,6 +105,9 @@ def _throttle_ctx(*, current, hard, soft_ratio=0.80, samples_bpt=None,
         ns, Scheduler
     )
     ns._prefill_abort_cap = Scheduler._prefill_abort_cap.__get__(ns, Scheduler)
+    ns._prefill_abort_description = (
+        Scheduler._prefill_abort_description.__get__(ns, Scheduler)
+    )
     ns._reclaim_to = reclaim_to
 
     def _reclaim():
@@ -237,6 +242,20 @@ def test_guard_raises_clean_error_when_even_floor_cannot_fit():
         _guard_call(ns, 256, kv_len=122_000)
     assert "too large for available memory" in str(exc.value)
     assert "Memory limit exceeded" not in str(exc.value)  # → fails fast, no requeue
+    assert "prefill safety cap" in str(exc.value)
+    assert "90% of effective ceiling 42.0GB" in str(exc.value)
+
+
+def test_guard_custom_margin_allows_95_percent_of_ceiling():
+    """Custom tier propagates a looser prefill safety margin."""
+    hard = 30 * _GB
+    ns = _throttle_ctx(
+        current=0,
+        hard=hard,
+        samples_bpt=1024 * 1024,
+        abort_margin=0.95,
+    )
+    assert ns._prefill_abort_cap() == int(30 * _GB * 0.95)
 
 
 def test_guard_recovers_after_reclaim_frees_memory():

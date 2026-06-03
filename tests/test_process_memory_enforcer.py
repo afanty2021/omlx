@@ -1243,6 +1243,15 @@ class TestTwoWatermarkPressureLevels:
         assert enforcer_2wm._soft_bytes() == int(100 * 1024**3 * 0.85)
         assert enforcer_2wm._hard_bytes() == int(100 * 1024**3 * 0.95)
 
+    def test_prefill_abort_margin_is_tier_specific(self, pool):
+        balanced = _make_enforcer(pool, tier="balanced")
+        aggressive = _make_enforcer(pool, tier="aggressive")
+        custom = _make_enforcer(pool, tier="custom")
+
+        assert balanced._get_prefill_abort_margin() == 0.90
+        assert aggressive._get_prefill_abort_margin() == 0.95
+        assert custom._get_prefill_abort_margin() == 0.95
+
     def test_get_pressure_level_when_not_running(self, enforcer_2wm):
         # _running=False → always ok regardless of cached level
         enforcer_2wm._pressure_level = "hard"
@@ -1352,6 +1361,28 @@ class TestTwoWatermarkPressureLevels:
             await enforcer_2wm._check_and_enforce()
 
         assert scheduler._memory_abort_limit_bytes == 42 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_propagates_prefill_abort_margin_to_scheduler(self, pool):
+        enforcer = _make_enforcer(pool, ceiling=100 * 1024**3, tier="custom")
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_abort_limit_bytes = 0
+        scheduler._prefill_abort_margin = 0.90
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = False
+        engine.scheduler = scheduler
+        pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 50 * 1024**3
+            await enforcer._check_and_enforce()
+
+        assert scheduler._prefill_abort_margin == 0.95
 
     @pytest.mark.asyncio
     async def test_hard_aborts_in_flight_when_all_pinned(self, enforcer_2wm, pool):

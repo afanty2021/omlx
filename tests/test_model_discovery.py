@@ -18,6 +18,7 @@ from omlx.model_discovery import (
     discover_models_from_dirs,
     estimate_model_size,
     format_size,
+    model_directory_access_error,
 )
 
 
@@ -679,6 +680,45 @@ class TestDiscoverModels:
         file_path.write_text("content")
         with pytest.raises(ValueError, match="not a directory"):
             discover_models(file_path)
+
+    def test_unreadable_directory_is_skipped(self, tmp_path, monkeypatch):
+        """Test that unreadable model roots do not crash discovery."""
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == tmp_path:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        assert discover_models(tmp_path) == {}
+        assert "not readable" in model_directory_access_error(tmp_path)
+
+    def test_unreadable_directory_skipped_in_multi_dir_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        """Test that a readable directory still wins when another root is unreadable."""
+        unreadable = tmp_path / "unreadable"
+        unreadable.mkdir()
+        readable = tmp_path / "readable"
+        readable.mkdir()
+        model_dir = readable / "valid-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        models = discover_models_from_dirs([unreadable, readable])
+        assert list(models) == ["valid-model"]
 
     def test_model_with_weight_error_skipped(self, tmp_path):
         """Test that models with no weights are skipped."""

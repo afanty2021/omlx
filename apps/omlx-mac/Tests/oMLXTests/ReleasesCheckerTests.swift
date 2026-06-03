@@ -72,3 +72,30 @@ final class ReleasesCheckerTests: XCTestCase {
         )
     }
 }
+
+@MainActor
+final class UpdateControllerPrefsTests: XCTestCase {
+
+    func testLegacyAutoDownloadPrefMigratesToAutoNotify() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-update-prefs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let url = dir.appendingPathComponent("update-prefs.json")
+        try Data(
+            #"{"channel":"stable","autoCheck":true,"autoDownload":true}"#.utf8
+        ).write(to: url)
+
+        let controller = UpdateController(storeURL: url, currentVersion: "0.0.0")
+        XCTAssertTrue(controller.autoNotify)
+
+        controller.autoNotify = false
+
+        let saved = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: url)
+        ) as? [String: Any]
+        XCTAssertEqual(saved?["autoNotify"] as? Bool, false)
+        XCTAssertNil(saved?["autoDownload"])
+    }
+}

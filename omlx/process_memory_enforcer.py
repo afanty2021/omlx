@@ -72,6 +72,16 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
     "aggressive": 0.8,
 }
 
+# Fraction of the effective physical cap used by the pre-chunk prediction
+# guard. Aggressive/custom are user-directed and can run closer to the
+# configured ceiling.
+_PREFILL_ABORT_MARGIN: dict[str, float] = {
+    "safe": 0.90,
+    "balanced": 0.90,
+    "aggressive": 0.95,
+    "custom": 0.95,
+}
+
 
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
@@ -538,6 +548,10 @@ class ProcessMemoryEnforcer:
             return min(static_ceiling, metal_cap)
         return static_ceiling
 
+    def _get_prefill_abort_margin(self) -> float:
+        """Tier-specific prediction margin for pre-chunk safety checks."""
+        return _PREFILL_ABORT_MARGIN[self._memory_guard_tier]
+
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
         ceiling = self._get_hard_limit_bytes()
@@ -648,6 +662,7 @@ class ProcessMemoryEnforcer:
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = ceiling
             scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
+            scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
