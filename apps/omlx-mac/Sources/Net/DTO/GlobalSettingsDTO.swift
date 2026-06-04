@@ -38,6 +38,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let logLevel: String
         let serverAliases: [String]
         let sseKeepaliveMode: String?
+        let autoStartOnLaunch: Bool?
     }
 
     struct ModelSettings: Codable, Equatable, Sendable {
@@ -172,6 +173,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// SSE keep-alive line strategy: `"chunk"` (default), `"comment"`, or
     /// `"off"`. Server rejects anything else with a 400.
     var sseKeepaliveMode: String? = nil
+    var autoStartOnLaunch: Bool? = nil
 
     // Claude Code (PR 9)
     var claudeCodeContextScalingEnabled: Bool? = nil

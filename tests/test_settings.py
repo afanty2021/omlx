@@ -43,6 +43,7 @@ class TestServerSettings:
         assert settings.log_level == "info"
         assert settings.cors_origins == ["*"]
         assert settings.sse_keepalive_mode == "chunk"
+        assert settings.auto_start_on_launch is True
 
     def test_custom_values(self):
         """Test custom values."""
@@ -68,6 +69,7 @@ class TestServerSettings:
             "cors_origins": ["*"],
             "server_aliases": [],
             "sse_keepalive_mode": "chunk",
+            "auto_start_on_launch": True,
         }
 
     def test_from_dict_sse_keepalive_mode(self):
@@ -76,6 +78,12 @@ class TestServerSettings:
             settings = ServerSettings.from_dict({"sse_keepalive_mode": mode})
             assert settings.sse_keepalive_mode == mode
             assert settings.to_dict()["sse_keepalive_mode"] == mode
+
+    def test_from_dict_auto_start_on_launch(self):
+        """auto_start_on_launch round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"auto_start_on_launch": False})
+        assert settings.auto_start_on_launch is False
+        assert settings.to_dict()["auto_start_on_launch"] is False
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -233,7 +241,9 @@ class TestSchedulerSettings:
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = SchedulerSettings(max_concurrent_requests=128, embedding_batch_size=16)
+        settings = SchedulerSettings(
+            max_concurrent_requests=128, embedding_batch_size=16
+        )
         assert settings.max_concurrent_requests == 128
         assert settings.embedding_batch_size == 16
 
@@ -387,6 +397,7 @@ class TestAuthSettings:
     def test_to_dict_with_sub_keys(self):
         """Test conversion to dictionary with sub keys."""
         from omlx.settings import SubKeyEntry
+
         settings = AuthSettings(
             api_key="my-key",
             sub_keys=[SubKeyEntry(key="sk1", name="Test", created_at="2024-01-01")],
@@ -658,11 +669,13 @@ class TestMemorySettings:
 
     def test_from_dict_ignores_legacy_keys(self):
         """Legacy max_process_memory / is_explicit keys in old settings.json are ignored."""
-        settings = MemorySettings.from_dict({
-            "max_process_memory": "80%",
-            "max_process_memory_is_explicit": True,
-            "memory_guard_tier": "safe",
-        })
+        settings = MemorySettings.from_dict(
+            {
+                "max_process_memory": "80%",
+                "max_process_memory_is_explicit": True,
+                "memory_guard_tier": "safe",
+            }
+        )
         assert settings.memory_guard_tier == "safe"
         assert not hasattr(settings, "max_process_memory")
 
@@ -688,7 +701,9 @@ class TestGlobalSettings:
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
 
-    def test_get_effective_model_dirs_includes_hf_cache_between_dirs(self, tmp_path, monkeypatch):
+    def test_get_effective_model_dirs_includes_hf_cache_between_dirs(
+        self, tmp_path, monkeypatch
+    ):
         """HF cache is inserted between primary and additional model dirs."""
         primary = tmp_path / "primary"
         additional = tmp_path / "additional"
@@ -707,7 +722,9 @@ class TestGlobalSettings:
             additional.resolve(),
         ]
 
-    def test_get_effective_model_dirs_skips_disabled_hf_cache(self, tmp_path, monkeypatch):
+    def test_get_effective_model_dirs_skips_disabled_hf_cache(
+        self, tmp_path, monkeypatch
+    ):
         """Disabled HF cache is not included in discovery dirs."""
         primary = tmp_path / "primary"
         hf_cache = tmp_path / "hf" / "hub"
@@ -764,7 +781,11 @@ class TestGlobalSettings:
                 json.dumps(
                     {
                         "version": "1.0",
-                        "server": {"host": "0.0.0.0", "port": 9000, "log_level": "debug"},
+                        "server": {
+                            "host": "0.0.0.0",
+                            "port": 9000,
+                            "log_level": "debug",
+                        },
                         "model": {"model_dir": "/models"},
                         "memory": {"memory_guard_tier": "safe"},
                         "scheduler": {
@@ -1205,16 +1226,12 @@ class TestGlobalSettings:
         """Test various values for OMLX_CACHE_ENABLED."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for value in ["true", "1", "yes"]:
-                with patch.dict(
-                    os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False
-                ):
+                with patch.dict(os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False):
                     settings = GlobalSettings.load(base_path=tmpdir)
                     assert settings.cache.enabled is True
 
             for value in ["false", "0", "no"]:
-                with patch.dict(
-                    os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False
-                ):
+                with patch.dict(os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False):
                     settings = GlobalSettings.load(base_path=tmpdir)
                     assert settings.cache.enabled is False
 
@@ -1495,7 +1512,10 @@ class TestInitSettings:
 
     def test_multiple_init_overwrites(self):
         """Test calling init_settings multiple times overwrites."""
-        with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir1,
+            tempfile.TemporaryDirectory() as tmpdir2,
+        ):
             settings1 = init_settings(base_path=tmpdir1)
             settings2 = init_settings(base_path=tmpdir2)
 
@@ -1650,7 +1670,11 @@ class TestSamplingSettings:
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"max_context_window": 8192, "max_tokens": 1024, "repetition_penalty": 1.2}
+        data = {
+            "max_context_window": 8192,
+            "max_tokens": 1024,
+            "repetition_penalty": 1.2,
+        }
         settings = SamplingSettings.from_dict(data)
         assert settings.max_context_window == 8192
         assert settings.max_tokens == 1024
@@ -1851,6 +1875,7 @@ class TestClaudeCodeRouteIntegration:
         the field in model_fields_set so the POST handler can clear it.
         """
         from omlx.admin.routes import GlobalSettingsRequest
+
         r = GlobalSettingsRequest.model_validate({"claude_code_opus_model": None})
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model is None
@@ -1861,6 +1886,7 @@ class TestClaudeCodeRouteIntegration:
         in model_fields_set — POST handler must not apply it (leave server value alone).
         """
         from omlx.admin.routes import GlobalSettingsRequest
+
         r = GlobalSettingsRequest()
         assert "claude_code_opus_model" not in r.model_fields_set
 
@@ -1870,7 +1896,10 @@ class TestClaudeCodeRouteIntegration:
         in model_fields_set and carry the value.
         """
         from omlx.admin.routes import GlobalSettingsRequest
-        r = GlobalSettingsRequest(claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit")
+
+        r = GlobalSettingsRequest(
+            claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit"
+        )
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
 

@@ -375,7 +375,8 @@ cat > "$CLI_WRAPPER" <<'EOF'
 #!/bin/sh
 set -eu
 
-APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
 RESOURCES="$APP_ROOT/Resources"
 PYROOT="$RESOURCES/Python"
 CPYTHON="$PYROOT/cpython-3.11"

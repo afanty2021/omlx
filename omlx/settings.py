@@ -108,6 +108,7 @@ class ServerSettings:
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
     server_aliases: list[str] = field(default_factory=list)
     sse_keepalive_mode: str = "chunk"
+    auto_start_on_launch: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -123,6 +124,7 @@ class ServerSettings:
             cors_origins=data.get("cors_origins", ["*"]),
             server_aliases=data.get("server_aliases", []),
             sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
+            auto_start_on_launch=data.get("auto_start_on_launch", True),
         )
 
 
@@ -297,7 +299,9 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 class MemorySettings:
     """Process-level memory enforcement settings."""
 
-    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
+    prefill_memory_guard: bool = (
+        True  # Memory guard: prefill estimation + generation scheduling defer
+    )
     # Tier selects the active-memory reclaim ratio (safe/balanced/aggressive)
     # or, for "custom", lets the user pin the dynamic ceiling to a fixed
     # GB number. See ProcessMemoryEnforcer._get_dynamic_ceiling for the math.
@@ -341,12 +345,8 @@ class MemorySettings:
             ),
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
-            prefill_safe_zone_ratio=float(
-                data.get("prefill_safe_zone_ratio", 0.80)
-            ),
-            prefill_min_chunk_tokens=int(
-                data.get("prefill_min_chunk_tokens", 32)
-            ),
+            prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
+            prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
         )
 
 
@@ -419,9 +419,7 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
-            sub_keys=[
-                SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
-            ],
+            sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
 
@@ -700,7 +698,9 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
-    idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
+    idle_timeout: ModelIdleTimeoutSettings = field(
+        default_factory=ModelIdleTimeoutSettings
+    )
 
     @classmethod
     def load(
@@ -789,13 +789,13 @@ class GlobalSettings:
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
             if "integrations" in data:
-                self.integrations = IntegrationSettings.from_dict(
-                    data["integrations"]
-                )
+                self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
             if "idle_timeout" in data:
-                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
+                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
+                    data["idle_timeout"]
+                )
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -868,9 +868,12 @@ class GlobalSettings:
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
         if hf_cache_enabled := os.getenv("OMLX_HF_CACHE_ENABLED"):
-            self.huggingface.hf_cache_enabled = (
-                hf_cache_enabled.strip().lower() in {"1", "true", "yes", "on"}
-            )
+            self.huggingface.hf_cache_enabled = hf_cache_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         # ModelScope settings
         if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
@@ -985,7 +988,9 @@ class GlobalSettings:
             return (Path(hf_home).expanduser() / "hub").resolve()
         return (Path.home() / ".cache" / "huggingface" / "hub").resolve()
 
-    def get_effective_model_dirs(self, model_dirs: list[str] | None = None) -> list[Path]:
+    def get_effective_model_dirs(
+        self, model_dirs: list[str] | None = None
+    ) -> list[Path]:
         """Return model directories in discovery order, including HF cache."""
         if model_dirs is None:
             configured = self.model.get_model_dirs(self.base_path)
@@ -1102,9 +1107,7 @@ class GlobalSettings:
 
         # Server validation
         if not 1 <= self.server.port <= 65535:
-            errors.append(
-                f"Invalid port: {self.server.port} (must be 1-65535)"
-            )
+            errors.append(f"Invalid port: {self.server.port} (must be 1-65535)")
 
         valid_log_levels = {"trace", "debug", "info", "warning", "error", "critical"}
         if self.server.log_level.lower() not in valid_log_levels:
@@ -1268,7 +1271,9 @@ class GlobalSettings:
         # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
-        ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        ssd_dir = (
+            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        )
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
@@ -1278,7 +1283,9 @@ class GlobalSettings:
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
-            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
+            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
+                self.base_path
+            ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
@@ -1322,9 +1329,7 @@ def get_settings() -> GlobalSettings:
     """
     global _global_settings
     if _global_settings is None:
-        raise RuntimeError(
-            "Settings not initialized. Call init_settings() first."
-        )
+        raise RuntimeError("Settings not initialized. Call init_settings() first.")
     return _global_settings
 
 

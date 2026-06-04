@@ -364,7 +364,7 @@ final class MenubarController: NSObject {
             }
             return (
                 String(localized: "menubar.header.stopped",
-                       defaultValue: "Server: stopped",
+                       defaultValue: "oMLX stopped",
                        comment: "Menubar status header when the server is stopped"),
                 .secondaryLabelColor
             )

@@ -72,6 +72,27 @@ struct ServerScreen: View {
             .id(ServerAnchor.defaultProfile.rawValue)
             ServerDefaultProfileEditor(vm: vm)
 
+            SectionHeader(String(localized: "server.section.startup",
+                                  defaultValue: "Server Startup",
+                                  comment: "Section heading for server startup behavior settings"))
+            ListGroup {
+                Row(
+                    label: String(localized: "server.row.auto_start_on_launch",
+                                  defaultValue: "Automatically start server on launch",
+                                  comment: "Row label for automatically starting the managed server when the macOS app launches"),
+                    sublabel: String(localized: "server.row.auto_start_on_launch.sub",
+                                     defaultValue: "When disabled, the menu bar app opens without starting the server.",
+                                     comment: "Sublabel explaining the auto-start on launch setting"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: vm.bind($vm.autoStartOnLaunch, save: {
+                        vm.saveAutoStartOnLaunch(services: services)
+                    }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
+
             SectionHeader(String(localized: "server.section.logging",
                                   defaultValue: "Logging",
                                   comment: "Section heading for the Logging rows"))
@@ -734,6 +755,7 @@ final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
     @Published var portText: String = "8000"
     @Published var logLevel: String = "info"
+    @Published var autoStartOnLaunch: Bool = true
 
     // Phase 4 — Advanced disclosure.
     @Published var sseKeepaliveMode: String = "chunk"
@@ -790,6 +812,7 @@ final class ServerScreenVM: ObservableObject {
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
+            self.autoStartOnLaunch = dto.server.autoStartOnLaunch ?? true
             self.appliedBindAddress = dto.server.host
             self.effectiveHost = AppConfig.connectableHost(for: dto.server.host)
             self.effectivePort = dto.server.port
@@ -1241,6 +1264,24 @@ final class ServerScreenVM: ObservableObject {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
     }
 
+    func saveAutoStartOnLaunch(services: AppServices) {
+        let enabled = autoStartOnLaunch
+        Task {
+            do {
+                switch services.serverState {
+                case .running, .unresponsive:
+                    if await commit(GlobalSettingsPatch(autoStartOnLaunch: enabled)) {
+                        try services.setAutoStartOnLaunch(enabled, persist: false)
+                    }
+                default:
+                    try services.setAutoStartOnLaunch(enabled)
+                }
+            } catch {
+                self.lastError = error.omlxDescription
+            }
+        }
+    }
+
     /// Build a `Binding` that calls `save` after the value changes. Used for
     /// Popups that have no `onSubmit` hook.
     func bind<T: Equatable>(
@@ -1257,13 +1298,16 @@ final class ServerScreenVM: ObservableObject {
         )
     }
 
-    private func commit(_ patch: GlobalSettingsPatch) async {
-        guard let client else { return }
+    @discardableResult
+    private func commit(_ patch: GlobalSettingsPatch) async -> Bool {
+        guard let client else { return false }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
+            return true
         } catch {
             self.lastError = error.omlxDescription
+            return false
         }
     }
 

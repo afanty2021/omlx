@@ -2097,10 +2097,8 @@
             },
 
             _launchCmd(tool) {
-                // cli_prefix is always "omlx" or an app-bundle path with no
-                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
-                // in the dashboard command display.
-                const cli = this.stats.cli_prefix || 'omlx';
+                const raw = this.stats.cli_prefix || 'omlx';
+                const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
                 return `${cli} launch ${tool}`;
             },
 
@@ -3475,7 +3473,7 @@
                         ? 2
                         : totalGB < 16
                             ? 4
-                            : { safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8;
+                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
                 const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 

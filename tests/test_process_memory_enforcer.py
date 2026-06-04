@@ -382,7 +382,7 @@ class TestStaticCeiling:
 
     @pytest.mark.parametrize(
         "tier,expected_reserve_gb",
-        [("safe", 12), ("balanced", 8), ("aggressive", 6)],
+        [("safe", 8), ("balanced", 6), ("aggressive", 4)],
     )
     def test_large_system_tier_reserve(
         self, mock_engine_pool, tier, expected_reserve_gb
@@ -544,10 +544,10 @@ class TestHardLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=100 * 1024**3,
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_mem.return_value = 48 * 1024**3  # static = 42 GB
             # dynamic balanced = 2 + 30 + 10 + 5*0.5 = 44.5 GB
-            # static (40) wins → final ceiling is 40 GB
-            assert enforcer._get_hard_limit_bytes() == 40 * 1024**3
+            # static (42) wins → final ceiling is 42 GB
+            assert enforcer._get_hard_limit_bytes() == 42 * 1024**3
 
     def test_picks_dynamic_when_smaller(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -568,7 +568,7 @@ class TestHardLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=100 * 1024**3,
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_mem.return_value = 48 * 1024**3  # static = 42 GB
             # dynamic balanced = 1 + 5 + 2 + int(4 * 0.5) = 10 GB
             # → dynamic wins
             assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
@@ -599,9 +599,9 @@ class TestAbortLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=100 * 1024**3,
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_mem.return_value = 48 * 1024**3  # static = 42 GB
             # dynamic (~10 GB) is far below, but the abort limit ignores it.
-            assert enforcer._get_abort_limit_bytes() == 40 * 1024**3
+            assert enforcer._get_abort_limit_bytes() == 42 * 1024**3
             # Sanity: the (jittery) hard limit DID drop to dynamic.
             assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
 
@@ -628,8 +628,8 @@ class TestAbortLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=0,  # unknown
         ):
-            # aggressive reserve = 6 GB → static = 42 GB
-            assert enforcer._get_abort_limit_bytes() == 42 * 1024**3
+            # aggressive reserve = 4 GB → static = 44 GB
+            assert enforcer._get_abort_limit_bytes() == 44 * 1024**3
 
     def test_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -677,12 +677,12 @@ class TestMetalWiredLimit:
         ):
             mock_mx.set_wired_limit.return_value = 36 * 1024**3
             enforcer.start()
-        # balanced @ 48 GB => static_ceiling = 40 GB
-        mock_mx.set_wired_limit.assert_called_once_with(40 * 1024**3)
+        # balanced @ 48 GB => static_ceiling = 42 GB
+        mock_mx.set_wired_limit.assert_called_once_with(42 * 1024**3)
         # Stored value is the desired ceiling (not the post-clamp value)
         # so the admin UI can detect a kernel cap that's below the
         # request and surface the sysctl-raise hint.
-        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+        assert enforcer._metal_wired_limit_request == 42 * 1024**3
 
     def test_start_clamps_to_effective_cap_when_lower(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -703,10 +703,10 @@ class TestMetalWiredLimit:
         ):
             mock_mx.set_wired_limit.return_value = 48 * 1024**3
             enforcer.start()
-        # aggressive @ 64 GB static = 58 GB, clamped to cap 42 GB
+        # aggressive @ 64 GB static = 60 GB, clamped to cap 42 GB
         mock_mx.set_wired_limit.assert_called_once_with(42 * 1024**3)
-        # Desired (58 GB) is stored, not the post-clamp 42 GB.
-        assert enforcer._metal_wired_limit_request == 58 * 1024**3
+        # Desired (60 GB) is stored, not the post-clamp 42 GB.
+        assert enforcer._metal_wired_limit_request == 60 * 1024**3
 
     def test_start_clamps_to_apple_default_when_sysctl_unset(
         self, mock_engine_pool
@@ -730,9 +730,9 @@ class TestMetalWiredLimit:
         ):
             mock_mx.set_wired_limit.return_value = 0
             enforcer.start()
-        # balanced @ 512 GB static = 504 GB, clamped to working set 128 GB
+        # balanced @ 512 GB static = 506 GB, clamped to working set 128 GB
         mock_mx.set_wired_limit.assert_called_once_with(128 * 1024**3)
-        assert enforcer._metal_wired_limit_request == 504 * 1024**3
+        assert enforcer._metal_wired_limit_request == 506 * 1024**3
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
         """Older macOS (<15) raises on the call; enforcer keeps going."""
@@ -753,7 +753,7 @@ class TestMetalWiredLimit:
             enforcer.start()  # must not raise
         # We store the desired static_ceiling even when the call fails,
         # so the admin UI can still surface a warning.
-        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+        assert enforcer._metal_wired_limit_request == 42 * 1024**3
 
     def test_start_skips_when_guard_disabled(self, mock_engine_pool):
         """Guard off means we should not touch Metal limits either."""

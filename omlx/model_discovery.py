@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -800,6 +801,43 @@ def model_directory_access_error(path: Path) -> str | None:
             f"Model directory is not readable: {path} "
             f"({type(e).__name__}: {e})"
         )
+    return None
+
+
+def model_directory_write_error(path: Path, *, create: bool = False) -> str | None:
+    """Return a user-facing error if a model directory cannot be written."""
+    try:
+        if not path.exists():
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    access_error = model_directory_access_error(path)
+    if access_error is not None:
+        return access_error
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".omlx-write-test-",
+            dir=path,
+            delete=True,
+        ) as f:
+            f.write(b"")
+            f.flush()
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
     return None
 
 

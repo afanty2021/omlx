@@ -24,11 +24,13 @@ class TestCLIModule:
     def test_cli_module_importable(self):
         """Test that CLI module can be imported."""
         from omlx import cli
+
         assert hasattr(cli, "main")
 
     def test_cli_has_serve_command(self):
         """Test that CLI has serve command setup."""
         from omlx import cli
+
         # The module should have the main entry point
         assert callable(cli.main)
 
@@ -76,6 +78,73 @@ class TestCLIHelp:
         assert "host" in stdout_lower
         assert "port" in stdout_lower
         assert "model-dir" in stdout_lower
+
+    def test_lifecycle_commands_in_main_help(self):
+        """Test start/stop/restart lifecycle commands are exposed."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        stdout_lower = result.stdout.lower()
+        assert "start" in stdout_lower
+        assert "stop" in stdout_lower
+        assert "restart" in stdout_lower
+
+
+class TestLifecycleCommand:
+    """Tests for managed background server lifecycle commands."""
+
+    @staticmethod
+    def _args(command, **overrides):
+        values = {"command": command, "timeout": 1.0, "no_wait": False}
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_app_bundle_stop_without_running_app_is_success(self, monkeypatch, capsys):
+        """`omlx stop` must not launch the macOS app just to stop it."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        monkeypatch.setattr(cli, "_send_app_control", MagicMock(side_effect=OSError))
+        monkeypatch.setattr(cli, "_open_macos_app", MagicMock())
+
+        assert cli.lifecycle_command(self._args("stop")) == 0
+        assert capsys.readouterr().out.strip() == "oMLX stopped"
+        cli._open_macos_app.assert_not_called()
+
+    def test_app_bundle_start_sends_command_and_waits(self, monkeypatch):
+        """`omlx start` asks the app to start and waits for a running state."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        send = MagicMock(return_value={"ok": True, "state": "starting", "port": 8000})
+        wait = MagicMock(return_value={"ok": True, "state": "running", "port": 8000})
+        monkeypatch.setattr(cli, "_send_app_control_with_launch", send)
+        monkeypatch.setattr(cli, "_wait_app_control_state", wait)
+
+        assert cli.lifecycle_command(self._args("start")) == 0
+        send.assert_called_once_with("start", timeout=1.0)
+        wait.assert_called_once_with({"running", "unresponsive"}, 1.0)
+
+    def test_homebrew_start_delegates_to_brew_services(self, monkeypatch):
+        """Homebrew installs use the Homebrew service supervisor."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: False)
+        monkeypatch.setattr(install, "is_homebrew", lambda: True)
+        run_brew = MagicMock(return_value=0)
+        monkeypatch.setattr(cli, "_run_brew_services", run_brew)
+
+        assert cli.lifecycle_command(self._args("start")) == 0
+        run_brew.assert_called_once_with("start")
 
 
 class TestCLIEntryPoint:
@@ -233,7 +302,6 @@ class TestServeCommandOptions:
             timeout=10,
         )
         assert "--api-key" in result.stdout
-
 
 
 class TestLaunchCommandOptions:
@@ -445,27 +513,28 @@ class TestLaunchCommandFunction:
         ctx = integration.launch.call_args.args[0]
         assert ctx.extra_args == ("--resume", "abc123")
 
-    def test_launch_command_uses_saved_claude_tiers_without_model_prompt(self):
-        """Bare `omlx launch claude` should use saved tier models."""
+    def test_launch_command_shows_picker_and_clears_saved_tiers(self):
+        """Bare `omlx launch claude` shows the picker and ignores saved tier models."""
         from omlx.cli import launch_command
 
         integration = MagicMock()
         integration.display_name = "Claude Code"
         integration.is_installed.return_value = True
+        integration.select_model.return_value = "sonnet-local"
 
         health_response = MagicMock()
         health_response.raise_for_status.return_value = None
 
-        status_response = MagicMock()
-        status_response.ok = True
-        status_response.json.return_value = {
-            "models": [
-                {
-                    "id": "sonnet-local",
-                    "model_type": "llm",
-                    "max_context_window": 65536,
-                    "max_tokens": 8192,
-                }
+        status_map_response = MagicMock()
+        status_map_response.ok = True
+        status_map_response.json.return_value = {"models": []}
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [
+                {"id": "sonnet-local", "model_type": "llm"},
+                {"id": "opus-local", "model_type": "llm"},
             ]
         }
 
@@ -492,20 +561,22 @@ class TestLaunchCommandFunction:
         )
 
         with (
-            patch("requests.get", side_effect=[health_response, status_response]),
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_map_response, models_response],
+            ),
             patch("omlx.integrations.get_integration", return_value=integration),
             patch("omlx.settings.GlobalSettings.load", return_value=settings),
         ):
             launch_command(args)
 
-        integration.select_model.assert_not_called()
+        integration.select_model.assert_called_once()
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == "sonnet-local"
-        assert ctx.opus_model == "opus-local"
-        assert ctx.sonnet_model == "sonnet-local"
-        assert ctx.haiku_model == "haiku-local"
+        assert ctx.opus_model is None
+        assert ctx.sonnet_model is None
+        assert ctx.haiku_model is None
         assert ctx.api_key == "saved-key"
-        assert ctx.context_window == 65536
 
     def test_launch_command_claude_cli_tiers_override_saved_settings(self):
         """Explicit --opus/--sonnet/--haiku should win over saved settings."""
@@ -570,7 +641,9 @@ class TestLaunchArgvParsing:
             timeout=10,
         )
         assert result.returncode != 0
-        assert "unrecognized arguments" in result.stderr or "--bogus-flag" in result.stderr
+        assert (
+            "unrecognized arguments" in result.stderr or "--bogus-flag" in result.stderr
+        )
 
 
 class TestServeCommandFunctions:
@@ -659,6 +732,7 @@ class TestServeCommandFunctions:
     def test_serve_command_exists(self):
         """Test that serve_command function exists."""
         from omlx.cli import serve_command
+
         assert callable(serve_command)
 
     def test_serve_model_dir_optional_with_default(self):
@@ -865,51 +939,62 @@ class TestHasCliOverrides:
 
     def test_no_overrides_returns_false(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args()) is False
 
     def test_host_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(host="0.0.0.0")) is True
         # Even the default value, when explicitly passed, counts as override
         assert _has_cli_overrides(self._make_args(host="127.0.0.1")) is True
 
     def test_port_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(port=9000)) is True
         assert _has_cli_overrides(self._make_args(port=8000)) is True
 
     def test_model_dir_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(model_dir="/tmp/models")) is True
 
     def test_log_level_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(log_level="info")) is True
         assert _has_cli_overrides(self._make_args(log_level="debug")) is True
 
     def test_embedding_batch_size_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(embedding_batch_size=4)) is True
 
     def test_memory_guard_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(memory_guard="safe")) is True
 
     def test_memory_guard_gb_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(memory_guard_gb=48.0)) is True
 
     def test_hf_cache_explicit(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(hf_cache_enabled=False)) is True
         assert _has_cli_overrides(self._make_args(hf_cache_enabled=True)) is True
 
     def test_multiple_overrides(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(self._make_args(host="0.0.0.0", port=9000)) is True
 
     def test_empty_namespace(self):
         from omlx.cli import _has_cli_overrides
+
         assert _has_cli_overrides(argparse.Namespace()) is False
 
 
@@ -936,4 +1021,6 @@ class TestCLIDocstrings:
             timeout=10,
         )
         # Should describe multi-model serving
-        assert "multi-model" in result.stdout.lower() or "server" in result.stdout.lower()
+        assert (
+            "multi-model" in result.stdout.lower() or "server" in result.stdout.lower()
+        )
