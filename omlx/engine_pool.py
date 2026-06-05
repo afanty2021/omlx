@@ -17,6 +17,7 @@ import asyncio
 import gc
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -69,6 +70,7 @@ class EngineEntry:
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
+    in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
 
 
 class EnginePool:
@@ -351,6 +353,7 @@ class EnginePool:
         self,
         model_id: str,
         force_lm: bool = False,
+        _lease: bool = False,
     ) -> (
         BaseEngine
         | EmbeddingEngine
@@ -399,6 +402,8 @@ class EnginePool:
                     await self._unload_engine(model_id)
                 else:
                     entry.last_access = time.time()
+                    if _lease:
+                        entry.in_use += 1
                     return entry.engine
 
             # Pre-load admission against the memory ceiling from the
@@ -450,7 +455,31 @@ class EnginePool:
             # Now load the model
             await self._load_engine(model_id, force_lm=force_lm)
 
-            return self._entries[model_id].engine
+            loaded = self._entries[model_id]
+            if _lease:
+                loaded.in_use += 1
+            return loaded.engine
+
+    async def release_engine(self, model_id: str) -> None:
+        """Release one in-use lease previously taken via get_engine(_lease=True)."""
+        async with self._lock:
+            e = self._entries.get(model_id)
+            if e is not None and e.in_use > 0:
+                e.in_use -= 1
+
+    @asynccontextmanager
+    async def acquire(self, model_id: str, force_lm: bool = False):
+        """Acquire an engine with an atomic in-use lease.
+
+        The lease is taken under the pool lock at acquire time and always
+        released in finally, so the engine cannot be evicted mid-request even
+        on exception.
+        """
+        engine = await self.get_engine(model_id, force_lm=force_lm, _lease=True)
+        try:
+            yield engine
+        finally:
+            await self.release_engine(model_id)
 
     def _find_lru_victim(self) -> str | None:
         """
@@ -465,6 +494,8 @@ class EnginePool:
         candidates = []
         for mid, e in self._entries.items():
             if e.engine is None or e.is_pinned:
+                continue
+            if e.in_use > 0:
                 continue
             try:
                 if e.engine.has_active_requests():
@@ -490,7 +521,7 @@ class EnginePool:
 
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
-        if engine is None or entry.is_pinned or entry.is_loading:
+        if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
             return False
         try:
             if engine.has_active_requests():
@@ -614,6 +645,17 @@ class EnginePool:
             await entry.engine.stop()
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
+
+        # #1595: the immediate-abort stop() above tears the engine down without the normal
+        # per-request completion callbacks, so a non-streaming engine's active_requests
+        # counter can leak a phantom count (a stale engine then looks permanently busy).
+        # Reset it on teardown so has_active_requests() and the status API stay consistent.
+        reset = getattr(entry.engine, "_reset_activity_tracking", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception as e:
+                logger.warning(f"Error resetting activity counter for {model_id}: {e}")
 
         # Yield to the event loop before dropping the engine reference.
         #
@@ -1230,7 +1272,7 @@ class EnginePool:
                     continue
 
                 # Check if model has active requests
-                has_active = entry.engine.has_active_requests()
+                has_active = entry.engine.has_active_requests() or entry.in_use > 0
 
                 if has_active:
                     entry.last_access = now
