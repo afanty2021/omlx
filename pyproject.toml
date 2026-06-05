@@ -74,9 +74,10 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (68d8515, v0.6.1-1) - includes Qwen MTP batched
+    # mlx-vlm from commit (041f889) - includes Qwen MTP batched
     # target-verify drift fixes, Gemma4 rollback fixes, TurboQuant RHT L=1 value
-    # kernels, and eager evaluation of cached MRoPE arrays on model load.
+    # kernels, eager evaluation of cached MRoPE arrays on model load, and
+    # Gemma4 unified long text prefill fixes.
     # Using local path for development (from /Users/berton/Github/mlx-vlm)
     "mlx-vlm @ file:///Users/berton/Github/mlx-vlm",
     "Pillow>=9.0.0",

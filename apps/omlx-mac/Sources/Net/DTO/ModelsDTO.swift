@@ -107,6 +107,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
+    // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
+    let vlmMtpEnabled: Bool?
+    let vlmMtpDraftModel: String?
+    let vlmMtpDraftBlockSize: Int?
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
@@ -164,6 +168,10 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    // Experimental: VLM MTP
+    var vlmMtpEnabled: Bool? = nil
+    var vlmMtpDraftModel: String? = nil
+    var vlmMtpDraftBlockSize: Int? = nil
 }
 
 /// Generic acknowledgment shape returned by non-streaming admin endpoints

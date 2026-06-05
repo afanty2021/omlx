@@ -31,7 +31,7 @@ class TestEngineConfig:
 
         assert config.model_name == ""
         assert config.scheduler_config is None
-        assert config.step_interval == 0.001
+        assert config.step_interval == 0.05
         assert config.stream_interval == 1
 
     def test_custom_values(self):
@@ -197,6 +197,46 @@ class TestEngineCoreStartStop:
 
                 await engine.start()  # Second start should be no-op
                 assert engine._task is first_task
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_idle_loop_wakes_without_waiting_for_step_interval(
+        self, mock_model, mock_tokenizer
+    ):
+        """Idle loop should sleep cheaply but wake immediately for new work."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(
+                model=mock_model,
+                tokenizer=mock_tokenizer,
+                config=EngineConfig(step_interval=10.0),
+            )
+
+            try:
+                engine.scheduler.has_requests = MagicMock(return_value=False)
+                await engine.start()
+
+                for _ in range(20):
+                    if engine.scheduler.has_requests.call_count >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                calls_before = engine.scheduler.has_requests.call_count
+                assert calls_before >= 2
+
+                await asyncio.sleep(0.05)
+                assert engine.scheduler.has_requests.call_count == calls_before
+
+                engine._wake_engine_loop()
+                for _ in range(20):
+                    if engine.scheduler.has_requests.call_count > calls_before:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert engine.scheduler.has_requests.call_count > calls_before
             finally:
                 await engine.stop()
                 engine.close()

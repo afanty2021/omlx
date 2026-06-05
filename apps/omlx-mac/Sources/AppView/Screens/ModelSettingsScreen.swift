@@ -976,9 +976,7 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.turboquant.label",
                               defaultValue: "TurboQuant KV Cache",
                               comment: "Row label for the TurboQuant KV cache toggle"),
-                sublabel: String(localized: "settings.experimental.turboquant.sub",
-                                 defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-                                 comment: "Sublabel describing TurboQuant KV cache")) {
+                sublabel: turboquantSublabel) {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
@@ -989,6 +987,8 @@ private struct ExperimentalSection: View {
                     }
                     Toggle("", isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .labelsHidden().toggleStyle(.switch)
+                        .disabled(vm.vlmMtpEnabled)
+                        .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
             }
 
@@ -1016,11 +1016,11 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.specprefill.label",
                               defaultValue: "SpecPrefill",
                               comment: "Row label for the SpecPrefill toggle"),
-                sublabel: String(localized: "settings.experimental.specprefill.sub",
-                                 defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
-                                 comment: "Sublabel describing SpecPrefill")) {
+                sublabel: specprefillSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.specprefillEnabled))
                     .labelsHidden().toggleStyle(.switch)
+                    .disabled(vm.vlmMtpEnabled)
+                    .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
             }
             if vm.specprefillEnabled {
                 Row(label: String(localized: "settings.experimental.specprefill.draft.label",
@@ -1062,8 +1062,8 @@ private struct ExperimentalSection: View {
                 sublabel: dflashSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.dflashEnabled))
                     .labelsHidden().toggleStyle(.switch)
-                    .disabled(!(vm.model?.dflashCompatible ?? true))
-                    .help(vm.model?.dflashCompatibilityReason ?? "")
+                    .disabled(dflashToggleDisabled)
+                    .help(dflashHelp)
             }
             if vm.dflashEnabled {
                 Row(label: String(localized: "settings.experimental.dflash.draft.label",
@@ -1202,18 +1202,86 @@ private struct ExperimentalSection: View {
                 }
             }
 
-            // Native MTP — last row of the experimental group.
+            // Native MTP
             Row(label: String(localized: "settings.experimental.mtp.label",
                               defaultValue: "Native MTP",
                               comment: "Row label for the Native MTP toggle"),
-                sublabel: mtpSublabel,
-                isLast: true) {
+                sublabel: mtpSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
                     .labelsHidden().toggleStyle(.switch)
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
             }
+
+            // VLM MTP — last row of the experimental group. Reveals the
+            // draft-model picker and block-size field when enabled.
+            Row(label: String(localized: "settings.experimental.vlm_mtp.label",
+                              defaultValue: "VLM MTP",
+                              comment: "Row label for the VLM MTP toggle"),
+                sublabel: vlmMtpSublabel,
+                isLast: !vm.vlmMtpEnabled) {
+                Toggle("", isOn: vm.bindProfile($vm.vlmMtpEnabled))
+                    .labelsHidden().toggleStyle(.switch)
+                    .disabled(vlmMtpToggleDisabled)
+                    .help(vm.vlmMtpConflictReason ?? "")
+            }
+            if vm.vlmMtpEnabled {
+                Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
+                                  defaultValue: "VLM Draft Model",
+                                  comment: "Row label for the VLM MTP draft-model picker"),
+                    sublabel: String(localized: "settings.experimental.vlm_mtp.draft.sub",
+                                     defaultValue: "Assistant drafter sharing the target's tokenizer.",
+                                     comment: "Sublabel for the VLM MTP draft-model picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.vlmMtpDraftModel),
+                        width: 260,
+                        options: vm.vlmMtpDraftModelOptions()
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.vlm_mtp.block_size.label",
+                                  defaultValue: "Draft Block Size",
+                                  comment: "Row label for the VLM MTP draft block-size field"),
+                    sublabel: String(localized: "settings.experimental.vlm_mtp.block_size.sub",
+                                     defaultValue: "Tokens drafted per round. Empty uses the mlx-vlm default.",
+                                     comment: "Sublabel for the VLM MTP draft block-size field"),
+                    isLast: true) {
+                    TextInput(text: vm.bindProfile($vm.vlmMtpDraftBlockSize),
+                              placeholder: "4", mono: true, width: 80)
+                }
+            }
         }
+    }
+
+    private var vlmMtpOwnsSpeculativePathReason: String {
+        String(localized: "settings.speculative.conflict.vlm_mtp",
+               defaultValue: "Disable VLM MTP before enabling this feature.",
+               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
+    }
+
+    private var turboquantSublabel: String {
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.turboquant.sub",
+                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
+                      comment: "Sublabel describing TurboQuant KV cache")
+    }
+
+    private var specprefillSublabel: String {
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.specprefill.sub",
+                      defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
+                      comment: "Sublabel describing SpecPrefill")
+    }
+
+    private var dflashToggleDisabled: Bool {
+        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+    }
+
+    private var dflashHelp: String {
+        if let reason = vm.model?.dflashCompatibilityReason,
+           !(vm.model?.dflashCompatible ?? true) {
+            return reason
+        }
+        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
     }
 
     private var dflashSublabel: String {
@@ -1221,6 +1289,7 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
                       comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")
@@ -1258,6 +1327,17 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.mtp.sub",
                       defaultValue: "Multi-token prediction. Speeds generation when the model supports it.",
                       comment: "Default sublabel for the Native MTP toggle")
+    }
+
+    private var vlmMtpToggleDisabled: Bool {
+        vm.vlmMtpConflictReason != nil
+    }
+
+    private var vlmMtpSublabel: String {
+        if let reason = vm.vlmMtpConflictReason { return reason }
+        return String(localized: "settings.experimental.vlm_mtp.sub",
+                      defaultValue: "Multi-token prediction for vision-language models via an assistant drafter.",
+                      comment: "Default sublabel for the VLM MTP toggle")
     }
 }
 
@@ -1306,6 +1386,7 @@ final class ModelSettingsScreenVM: ObservableObject {
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
         case mtpEnabled
+        case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
 
     static var modelTypeOptions: [(String, String)] {
@@ -1532,6 +1613,12 @@ final class ModelSettingsScreenVM: ObservableObject {
     // Experimental: native MTP
     @Published var mtpEnabled: Bool = false
 
+    // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
+    // Block size is held as a string for the editor; empty = mlx-vlm default.
+    @Published var vlmMtpEnabled: Bool = false
+    @Published var vlmMtpDraftModel: String = ""
+    @Published var vlmMtpDraftBlockSize: String = ""
+
     // Profiles
     @Published var profiles: [ProfileDTO] = []
     @Published var templates: [ProfileDTO] = []
@@ -1657,6 +1744,9 @@ final class ModelSettingsScreenVM: ObservableObject {
                     self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s.dflashSsdCacheMaxBytes)
                         .map(String.init) ?? "20"
                     self.mtpEnabled = s.mtpEnabled ?? false
+                    self.vlmMtpEnabled = s.vlmMtpEnabled ?? false
+                    self.vlmMtpDraftModel = s.vlmMtpDraftModel ?? ""
+                    self.vlmMtpDraftBlockSize = s.vlmMtpDraftBlockSize.map(String.init) ?? ""
                     self.activeProfileName = s.activeProfileName
                 }
             }
@@ -1801,6 +1891,9 @@ final class ModelSettingsScreenVM: ObservableObject {
         case .dflashSsdCacheGib:
             patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
         case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
+        case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
+        case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
+        case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
         do {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
@@ -1844,6 +1937,29 @@ final class ModelSettingsScreenVM: ObservableObject {
         return out
     }
 
+    /// Draft-model options for VLM MTP. mlx-vlm's MTP loop takes an
+    /// "assistant" drafter, so the picker filters to model ids containing
+    /// "assistant" (case-insensitive), matching the HTML editor's filter,
+    /// and drops the current model so it can't draft for itself.
+    ///
+    /// The stored value is the model **id**, not its path: the server
+    /// resolves the drafter by registry id (`engine_pool` looks it up in
+    /// `_entries` keyed by model_id, then uses that entry's `model_path`).
+    /// This matches the web modal, which binds `m.id`.
+    func vlmMtpDraftModelOptions() -> [(String, String)] {
+        var out: [(String, String)] = [
+            ("", String(localized: "settings.vlm_mtp.draft.placeholder",
+                        defaultValue: "Select assistant drafter…",
+                        comment: "Initial placeholder option in the VLM MTP draft-model picker")),
+        ]
+        for m in allModels
+        where m.id != modelID
+            && m.id.range(of: "assistant", options: .caseInsensitive) != nil {
+            out.append((m.id, m.id))
+        }
+        return out
+    }
+
     var isDSAConfigModel: Bool {
         guard let type = model?.configModelType else { return false }
         return Self.dsaConfigModelTypes.contains(type)
@@ -1861,6 +1977,38 @@ final class ModelSettingsScreenVM: ObservableObject {
             return String(localized: "settings.mtp.conflict.turboquant",
                           defaultValue: "Disable TurboQuant KV before enabling MTP.",
                           comment: "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on")
+        }
+        if vlmMtpEnabled {
+            return String(localized: "settings.mtp.conflict.vlm_mtp",
+                          defaultValue: "Disable VLM MTP before enabling Native MTP.",
+                          comment: "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on")
+        }
+        return nil
+    }
+
+    /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
+    /// other speculative-decoding / KV-quant features. Mirrors the HTML
+    /// editor's gating so the toggle disables itself and surfaces why.
+    var vlmMtpConflictReason: String? {
+        if dflashEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.dflash",
+                          defaultValue: "Disable DFlash before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on")
+        }
+        if specprefillEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.specprefill",
+                          defaultValue: "Disable SpecPrefill before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on")
+        }
+        if mtpEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.mtp",
+                          defaultValue: "Disable Native MTP before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on")
+        }
+        if turboquantKvEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.turboquant",
+                          defaultValue: "Disable TurboQuant KV before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on")
         }
         return nil
     }
@@ -1969,6 +2117,11 @@ final class ModelSettingsScreenVM: ObservableObject {
             }
         }
         putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
+        putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
+        if vlmMtpEnabled {
+            putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
+            putInt(ProfileSettingsKey.vlmMtpDraftBlockSize, vlmMtpDraftBlockSize)
+        }
 
         return out
     }

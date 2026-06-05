@@ -658,6 +658,13 @@ app.add_middleware(DebugRequestLoggingMiddleware)
 # =============================================================================
 
 
+def _wake_process_memory_enforcer(*, active: bool = False) -> None:
+    enforcer = _server_state.process_memory_enforcer
+    wake = getattr(enforcer, "wake", None) if enforcer is not None else None
+    if callable(wake):
+        wake(active=active)
+
+
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
@@ -696,6 +703,7 @@ async def get_engine(
 
     # Resolve alias to real model_id
     model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    _wake_process_memory_enforcer(active=True)
 
     try:
         engine = await pool.get_engine(model_id)
@@ -712,6 +720,7 @@ async def get_engine(
                 f"default model '{_server_state.default_model}'"
             )
             try:
+                _wake_process_memory_enforcer(active=True)
                 return await pool.get_engine(_server_state.default_model)
             except Exception:
                 pass  # Fall through to original 404

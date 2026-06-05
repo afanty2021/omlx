@@ -5,6 +5,7 @@ import json
 
 from omlx.utils.tokenizer import (
     apply_qwen3_fix,
+    create_streaming_detokenizer,
     get_tokenizer_config,
     is_gemma4_model,
     is_harmony_model,
@@ -14,6 +15,96 @@ from omlx.utils.tokenizer import (
 
 def _write_json(path, data):
     path.write_text(json.dumps(data))
+
+
+def _spm_decoder(strip_space=True):
+    decoders = [
+        {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "},
+        {"type": "ByteFallback"},
+        {"type": "Fuse"},
+    ]
+    if strip_space:
+        decoders.append({"type": "Strip", "content": " ", "start": 1, "stop": 0})
+    return {"type": "Sequence", "decoders": decoders}
+
+
+class _ByteFallbackTokenizer:
+    clean_up_tokenization_spaces = False
+    vocab = {
+        "<pad>": 0,
+        "<0xEC>": 1,
+        "<0x9E>": 2,
+        "<0xA0>": 3,
+    }
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        table = {
+            0: b"",
+            1: bytes([0xEC]),
+            2: bytes([0x9E]),
+            3: bytes([0xA0]),
+        }
+        raw = b"".join(table[token_id] for token_id in token_ids)
+        if not raw:
+            return ""
+        if raw == bytes([0xEC, 0x9E, 0xA0]):
+            return "\uc7a0"
+        return "\ufffd" * sum(1 for token_id in token_ids if token_id != 0)
+
+
+class _BpeTokenizer:
+    clean_up_tokenization_spaces = False
+    vocab = {"A": 0, "B": 1}
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        reverse = {token_id: token for token, token_id in self.vocab.items()}
+        return "".join(reverse[token_id] for token_id in token_ids)
+
+
+class _ExplicitNoDetokenizer:
+    detokenizer = None
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        return ""
+
+
+class TestCreateStreamingDetokenizer:
+    def test_uses_spm_decoder_from_tokenizer_json(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": _spm_decoder()})
+
+        detokenizer = create_streaming_detokenizer(
+            _ByteFallbackTokenizer(),
+            model_path=tmp_path,
+        )
+        assert detokenizer is not None
+
+        parts = []
+        for token_id in [1, 2, 3]:
+            detokenizer.add_token(token_id)
+            parts.append(detokenizer.last_segment)
+
+        assert "".join(parts) == "\uc7a0"
+
+    def test_uses_bpe_decoder_from_tokenizer_json(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": {"type": "ByteLevel"}})
+
+        detokenizer = create_streaming_detokenizer(
+            _BpeTokenizer(),
+            model_path=tmp_path,
+        )
+
+        assert type(detokenizer).__name__ == "BPEStreamingDetokenizer"
+
+    def test_explicit_none_detokenizer_without_model_path_stays_none(self):
+        assert create_streaming_detokenizer(_ExplicitNoDetokenizer()) is None
+
+    def test_missing_tokenizer_json_uses_naive_fallback(self, tmp_path):
+        detokenizer = create_streaming_detokenizer(
+            _ByteFallbackTokenizer(),
+            model_path=tmp_path,
+        )
+
+        assert type(detokenizer).__name__ == "NaiveStreamingDetokenizer"
 
 
 class TestIsHarmonyModel:
