@@ -1146,6 +1146,51 @@ class TestParseToolCallsSyntaxError:
         assert args["path"] == "/etc/hosts"
         assert args["lines"] == 10  # json.loads converts numeric string
 
+    def test_json_fallback_recovers_raw_control_chars(self):
+        """Model-generated JSON tool calls may contain raw tabs or newlines."""
+
+        def failing_parser(text, tools):
+            raise json.JSONDecodeError("Invalid control character at", text, 90)
+
+        tok = self._qwen_tok(failing_parser)
+        old_string = (
+            "\t\t// Check if second word is a subcommand.\n"
+            "\t\tif len(ce.Args) > 1 && isSubcommand(ce.Args[1]) {"
+        )
+        text = (
+            '<tool_call>{"name": "edit", "arguments": {'
+            '"file_path": "/Users/user/project/file.go", '
+            f'"old_string": "{old_string}", '
+            '"new_string": "x"}}</tool_call>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "edit"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["old_string"] == old_string
+
+    def test_generic_xml_json_fallback_recovers_raw_control_chars(self):
+        """The non-native XML JSON fallback should recover the same malformed JSON."""
+
+        tok = _make_tokenizer()
+        old_string = "\tindent\nnext line"
+        text = (
+            '<tool_call>{"name": "edit", "arguments": {'
+            f'"old_string": "{old_string}", '
+            '"new_string": "x"}}</tool_call>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"old_string": old_string, "new_string": "x"}
+
     def test_unparseable_body_logs_and_drops(self, caplog):
         """Fully unparseable body drops gracefully and logs a warning."""
 

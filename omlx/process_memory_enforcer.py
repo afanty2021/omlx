@@ -50,14 +50,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Reserve below 16 GB systems regardless of tier — small Macs cannot
-# afford a tier-scaled cut and still load any useful model.
+# Reserve sub-24 GB systems regardless of tier. Small Macs cannot afford a
+# tier-scaled cut and still load any useful model.
 _SMALL_SYSTEM_RESERVE = 4 * 1024**3
-_SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
+_SMALL_SYSTEM_THRESHOLD = 24 * 1024**3
 
-# Tier map: static reserve (>= 16 GB systems). `custom` shares the
-# `balanced` reserve so the static cap stays sane regardless of what
-# the user types into the custom ceiling field.
+# Tier map: static reserve for systems at or above the small-system threshold.
+# `custom` shares the `balanced` reserve so the static cap stays sane
+# regardless of what the user types into the custom ceiling field.
 _STATIC_RESERVE_LARGE: dict[str, int] = {
     "safe": 8 * 1024**3,
     "balanced": 6 * 1024**3,

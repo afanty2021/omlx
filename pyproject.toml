@@ -30,13 +30,11 @@ classifiers = [
 dependencies = [
     "mlx>=0.31.2",
     # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
-    # Using local path for development (from /Users/berton/Github/AI-Infra/mlx-lm)
-    "mlx-lm @ file:///Users/berton/Github/AI-Infra/mlx-lm",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
-    # Using local path for development (from /Users/berton/Github/AI-Infra/mlx-embeddings)
-    "mlx-embeddings @ file:///Users/berton/Github/AI-Infra/mlx-embeddings",
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     "transformers>=5.0.0",
     # transformers 5.x's tokenization_mistral_common module imports
@@ -50,7 +48,7 @@ dependencies = [
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
-    "numpy>=1.24.0",
+    "numpy>=1.24.0,<2.4",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
@@ -74,16 +72,15 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (041f889) - includes Qwen MTP batched
-    # target-verify drift fixes, Gemma4 rollback fixes, TurboQuant RHT L=1 value
-    # kernels, eager evaluation of cached MRoPE arrays on model load, and
-    # Gemma4 unified long text prefill fixes.
-    # Using local path for development (from /Users/berton/Github/AI-Infra/mlx-vlm)
-    "mlx-vlm @ file:///Users/berton/Github/AI-Infra/mlx-vlm",
+    # mlx-vlm from commit (526c210, main) — includes Gemma4 unified audio prefill
+    # fixes (041f889), Qwen MTP batched target-verify drift fixes, Gemma4 rollback
+    # fixes, TurboQuant RHT L=1 value kernels, and eager evaluation of cached MRoPE
+    # arrays on model load.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@526c210b8ef841a2906beb2805e9c41b8b77f4e7",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
-    # Using local path for development (from /Users/berton/Github/AI-Infra/dflash-mlx)
-    "dflash-mlx @ file:///Users/berton/Github/AI-Infra/dflash-mlx",
+    # dflash-mlx v0.1.8 (39b2520) — bstnxbt repo. Apple G17 NAX verify path plus v0.1.7 Qwen/Gemma4 DFlash fixes
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@39b2520e805f1d1be3852c62944b389cff73fa35",
+    "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
 [project.optional-dependencies]
@@ -189,7 +186,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ file:///Users/berton/Github/AI-Infra/mlx-lm",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
 ]
 
 [tool.black]

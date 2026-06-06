@@ -453,8 +453,8 @@ class TestPrefillMemoryGuardToggle:
 class TestStaticCeiling:
     """Tier-driven static ceiling (`total_ram - tier.static_reserve`).
 
-    >= 16 GB systems use a tier-scaled reserve. < 16 GB systems always
-    use 4 GB regardless of tier.
+    >= 24 GB systems use a tier-scaled reserve. < 24 GB systems always
+    use a 4 GB reserve regardless of tier.
     """
 
     @pytest.mark.parametrize(
@@ -483,6 +483,48 @@ class TestStaticCeiling:
             mock_mem.return_value = 12 * 1024**3
             result = enforcer._get_static_ceiling()
         assert result == 8 * 1024**3
+
+    @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
+    def test_16gb_system_uses_4gb_reserve_regardless_of_tier(
+        self, mock_engine_pool, tier
+    ):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 16 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 12 * 1024**3
+
+    @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
+    def test_between_16gb_and_24gb_system_uses_4gb_reserve_regardless_of_tier(
+        self, mock_engine_pool, tier
+    ):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 16 * 1024**3 + 256 * 1024**2
+            result = enforcer._get_static_ceiling()
+        assert result == 12 * 1024**3 + 256 * 1024**2
+
+    def test_18gb_system_uses_4gb_reserve(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 18 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 14 * 1024**3
+
+    def test_24gb_system_uses_tier_reserve(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 24 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 18 * 1024**3
 
     def test_custom_uses_2gb_reserve_on_large_system(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(

@@ -146,7 +146,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         content = match.strip()
         try:
             # Try JSON format first: {"name": "func", "arguments": {...}}
-            parsed = json.loads(content)
+            parsed = json.loads(content, strict=False)
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
             tool_calls.append(

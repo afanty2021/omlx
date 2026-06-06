@@ -391,6 +391,20 @@ class EngineCore:
                                 eviction_request.request_id,
                             )
                         continue
+                    if not output.has_work:
+                        # Requests may be queued while scheduler admission is
+                        # intentionally throttled by async cache cleanup. Avoid
+                        # spinning the engine loop, but still let new requests
+                        # wake the wait immediately.
+                        event = self._wake_event
+                        if event is None:
+                            await asyncio.sleep(step_interval)
+                        else:
+                            event.clear()
+                            with suppress(TimeoutError):
+                                await asyncio.wait_for(
+                                    event.wait(), timeout=step_interval
+                                )
                 else:
                     event = self._wake_event
                     if event is None:

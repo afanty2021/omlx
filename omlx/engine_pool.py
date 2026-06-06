@@ -467,6 +467,26 @@ class EnginePool:
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
 
+    async def unload_if_idle_unpinned(self, model_id: str) -> bool:
+        """Unload a loaded engine only when it is idle and not pinned."""
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if (
+                entry is None
+                or entry.engine is None
+                or entry.is_loading
+                or entry.is_pinned
+                or entry.in_use > 0
+            ):
+                return False
+
+            if entry.engine.has_active_requests():
+                entry.last_access = time.time()
+                return False
+
+            await self._unload_engine(model_id)
+            return True
+
     @asynccontextmanager
     async def acquire(self, model_id: str, force_lm: bool = False):
         """Acquire an engine with an atomic in-use lease.
