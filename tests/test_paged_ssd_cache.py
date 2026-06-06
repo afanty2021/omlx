@@ -7,6 +7,7 @@ enabling larger effective cache sizes than GPU memory allows.
 """
 
 import errno
+import json
 import logging
 import shutil
 import time
@@ -20,6 +21,7 @@ from omlx.cache.paged_ssd_cache import (
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
     SharedHotCacheBudget,
+    _cache_compat_signature,
     _extract_tensor_bytes,
     _restore_tensor_from_bytes,
     _write_safetensors_no_mx,
@@ -131,6 +133,8 @@ class TestPagedSSDBlockMetadata:
             last_access=now,
             num_layers=32,
             model_name="test-model",
+            block_size=2048,
+            cache_signature="sig",
             layer_cache_types=["KVCache", "ArraysCache"],
             layer_meta_states=[(0,), (1, 2, 3, 4)],
         )
@@ -143,6 +147,8 @@ class TestPagedSSDBlockMetadata:
         assert d["token_count"] == 64
         assert d["num_layers"] == 32
         assert d["model_name"] == "test-model"
+        assert d["block_size"] == 2048
+        assert d["cache_signature"] == "sig"
         assert d["layer_cache_types"] == ["KVCache", "ArraysCache"]
         assert d["layer_meta_states"] == [[0], [1, 2, 3, 4]]
 
@@ -157,6 +163,8 @@ class TestPagedSSDBlockMetadata:
             "last_access": 1000.0,
             "num_layers": 32,
             "model_name": "test-model",
+            "block_size": 2048,
+            "cache_signature": "sig",
             "layer_cache_types": ["KVCache", "RotatingKVCache"],
             "layer_meta_states": [[0], [1, 2, 3, 4]],
         }
@@ -166,6 +174,8 @@ class TestPagedSSDBlockMetadata:
         assert metadata.block_hash == b"test_hash_bytes_1234"
         assert metadata.file_path == Path("/tmp/test.safetensors")
         assert metadata.file_size == 1024
+        assert metadata.block_size == 2048
+        assert metadata.cache_signature == "sig"
         assert metadata.layer_cache_types == ["KVCache", "RotatingKVCache"]
         assert metadata.layer_meta_states == [(0,), (1, 2, 3, 4)]
 
@@ -184,6 +194,8 @@ class TestPagedSSDBlockMetadata:
         metadata = PagedSSDBlockMetadata.from_dict(d)
 
         assert metadata.model_name == ""
+        assert metadata.block_size == 0
+        assert metadata.cache_signature == ""
         assert metadata.layer_cache_types is None
         assert metadata.layer_meta_states is None
 
@@ -466,6 +478,8 @@ class TestPagedSSDCacheManager:
         manager = PagedSSDCacheManager(
             cache_dir=tmp_path / "ssd_cache",
             max_size_bytes=1024**3,
+            expected_model_name="test-model",
+            expected_block_size=64,
         )
 
         # Non-existent block
@@ -674,6 +688,8 @@ class TestPagedSSDCacheManagerWithMLX:
         assert loaded_meta["num_layers"] == 2
         assert loaded_meta["token_count"] == 64
         assert loaded_meta["model_name"] == "test-model"
+        assert loaded_meta["block_size"] == 64
+        assert loaded_meta["cache_signature"]
         assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
 
     def test_get_block_metadata(self, tmp_path: Path, mock_mlx):
@@ -810,6 +826,8 @@ class TestPagedSSDCacheManagerWithMLX:
         *,
         num_layers: int,
         model_name: str,
+        block_size: int = 256,
+        layer_cache_types: list[str] | None = None,
     ) -> Path:
         """Drop a minimally-valid versioned block on disk so we can exercise
         the startup scan without relying on the background writer."""
@@ -826,6 +844,9 @@ class TestPagedSSDCacheManagerWithMLX:
             tensors[f"layer_{i}_keys"] = mx.zeros((1, 8, 32, 64))
             tensors[f"layer_{i}_values"] = mx.zeros((1, 8, 32, 64))
 
+        if layer_cache_types is None:
+            layer_cache_types = ["KVCache"] * num_layers
+
         mx.save_safetensors(
             str(file_path),
             tensors,
@@ -835,20 +856,28 @@ class TestPagedSSDCacheManagerWithMLX:
                 "token_count": "32",
                 "num_layers": str(num_layers),
                 "model_name": model_name,
+                "block_size": str(block_size),
+                "cache_signature": _cache_compat_signature(
+                    model_name=model_name,
+                    num_layers=num_layers,
+                    block_size=block_size,
+                    layer_cache_types=layer_cache_types,
+                ),
+                "layer_cache_types": json.dumps(layer_cache_types),
                 "created_at": "0",
             },
         )
         return file_path
 
-    def test_scan_invalidates_layer_count_mismatch(
+    def test_scan_skips_layer_count_mismatch_without_unlinking(
         self, tmp_path: Path, mock_mlx
     ):
-        """Blocks with num_layers != expected_num_layers are unlinked at scan.
+        """Blocks with num_layers != expected_num_layers are not indexed.
 
         Models that change their effective layer count across versions (e.g.,
-        #1404 attaching MTPModule changed 30 → 40) would otherwise leave the
-        old blocks on disk forever, hitting the layer-mismatch reject path on
-        every prefix lookup. See #1413.
+        #1404 attaching MTPModule changed 30 -> 40) should not hit the
+        layer-mismatch reject path on every prefix lookup. The file is still
+        left on disk so shared cache directories are non-destructive.
         """
         mx = mock_mlx
         cache_dir = tmp_path / "ssd_cache"
@@ -867,18 +896,18 @@ class TestPagedSSDCacheManagerWithMLX:
             max_size_bytes=1024**3,
             expected_model_name="qwen3.6",
             expected_num_layers=40,
+            expected_block_size=256,
         )
 
-        assert not stale_path.exists()
+        assert stale_path.exists()
         assert fresh_path.exists()
         assert not manager.has_block(stale_hash)
         assert manager.has_block(fresh_hash)
 
-    def test_scan_invalidates_model_name_mismatch(
+    def test_scan_skips_model_name_mismatch_without_unlinking(
         self, tmp_path: Path, mock_mlx
     ):
-        """Blocks from a different model are unlinked, even when layer count
-        happens to match."""
+        """Blocks from a different model stay on disk but are not indexed."""
         mx = mock_mlx
         cache_dir = tmp_path / "ssd_cache"
 
@@ -891,15 +920,57 @@ class TestPagedSSDCacheManagerWithMLX:
             cache_dir, mx, match_hash, num_layers=40, model_name="qwen3.6"
         )
 
-        PagedSSDCacheManager(
+        manager = PagedSSDCacheManager(
             cache_dir=cache_dir,
             max_size_bytes=1024**3,
             expected_model_name="qwen3.6",
             expected_num_layers=40,
+            expected_block_size=256,
         )
 
-        assert not other_path.exists()
+        assert other_path.exists()
         assert match_path.exists()
+        assert not manager.has_block(other_hash)
+        assert manager.has_block(match_hash)
+
+    def test_scan_skips_block_size_mismatch_without_unlinking(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Blocks with another paged cache block size are not indexed."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        wrong_hash = b"\x41" + b"\x00" * 31
+        match_hash = b"\x42" + b"\x00" * 31
+        wrong_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            wrong_hash,
+            num_layers=40,
+            model_name="qwen3.6",
+            block_size=2048,
+        )
+        match_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            match_hash,
+            num_layers=40,
+            model_name="qwen3.6",
+            block_size=256,
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="qwen3.6",
+            expected_num_layers=40,
+            expected_block_size=256,
+        )
+
+        assert wrong_path.exists()
+        assert match_path.exists()
+        assert not manager.has_block(wrong_hash)
+        assert manager.has_block(match_hash)
 
     def test_scan_keeps_blocks_when_expected_fields_unset(
         self, tmp_path: Path, mock_mlx
@@ -928,11 +999,10 @@ class TestPagedSSDCacheManagerWithMLX:
         assert manager.has_block(h1)
         assert manager.has_block(h2)
 
-    def test_scan_logs_invalidated_count(
+    def test_scan_logs_skipped_incompatible_count(
         self, tmp_path: Path, mock_mlx, caplog
     ):
-        """The completion log line surfaces the cleanup count so operators
-        can tell when stale data was purged at boot."""
+        """The completion log line surfaces incompatible blocks skipped at scan."""
         import logging
 
         mx = mock_mlx
@@ -953,15 +1023,14 @@ class TestPagedSSDCacheManagerWithMLX:
                 max_size_bytes=1024**3,
                 expected_model_name="old",
                 expected_num_layers=40,
+                expected_block_size=256,
             )
 
         scan_lines = [
-            r.message
-            for r in caplog.records
-            if "SSD cache scan complete" in r.message
+            r.message for r in caplog.records if "SSD cache scan complete" in r.message
         ]
         assert scan_lines, "scan completion log not emitted"
-        assert "invalidated_stale=3 blocks" in scan_lines[-1]
+        assert "skipped_incompatible=3 blocks" in scan_lines[-1]
 
 
 class TestPagedSSDCacheManagerCacheList:
@@ -1932,6 +2001,7 @@ class TestPreloadMatchedBlocks:
     def mx(self):
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -2277,6 +2347,7 @@ class TestPreloadBlocks:
     def mx(self):
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")

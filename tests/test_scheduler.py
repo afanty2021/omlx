@@ -698,6 +698,69 @@ class TestPrefillAbortInterrupt:
         result = scheduler._check_pending_aborts_for_uids([0])
         assert result == []
 
+    def test_external_prefill_abort_reclaims_metal_before_raise(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aborted external prefill must clear transients before unwinding."""
+        from omlx.scheduler import _PrefillAbortedError
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=2),
+        )
+        request = Request(
+            request_id="req-prefill-abort",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        cache = [SimpleNamespace(state=mx.array([0]))]
+
+        uid = 42
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+        scheduler._pending_abort_ids.add(request.request_id)
+
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache:
+            with pytest.raises(_PrefillAbortedError):
+                scheduler._do_external_prefill(
+                    request,
+                    request.prompt_token_ids,
+                    cache,
+                )
+
+        clear_cache.assert_called_once_with(scheduler._stream)
+        assert request._prefill_saved_rope_deltas is None
+
+    def test_prefill_abort_cleanup_removes_temp_uid_and_pending_abort(
+        self, mock_model, mock_tokenizer
+    ):
+        """Schedule-time prefill aborts must not leave orphan scheduler state."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-clean-prefill-abort",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        scheduler.requests[request.request_id] = request
+
+        temp_uid = id(request)
+        scheduler.request_id_to_uid[request.request_id] = temp_uid
+        scheduler.uid_to_request_id[temp_uid] = request.request_id
+        scheduler._pending_abort_ids.add(request.request_id)
+
+        scheduler._cleanup_prefill_abort_request(request, temp_uid=temp_uid)
+
+        assert request.status == RequestStatus.FINISHED_ABORTED
+        assert request.request_id not in scheduler.requests
+        assert request.request_id not in scheduler.request_id_to_uid
+        assert temp_uid not in scheduler.uid_to_request_id
+        assert request.request_id not in scheduler._pending_abort_ids
+
     def test_prefill_aborted_error_resets_batch_generator(
         self, mock_model, mock_tokenizer
     ):
