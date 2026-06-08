@@ -877,6 +877,9 @@ class SchedulerConfig:
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 128  # Steps between mx.clear_cache() calls (reduced from 512 for Metal stability)
 
+    # Cache cleanup on unload
+    clear_ssd_cache_on_unload: bool = False  # Clear SSD cache when model is unloaded
+
 
 @dataclass
 class SchedulerOutput:
