@@ -90,44 +90,9 @@ def _format_gb(b: int) -> str:
     return f"{b / 1024**3:.1f}GB"
 
 
-class _VMStats64(ctypes.Structure):
-    """Layout of mach `vm_statistics64`. Field order + types must match
-    `<mach/vm_statistics.h>` so ctypes reads them at the right offsets.
-
-    Mixing uint32 and uint64 — the enclosing struct in C is `natural_t`
-    (uint32) for page counters and `uint64_t` for monotonic counters.
-    Getting the layout wrong silently mis-reads later fields, which is
-    how we hit the "speculative = 8 TB" bug during planning.
-    """
-    _fields_ = [
-        ("free_count", ctypes.c_uint32),
-        ("active_count", ctypes.c_uint32),
-        ("inactive_count", ctypes.c_uint32),
-        ("wire_count", ctypes.c_uint32),
-        ("zero_fill_count", ctypes.c_uint64),
-        ("reactivations", ctypes.c_uint64),
-        ("pageins", ctypes.c_uint64),
-        ("pageouts", ctypes.c_uint64),
-        ("faults", ctypes.c_uint64),
-        ("cow_faults", ctypes.c_uint64),
-        ("lookups", ctypes.c_uint64),
-        ("hits", ctypes.c_uint64),
-        ("purges", ctypes.c_uint64),
-        ("purgeable_count", ctypes.c_uint32),
-        ("speculative_count", ctypes.c_uint32),
-        ("decompressions", ctypes.c_uint64),
-        ("compressions", ctypes.c_uint64),
-        ("swapins", ctypes.c_uint64),
-        ("swapouts", ctypes.c_uint64),
-        ("compressor_page_count", ctypes.c_uint32),
-        ("throttled_count", ctypes.c_uint32),
-        ("external_page_count", ctypes.c_uint32),
-        ("internal_page_count", ctypes.c_uint32),
-        ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
-    ]
-
-
 _HOST_VM_INFO64 = 4
+_HOST_INFO64_MAX_COUNT = 256
+_VM_STATS_MIN_COUNT = 4
 _VM_PAGE_SIZE = 16384  # default on Apple Silicon; refined at import
 
 if sys.platform == "darwin":
@@ -155,27 +120,27 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     call so this is safe inside the enforcer poll loop and inside
     per-chunk memcheck.
 
-    The dict exposes the fields we actually use for the dynamic ceiling
-    math; we deliberately do not surface speculative / purgeable because
-    those are subsets of free / inactive (adding them would double count
-    real reclaimable memory).
+    The dict exposes only the first four page counters we use for the
+    dynamic ceiling math. Those counters are stable at the front of
+    `vm_statistics64`; using a max-sized `host_info64_t` buffer avoids
+    pinning oMLX to an SDK-specific tail layout.
     """
     if _libc is None or _MACH_HOST is None:
         return None
     try:
-        stats = _VMStats64()
-        count = ctypes.c_uint(ctypes.sizeof(_VMStats64) // 4)
+        stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
+        count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
         rc = _libc.host_statistics64(
-            _MACH_HOST, _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)
+            _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
         )
-        if rc != 0:
+        if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
             return None
         ps = _VM_PAGE_SIZE
         return {
-            "free": stats.free_count * ps,
-            "active": stats.active_count * ps,
-            "inactive": stats.inactive_count * ps,
-            "wired": stats.wire_count * ps,
+            "free": int(stats[0]) * ps,
+            "active": int(stats[1]) * ps,
+            "inactive": int(stats[2]) * ps,
+            "wired": int(stats[3]) * ps,
         }
     except Exception:  # noqa: BLE001
         return None
@@ -511,7 +476,9 @@ class ProcessMemoryEnforcer:
             them (would double count).
 
         Non-macOS or vm_stat failure: falls back to psutil's available
-        (= roughly free + inactive on macOS, similar elsewhere).
+        (= roughly free + inactive on macOS, similar elsewhere). If psutil
+        is also unavailable or broken, fall back to the static ceiling so
+        telemetry failures do not disable the server's health endpoints.
         """
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
@@ -519,7 +486,16 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
-            return max(0, omlx_usage + psutil.virtual_memory().available)
+            try:
+                available = int(psutil.virtual_memory().available)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Memory guard could not read available memory; "
+                    "using static ceiling fallback: %s",
+                    exc,
+                )
+                return self._get_static_ceiling()
+            return max(0, omlx_usage + available)
         ratio = _ACTIVE_RECLAIM_RATIO[self._memory_guard_tier]
         reclaimable = (
             stats["free"]
