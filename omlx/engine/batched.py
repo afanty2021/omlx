@@ -391,6 +391,7 @@ class BatchedEngine(BaseEngine):
                 self._engine.engine.scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
+                self._engine.engine.scheduler._set_model_info_for_monitor()
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -835,7 +836,7 @@ class BatchedEngine(BaseEngine):
         attached) if it would. Designed to be called from the FastAPI
         route handler BEFORE the response is wrapped in a
         ``StreamingResponse``, so the exception can be mapped to HTTP
-        413 by ``prefill_memory_exceeded_handler``.
+        400 by ``prefill_memory_exceeded_handler``.
 
         Cheap enough to run as a precondition: tokenization of even a
         100k-token chat takes tens of milliseconds compared to the many

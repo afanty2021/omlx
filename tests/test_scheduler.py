@@ -266,6 +266,17 @@ class TestSchedulerInitialization:
 
         assert scheduler.config.max_num_seqs == 64
 
+    def test_llama4_effective_cap_is_serial(self, mock_model, mock_tokenizer):
+        """Llama 4 uses ChunkedKVCache layers that are serialized for now."""
+        mock_model.config.model_type = "llama4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=8),
+        )
+
+        assert scheduler._effective_max_num_seqs() == 1
+
     def test_init_falls_back_when_paged_ssd_cache_unavailable(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
     ):
@@ -2595,6 +2606,39 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler._ensure_batch_generator.assert_called_once_with(
             request.sampling_params
         )
+
+    def test_llama4_admission_serializes_waiting_requests(
+        self, mock_model, mock_tokenizer
+    ):
+        """A second Llama 4 request stays queued instead of forming a batch."""
+        mock_model.config.model_type = "llama4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=4),
+        )
+        first = self._make_request("req-llama4-1")
+        second = self._make_request("req-llama4-2")
+        self._queue_request(scheduler, first)
+        self._queue_request(scheduler, second)
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert rejected == []
+        assert scheduled == [first]
+        assert list(scheduler.waiting) == [second]
+        assert list(scheduler.running) == [first.request_id]
+        assert batch_generator.insert.call_count == 1
 
     def test_schedule_waiting_defers_when_pending_cleanups_reach_cap(
         self, mock_model, mock_tokenizer

@@ -284,7 +284,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import verify_any_api_key
+    from .admin.auth import fingerprint_key, verify_any_api_key
 
     # No auth required if no API key is configured
     if _server_state.api_key is None:
@@ -313,7 +313,7 @@ async def verify_api_key(
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
-        logger.warning("Rejected API key: %r", api_key_value)
+        logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
@@ -507,10 +507,7 @@ def _status_to_error_type(status_code: int) -> str:
     if status_code == 404:
         return "not_found_error"
     if status_code == 413:
-        # Prefill-memory-guard rejection. OpenAI uses
-        # invalid_request_error for context-window-exceeded as well; we
-        # use the finer-grained 413 status but the same type so existing
-        # clients that branch on type still recognise the failure mode.
+        # Body-size rejections are still request-shape errors.
         return "invalid_request_error"
     if status_code == 429:
         return "rate_limit_error"
@@ -626,27 +623,31 @@ async def scheduler_queue_full_handler(
 async def prefill_memory_exceeded_handler(
     request: FastAPIRequest, exc: PrefillMemoryExceededError
 ):
-    """Map prefill peak overshoot to HTTP 413 with a clean JSON body.
+    """Map prefill peak overshoot to HTTP 400 with a clear JSON body.
 
     The synchronous prefill memory guard in ``Scheduler.add_request`` raises
     this when the estimated KV+SDPA peak for a request would push memory
-    past the user-configured ``max_process_memory``. The caller's prompt
+    past the user-configured memory guard ceiling. The caller's prompt
     fits in the model's context window but is too large for the host's
-    headroom, so 413 (Payload Too Large) is the right code.
+    headroom.
 
-    Code vs status trade-off: 413 (Payload Too Large) is a request-shape
-    error; 507 (Insufficient Storage) more accurately describes "host
-    can't service it right now". We use 413 because it maps cleanly to
-    the OpenAI SDK retry-with-smaller-input flow that most clients
-    already implement, and the ``error.code`` field gives consumers a
-    machine-readable discriminator (``"prefill_memory_exceeded"``)
-    distinct from genuine context-window-exceeded rejections.
+    This is an actionable request rejection, not an HTTP body-size
+    rejection. HTTP 400 also prevents Anthropic clients from collapsing
+    this oMLX memory-guard failure into Anthropic's generic
+    "Request too large (max 32MB)" body-size error.
     """
-    detail = str(exc)
+    detail = (
+        "oMLX prefill memory guard rejected this prompt: "
+        f"{str(exc)} "
+        "To continue, set Memory Guard to aggressive, raise the custom "
+        "memory guard ceiling, free system memory, or compact/reduce context."
+    )
+    status_code = 400
     logger.warning(
-        "%s %s → 413: %s",
+        "%s %s → %d: %s",
         request.method,
         request.url.path,
+        status_code,
         detail,
     )
     if _is_api_route(request):
@@ -655,25 +656,30 @@ async def prefill_memory_exceeded_handler(
         # and "host has no memory headroom" both surface as
         # invalid_request_error with code=None and clients can only
         # tell the user "shorten your prompt" — which is wrong when
-        # the actual fix is to raise --max-process-memory.
+        # the actual fix is to loosen the memory guard.
         content = _openai_error_body(
-            detail, 413, code="prefill_memory_exceeded"
+            detail, status_code, code="prefill_memory_exceeded"
         )
         # Surface the structured fields so clients can branch on
         # numeric values instead of regex-matching the human message.
         # OpenAI clients ignore unknown error fields so this is a
         # forward-compatible extension.
+        content["type"] = "error"
+        content["error"]["omlx_code"] = "prefill_memory_exceeded"
         if exc.estimated_bytes is not None:
             content["error"]["estimated_bytes"] = exc.estimated_bytes
         if exc.limit_bytes is not None:
             content["error"]["limit_bytes"] = exc.limit_bytes
     else:
-        content = {"detail": detail}
+        content = {
+            "detail": detail,
+            "omlx_code": "prefill_memory_exceeded",
+        }
         if exc.estimated_bytes is not None:
             content["estimated_bytes"] = exc.estimated_bytes
         if exc.limit_bytes is not None:
             content["limit_bytes"] = exc.limit_bytes
-    return JSONResponse(status_code=413, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(Exception)
@@ -2534,7 +2540,7 @@ async def create_completion(
 
     # Pre-flight prefill memory guard — see create_chat_completion for
     # the reason this must precede any StreamingResponse return.
-    # Thread the client-provided X-Request-ID when present so the 413
+    # Thread the client-provided X-Request-ID when present so the 400
     # log line and the FastAPI handler trace correlate with whatever
     # the client is using on its side.
     upstream_request_id = http_request.headers.get("x-request-id")
@@ -2917,7 +2923,7 @@ async def create_chat_completion(
     # so a typed exception thrown later by add_request lands as "Caught
     # handled exception, but response already started" and the client sees
     # an incomplete chunked read. Running the check here lets
-    # prefill_memory_exceeded_handler return a clean HTTP 413.
+    # prefill_memory_exceeded_handler return a clean HTTP 400.
     await engine.preflight_chat(
         messages,
         request_id=http_request.headers.get("x-request-id"),
@@ -2952,7 +2958,12 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
+        logger.info(
+            f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}, "
+            f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
+            f"request_max_tokens={request.max_tokens}"
+        )
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
@@ -3805,7 +3816,13 @@ async def stream_chat_completion(
             model_id=resolved_model or request.model,
         )
         tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
-        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
+        logger.info(
+            f"Chat completion: {last_output.completion_tokens} tokens in "
+            f"{end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), "
+            f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
+            f"max_tokens={kwargs.get('max_tokens')}, "
+            f"request_max_tokens={request.max_tokens}"
+        )
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -4394,7 +4411,7 @@ async def create_anthropic_message(
         chat_kwargs["stop"] = request.stop_sequences
 
     # Pre-flight prefill memory guard — must precede any StreamingResponse
-    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    # return so PrefillMemoryExceededError can be mapped to HTTP 400.
     await engine.preflight_chat(
         messages,
         request_id=http_request.headers.get("x-request-id"),
@@ -4809,7 +4826,7 @@ async def create_response(
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
     # Pre-flight prefill memory guard — must precede any StreamingResponse
-    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    # return so PrefillMemoryExceededError can be mapped to HTTP 400.
     await engine.preflight_chat(
         messages,
         request_id=http_request.headers.get("x-request-id"),

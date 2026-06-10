@@ -389,6 +389,13 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
 
+    # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
+    # and `for p in self.logits_processors[e]`, both of which crash when
+    # logits_processors is None.  Normalise to [] so the original code path
+    # works without modification.  See #934.
+    if self.logits_processors is None:
+        self.logits_processors = []
+
     result = _original_generation_batch_step(self)
 
     # self._next_tokens contains the just-sampled tokens (async eval pending).
@@ -575,7 +582,9 @@ def _patched_ppb_split(self, indices):
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = self.samplers
         new_batch.fallback_sampler = self.fallback_sampler
-        new_batch.logits_processors = self.logits_processors
+        # Defensive: normalise None → [] to avoid mlx-lm crash in _step
+        lps = self.logits_processors if self.logits_processors is not None else []
+        new_batch.logits_processors = lps
         new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
 
@@ -877,6 +886,43 @@ def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     return advanced
 
 
+def _get_attr_or_key(obj: Any, name: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return None
+    if type(value).__module__.startswith("unittest.mock"):
+        return None
+    return value
+
+
+def _model_declares_llama4(model: Any) -> bool:
+    """Return True if the loaded model/config tree declares Llama 4."""
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _get_attr_or_key(obj, "model_type") == "llama4":
+            return True
+
+        for attr in ("config", "args", "text_config", "language_config", "llm_config"):
+            child = _get_attr_or_key(obj, attr)
+            if child is not None and not isinstance(
+                child, (str, bytes, int, float, bool)
+            ):
+                stack.append(child)
+    return False
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1059,6 +1105,12 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
+        self._serialize_llama4_requests = _model_declares_llama4(model)
+        if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Llama 4 detected; serializing requests because ChunkedKVCache "
+                "does not support multi-row batching yet"
+            )
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -1124,6 +1176,10 @@ class Scheduler:
         # kill a near-complete request that actually fits. 0 => fall back to
         # _memory_hard_limit_bytes (pre-propagation / old enforcer).
         self._memory_abort_limit_bytes: int = 0
+        # Last mx.get_active_memory() sample taken on this scheduler's MLX
+        # executor thread. The background memory enforcer reads this cached
+        # value during active decode instead of touching MLX/Metal directly.
+        self._last_mlx_active_memory_bytes: int = 0
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -2037,7 +2093,7 @@ class Scheduler:
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens_seq,
             sampler=sampler,
-            logits_processors=logits_processors if logits_processors else None,
+            logits_processors=logits_processors if logits_processors else [],
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
@@ -2169,13 +2225,15 @@ class Scheduler:
         plain KVCache objects but read fetched cache tensors directly, which
         TurboQuant's quantized states do not support (#1613).
         """
-        from mlx_lm.models.cache import CacheList, KVCache
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
         if self._model_uses_mla():
             return False
 
         def _ok(c: Any) -> bool:
             if isinstance(c, KVCache):
+                return True
+            if isinstance(c, ArraysCache):
                 return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
@@ -2481,7 +2539,7 @@ class Scheduler:
             # show in mx.get_active_memory() still trigger the guard.
             # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = self._current_usage_bytes()
                 _hard = self._memory_hard_limit_bytes
                 _soft = self._memory_limit_bytes
                 # Only log when crossing the soft watermark — that's the
@@ -2745,7 +2803,7 @@ class Scheduler:
         if cap <= 0:
             return n_tokens
         min_chunk = max(1, self._prefill_min_chunk_tokens)
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         if current + self._predicted_chunk_transient(n_tokens, kv_len) <= cap:
             return n_tokens
 
@@ -2859,7 +2917,7 @@ class Scheduler:
         if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
             return requested
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
         # Conservative per-token transient (measured-last / EWMA / static, ×
@@ -2943,6 +3001,23 @@ class Scheduler:
             )
         return n
 
+    def get_cached_mlx_active_memory_bytes(self) -> int:
+        """Return the last MLX active-memory sample taken on the executor."""
+        return self._last_mlx_active_memory_bytes
+
+    def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
+        """Current memory usage for scheduler-side guard checks.
+
+        Scheduler steps run on the MLX executor thread, so they can refresh
+        mx.get_active_memory() safely. Event-loop callers such as early
+        preflight use the cached executor sample and phys_footprint instead.
+        """
+        active = self._last_mlx_active_memory_bytes
+        if refresh_mlx_active:
+            active = max(0, int(mx.get_active_memory()))
+            self._last_mlx_active_memory_bytes = active
+        return max(active, get_phys_footprint())
+
     def _record_chunk_transient(
         self,
         n_tokens: int,
@@ -2996,7 +3071,7 @@ class Scheduler:
             ``max(active, phys_footprint)`` after reclaim.
         """
         _sync_and_clear_cache(self._stream)
-        return max(mx.get_active_memory(), get_phys_footprint())
+        return self._current_usage_bytes()
 
     # ------------------------------------------------------------------
     # Chunked prefill helpers (used when config.chunked_prefill=True)
@@ -3160,7 +3235,7 @@ class Scheduler:
         # phys_footprint, so the active-only check could miss the page
         # before the kernel kills us.
         if self._memory_limit_bytes > 0:
-            current = max(mx.get_active_memory(), get_phys_footprint())
+            current = self._current_usage_bytes()
             _hard = self._memory_hard_limit_bytes
             _soft = self._memory_limit_bytes
             # Caution-zone-only memcheck log (see external loop counterpart).
@@ -5474,7 +5549,7 @@ class Scheduler:
         self._pending_reclaim_request = False
         if self.running or self.prefilling or self.waiting:
             return
-        before = max(mx.get_active_memory(), get_phys_footprint())
+        before = self._current_usage_bytes()
         after = self._reclaim_prefill_headroom()
         logger.info(
             "Idle reclaim: trimmed Metal transients between turns "
@@ -5610,9 +5685,9 @@ class Scheduler:
         self._generation_overflow_recovery_ids.intersection_update(active_ids)
 
     def _effective_max_num_seqs(self) -> int:
-        """Current admission cap, narrowed during generation-overflow retry."""
+        """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._generation_overflow_recovery_ids:
+        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
             return 1
         return max(1, self.config.max_num_seqs)
 
@@ -5722,12 +5797,11 @@ class Scheduler:
         Estimate whether prefill would exceed memory limits.
 
         Computes worst-case peak memory for the last prefill chunk
-        (model weights + KV cache + SDPA attention matrix) and rejects
+        (model weights + KV cache + SDPA activation/scratch) and rejects
         if it would exceed the hard limit.
 
-        For head_dim > 128, MLX SDPA uses a fallback that materializes
-        the full attention matrix [B, n_q, chunk, kv_len] in float32.
-        For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
+        Current MLX avoids the old full fp32 attention matrix for
+        head_dim > 128, but still needs a bounded tiled scratch term.
 
         Returns:
             ``_PreflightRejection`` carrying the message + numeric
@@ -5756,7 +5830,7 @@ class Scheduler:
         if peak == 0:
             return None  # can't estimate, skip
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         estimated = current + peak
         hard_limit = self._memory_hard_limit_bytes
 
@@ -5830,7 +5904,7 @@ class Scheduler:
         if peak == 0:
             return
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes(refresh_mlx_active=False)
         if current + peak <= self._memory_hard_limit_bytes:
             return
 
@@ -5937,7 +6011,7 @@ class Scheduler:
                 and self._memory_limit_bytes > 0
                 and admitted
             ):
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = self._current_usage_bytes()
                 if current > self._memory_limit_bytes:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "
@@ -7972,13 +8046,14 @@ class Scheduler:
                 num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
                 head_dim = hidden_size // num_heads
 
-            # Determine dtype size
-            dtype_size = 2  # Default float16
+            # Determine base dtype size for uncompressed KV cache elements.
+            base_dtype_size: float = 2  # Default float16/bfloat16
             if hasattr(self.model, "dtype"):
                 if self.model.dtype == mx.float32:
-                    dtype_size = 4
+                    base_dtype_size = 4
                 elif self.model.dtype == mx.bfloat16:
-                    dtype_size = 2
+                    base_dtype_size = 2
+            dtype_size = base_dtype_size
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
             num_attention_heads = (
@@ -7988,19 +8063,58 @@ class Scheduler:
             )
 
             # Count KVCache layers for hybrid models
+            cache_list_for_tq = None
+            actual_kv_cache_layers = None
             num_kv_cache_layers = num_layers
-            if hasattr(self.model, "make_cache"):
+            if not hasattr(self.model, "make_cache"):
+                actual_kv_cache_layers = num_layers
+            else:
                 try:
                     cache_list = self.model.make_cache()
-                    from mlx_lm.models.cache import KVCache
+                    cache_list_for_tq = cache_list
+                    from mlx_lm.models.cache import CacheList, KVCache
 
-                    num_kv_cache_layers = sum(
-                        1 for c in cache_list if type(c) is KVCache
-                    )
+                    def _count_kv(c: Any) -> int:
+                        if type(c) is KVCache:
+                            return 1
+                        if isinstance(c, CacheList):
+                            return sum(_count_kv(inner) for inner in c.caches)
+                        return 0
+
+                    actual_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                    num_kv_cache_layers = actual_kv_cache_layers
                     if num_kv_cache_layers == 0:
                         num_kv_cache_layers = num_layers  # fallback
                 except Exception:
                     pass
+
+            if (
+                self._turboquant_kv_bits is not None
+                and isinstance(head_dim, int)
+                and not isinstance(head_dim, bool)
+                and head_dim > 0
+                and isinstance(actual_kv_cache_layers, int)
+                and actual_kv_cache_layers > 0
+                and (
+                    self._turboquant_eligible(cache_list_for_tq)
+                    if cache_list_for_tq is not None
+                    else not self._model_uses_mla()
+                )
+            ):
+                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (
+                    2.0 / head_dim
+                )
+                if (
+                    self._turboquant_skip_last
+                    and not isinstance(actual_kv_cache_layers, bool)
+                    and actual_kv_cache_layers > 1
+                ):
+                    dtype_size = (
+                        (actual_kv_cache_layers - 1) * tq_dtype_size
+                        + base_dtype_size
+                    ) / actual_kv_cache_layers
+                else:
+                    dtype_size = tq_dtype_size
 
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
