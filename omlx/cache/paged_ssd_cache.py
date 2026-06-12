@@ -166,6 +166,24 @@ _READABLE_CACHE_FORMAT_VERSIONS = frozenset({"2", "3"})
 _ROTATING_CACHE_TYPES = ("RotatingKVCache", "BatchRotatingKVCache")
 
 
+def _canonicalize_layer_cache_types(
+    layer_cache_types: list[str] | tuple[str, ...] | None,
+) -> list[str] | None:
+    """Normalize wrapper class names for metadata compatibility checks.
+
+    Currently maps ``SizedArraysCache`` to ``ArraysCache`` so blocks saved
+    under either wrapper class compare equal. Types that change tensor
+    representation (e.g., ``TurboQuantKVCache`` vs ``KVCache``) are NOT
+    collapsed — that mismatch is real and the block must be invalidated.
+    """
+    if layer_cache_types is None:
+        return None
+    return [
+        "ArraysCache" if cache_type == "SizedArraysCache" else cache_type
+        for cache_type in layer_cache_types
+    ]
+
+
 def _cache_compat_signature(
     *,
     model_name: str = "",
@@ -925,6 +943,11 @@ class PagedSSDCacheManager(CacheManager):
         self._expected_num_layers = expected_num_layers
         self._expected_block_size = expected_block_size
         self._expected_layer_cache_types = expected_layer_cache_types
+        # Set once we have swept stale-signature blocks for the current
+        # ``_expected_layer_cache_types``. Re-assigning the signature (e.g.,
+        # via ``adopt_layer_signature_if_unset``) resets this so the new
+        # signature triggers its own one-shot sweep.
+        self._signature_sweep_completed = False
         self._lock = threading.RLock()
 
         # Disk usage cache for dynamic effective max size (30s TTL)
@@ -1322,16 +1345,63 @@ class PagedSSDCacheManager(CacheManager):
             if metadata.block_size != self._expected_block_size:
                 return False
         if self._expected_layer_cache_types is not None:
-            if metadata.layer_cache_types != self._expected_layer_cache_types:
+            if _canonicalize_layer_cache_types(
+                metadata.layer_cache_types
+            ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
-        expected_signature = (
-            self._expected_cache_signature()
-            if self._expected_layer_cache_types is not None
-            else ""
-        )
-        if expected_signature and metadata.cache_signature:
-            if metadata.cache_signature != expected_signature:
+        if (
+            self._expected_layer_cache_types is not None
+            and not self._is_compatible_cache_signature(metadata)
+        ):
+            return False
+        return True
+
+    def _is_compatible_cache_signature(self, metadata: PagedSSDBlockMetadata) -> bool:
+        """Return True when a saved cache_signature matches enabled checks."""
+        if not metadata.cache_signature:
+            return True
+
+        try:
+            payload = json.loads(metadata.cache_signature)
+        except (TypeError, ValueError):
+            expected_signature = (
+                self._expected_cache_signature()
+                if self._expected_layer_cache_types is not None
+                else ""
+            )
+            return (
+                not expected_signature or metadata.cache_signature == expected_signature
+            )
+
+        if self._expected_model_name:
+            if payload.get("model_name", "") != self._expected_model_name:
                 return False
+
+        if self._expected_num_layers > 0:
+            try:
+                num_layers = int(payload.get("num_layers", 0) or 0)
+            except (TypeError, ValueError):
+                num_layers = 0
+            if num_layers > 0 and num_layers != self._expected_num_layers:
+                return False
+
+        if self._expected_block_size > 0:
+            try:
+                block_size = int(payload.get("block_size", 0) or 0)
+            except (TypeError, ValueError):
+                block_size = 0
+            if block_size > 0 and block_size != self._expected_block_size:
+                return False
+
+        if self._expected_layer_cache_types is not None:
+            layer_cache_types = payload.get("layer_cache_types")
+            if not isinstance(layer_cache_types, (list, tuple)):
+                return False
+            if _canonicalize_layer_cache_types(
+                layer_cache_types
+            ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
+                return False
+
         return True
 
     def _expected_cache_signature(self) -> str:
@@ -1577,6 +1647,16 @@ class PagedSSDCacheManager(CacheManager):
         if not HAS_MLX:
             logger.error("MLX not available, cannot save block")
             return False
+
+        # First save call after a model load is the canonical source for
+        # the live layer-cache signature (post-TurboQuant / post-MTP). If
+        # the manager wasn't told the signature at construction, adopt it
+        # now and sweep any index entries left over from a prior config.
+        if self.adopt_layer_signature_if_unset(layer_cache_types):
+            try:
+                self.invalidate_stale_layer_signature()
+            except Exception as e:
+                logger.warning("Stale-signature sweep failed: %s", e)
 
         # Check if already exists in index (thread-safe)
         if self._index.contains(block_hash):
@@ -2570,6 +2650,127 @@ class PagedSSDCacheManager(CacheManager):
                 f"(workers={max_workers}, time={elapsed_ms:.1f}ms)"
             )
         return loaded_count
+
+    def adopt_layer_signature_if_unset(
+        self, layer_cache_types: list[str] | None
+    ) -> bool:
+        """Adopt ``layer_cache_types`` as the expected signature if none was set.
+
+        The scheduler may not be able to derive the post-patch cache layout
+        before constructing this manager (TurboQuant / MTP / dtype changes
+        happen at model-load time). Save sites pass the live signature on
+        every call, so the manager can adopt it the first time it sees one.
+
+        Returns True when adoption actually happened (caller can use this
+        to trigger the one-shot sweep). Returns False when the manager
+        already had a signature or when ``layer_cache_types`` is empty.
+        """
+        if not layer_cache_types:
+            return False
+        if self._expected_layer_cache_types is not None:
+            return False
+        canonical = _canonicalize_layer_cache_types(layer_cache_types)
+        with self._lock:
+            if self._expected_layer_cache_types is not None:
+                return False  # raced with another adopter
+            self._expected_layer_cache_types = list(layer_cache_types)
+            self._signature_sweep_completed = False
+        logger.info(
+            "PagedSSDCacheManager adopted layer cache signature "
+            "(%d layers, %d unique types)",
+            len(layer_cache_types),
+            len(set(canonical or ())),
+        )
+        return True
+
+    def set_expected_layer_signature(self, layer_cache_types: list[str] | None) -> bool:
+        """Set the live layer-cache signature, replacing stale expectations.
+
+        Unlike ``adopt_layer_signature_if_unset``, this is used by callers that
+        learn the final cache layout after manager construction (for example
+        TurboQuant settings applied by the engine after the scheduler starts).
+
+        Returns True when the canonical signature changed and a stale-signature
+        sweep should run. Returns False for empty input or a canonical no-op.
+        """
+        if not layer_cache_types:
+            return False
+
+        new_signature = list(layer_cache_types)
+        new_canonical = _canonicalize_layer_cache_types(new_signature)
+
+        with self._lock:
+            old_signature = self._expected_layer_cache_types
+            old_canonical = _canonicalize_layer_cache_types(old_signature)
+            if old_canonical == new_canonical:
+                if old_signature != new_signature:
+                    self._expected_layer_cache_types = new_signature
+                return False
+
+            self._expected_layer_cache_types = new_signature
+            self._signature_sweep_completed = False
+
+        logger.info(
+            "PagedSSDCacheManager updated layer cache signature "
+            "(%d layers, %d unique types)",
+            len(new_signature),
+            len(set(new_canonical or ())),
+        )
+        return True
+
+    def invalidate_stale_layer_signature(self) -> int:
+        """Drop in-memory index entries whose layer_cache_types disagree
+        with the current expected signature.
+
+        Scoped to the current ``_expected_model_name``: blocks belonging to
+        other models share the SSD directory and remain valid for them, so
+        we leave them alone. Legacy blocks without a recorded ``model_name``
+        are also skipped — we cannot safely attribute them.
+
+        The SSD files are unlinked from the index (and any in-memory hot
+        copy is dropped), but the on-disk file is left for LRU to reclaim
+        later. Returns the number of blocks dropped from the index.
+
+        Idempotent: a second call after a clean sweep returns 0.
+        """
+        if self._expected_layer_cache_types is None:
+            return 0
+        if not self._expected_model_name:
+            # Without an owning model_name we cannot scope safely; refuse
+            # rather than risk evicting another model's blocks.
+            return 0
+        if self._signature_sweep_completed:
+            return 0
+
+        expected = _canonicalize_layer_cache_types(self._expected_layer_cache_types)
+
+        with self._index._lock:
+            stale: list[bytes] = []
+            for h, meta in self._index._index.items():
+                if not meta.model_name or meta.model_name != self._expected_model_name:
+                    continue
+                got = _canonicalize_layer_cache_types(meta.layer_cache_types)
+                if got is None:
+                    # Pre-signature blocks lack the metadata to judge.
+                    # Skip rather than guess. Newer saves will replace them.
+                    continue
+                if got != expected:
+                    stale.append(h)
+
+        for h in stale:
+            self.forget_block(h)
+
+        self._signature_sweep_completed = True
+
+        if stale:
+            logger.info(
+                "Invalidated %d SSD index entries with stale layer "
+                "cache signature for model %r (kept %d)",
+                len(stale),
+                self._expected_model_name,
+                len(self._index._index),
+            )
+        return len(stale)
 
     def forget_block(self, block_hash: bytes) -> bool:
         """

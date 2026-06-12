@@ -2257,6 +2257,8 @@ class Scheduler:
                 return True
             if isinstance(c, ArraysCache):
                 return True
+            if type(c).__name__ == "SizedArraysCache":
+                return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
             return False
@@ -5061,10 +5063,12 @@ class Scheduler:
         drafter: VLMMTPDrafter | None,
         draft_block_size: int | None = None,
     ) -> None:
-        """Attach a gemma4_assistant drafter for VLM MTP speculative decode.
+        """Attach an MTP drafter for VLM MTP speculative decode.
 
-        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the assistant
-        artifact is loaded. ``None`` clears the toggle.
+        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the drafter
+        artifact is loaded.  Supports any drafter that mlx-vlm's
+        ``load_drafter()`` resolves to ``kind="mtp"`` (gemma4_assistant,
+        qwen3_5_mtp, etc.).  ``None`` clears the toggle.
         """
         self._vlm_mtp_drafter = drafter
         self._vlm_mtp_draft_block_size = draft_block_size
@@ -5159,15 +5163,22 @@ class Scheduler:
             )
             return None
 
-        logits = out.logits[:, -1, :]
+        # Handle both LanguageModelOutput (dense models) and 3-tuple
+        # (logits, hidden, gdn_states) returned by the MoE MTP runtime patch.
+        if isinstance(out, tuple):
+            logits = out[0][:, -1, :]
+            hidden_raw = out[1]
+        else:
+            logits = out.logits[:, -1, :]
+            hidden_raw = out.hidden_states
+
         first_bonus_arr = mtp_sampler(logits)  # mx.array shape [1]
         mx.eval(first_bonus_arr)
 
-        hidden_states = out.hidden_states
-        if isinstance(hidden_states, list):
-            hidden = hidden_states[-1]
+        if isinstance(hidden_raw, list):
+            hidden = hidden_raw[-1]
         else:
-            hidden = hidden_states
+            hidden = hidden_raw
         # Slice to last position so the drafter sees a [B, 1, H] tensor
         # regardless of how many tokens this forward processed.
         if hidden.shape[1] > 1:
@@ -5185,7 +5196,7 @@ class Scheduler:
                 drafter=drafter,
                 prompt_cache=prefilled_cache,
                 hidden=hidden,
-                shared_kv_states=out.shared_kv_states,
+                shared_kv_states=getattr(out, "shared_kv_states", {}) if not isinstance(out, tuple) else {},
                 first_bonus=int(first_bonus_arr.item()),
                 max_tokens=request.sampling_params.max_tokens,
                 sampler=mtp_sampler,
@@ -8282,6 +8293,81 @@ class Scheduler:
 
         except Exception as e:
             logger.debug(f"Failed to extract model info: {e}")
+
+    def _infer_live_layer_cache_types(self) -> list[str] | None:
+        """Infer the layer-cache signature that future SSD saves will use."""
+        if not HAS_CACHE_TYPE_HANDLERS or ModelCacheConfig is None:
+            return None
+
+        make_cache = getattr(self.model, "make_cache", None)
+        if not callable(make_cache):
+            return None
+
+        try:
+            cache_list = make_cache()
+        except Exception as e:
+            logger.debug("Failed to build cache list for SSD signature: %s", e)
+            return None
+
+        if not isinstance(cache_list, (list, tuple)) or not cache_list:
+            return None
+
+        cache_list = list(cache_list)
+        try:
+            model_cache_config = ModelCacheConfig.from_cache_list(
+                cache_list,
+                model_name=self.config.model_name or "",
+            )
+            layer_cache_types = model_cache_config.get_type_names()
+        except Exception as e:
+            logger.debug("Failed to infer SSD layer cache signature: %s", e)
+            return None
+
+        if not layer_cache_types:
+            return None
+
+        if self._turboquant_kv_bits is None:
+            return layer_cache_types
+
+        try:
+            if not self._turboquant_eligible(cache_list):
+                return layer_cache_types
+            from mlx_lm.models.cache import KVCache
+        except Exception as e:
+            logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
+            return layer_cache_types
+
+        kv_indices = [i for i, c in enumerate(cache_list) if isinstance(c, KVCache)]
+        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
+        last_kv_idx = kv_indices[-1] if skip_last else -1
+        for idx in kv_indices:
+            if idx != last_kv_idx and idx < len(layer_cache_types):
+                layer_cache_types[idx] = "TurboQuantKVCache"
+
+        return layer_cache_types
+
+    def refresh_ssd_layer_signature(self) -> list[str] | None:
+        """Set the SSD manager's live layer signature before prefix lookup."""
+        manager = self.paged_ssd_cache_manager
+        if manager is None:
+            return None
+
+        layer_cache_types = self._infer_live_layer_cache_types()
+        if not layer_cache_types:
+            return None
+
+        try:
+            set_signature = getattr(manager, "set_expected_layer_signature", None)
+            if callable(set_signature):
+                set_signature(layer_cache_types)
+            else:
+                manager.adopt_layer_signature_if_unset(layer_cache_types)
+            manager.invalidate_stale_layer_signature()
+        except Exception as e:
+            logger.warning("Failed to refresh SSD layer cache signature: %s", e)
+            return None
+
+        return layer_cache_types
 
     def _init_tiered_cache(self) -> bool:
         """Initialize paged SSD cache components if configured.

@@ -2210,6 +2210,81 @@ class TestExtractCacheStatesRotatingNormalization:
         assert normalized_meta == ("0", "128", "1280", "128")
 
 
+class TestSchedulerSSDLayerSignature:
+    """Tests for pre-lookup SSD layer signature refresh."""
+
+    def test_refresh_uses_final_turboquant_layout_and_sweeps(
+        self, mock_tokenizer, tmp_path
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+
+        class TwoLayerModel:
+            config = SimpleNamespace(
+                num_hidden_layers=2,
+                num_key_value_heads=2,
+                num_attention_heads=2,
+                head_dim=32,
+            )
+
+            def make_cache(self):
+                return [KVCache(), KVCache()]
+
+        scheduler = Scheduler(
+            model=TwoLayerModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=4,
+                model_name="test-model",
+            ),
+        )
+        try:
+            manager = scheduler.paged_ssd_cache_manager
+            assert manager is not None
+            assert manager._expected_layer_cache_types is None
+
+            stale = PagedSSDBlockMetadata(
+                block_hash=b"stale".ljust(32, b"\0"),
+                file_path=tmp_path / "stale.safetensors",
+                file_size=1024,
+                token_count=4,
+                created_at=0.0,
+                last_access=0.0,
+                num_layers=2,
+                model_name="test-model",
+                block_size=4,
+                layer_cache_types=["KVCache", "KVCache"],
+            )
+            fresh = PagedSSDBlockMetadata(
+                block_hash=b"fresh".ljust(32, b"\0"),
+                file_path=tmp_path / "fresh.safetensors",
+                file_size=1024,
+                token_count=4,
+                created_at=0.0,
+                last_access=0.0,
+                num_layers=2,
+                model_name="test-model",
+                block_size=4,
+                layer_cache_types=["TurboQuantKVCache", "KVCache"],
+            )
+            manager._index.add(stale)
+            manager._index.add(fresh)
+
+            scheduler._turboquant_kv_bits = 4.0
+            scheduler._turboquant_skip_last = True
+
+            layer_cache_types = scheduler.refresh_ssd_layer_signature()
+
+            assert layer_cache_types == ["TurboQuantKVCache", "KVCache"]
+            assert manager._expected_layer_cache_types == layer_cache_types
+            assert manager._index.get(stale.block_hash) is None
+            assert manager._index.get(fresh.block_hash) is not None
+        finally:
+            scheduler.shutdown()
+
+
 class TestCacheCorruptionRecovery:
     """Tests for cache corruption detection and recovery."""
 
@@ -2931,6 +3006,68 @@ class TestBatchGeneratorAllTokens:
         inserted_cache = call_kwargs["caches"][0][0]
         assert isinstance(inserted_cache, TurboQuantKVCache)
         assert state.cache[0] is inserted_cache
+        materialize.assert_called_once_with(state.cache)
+        sync_clear.assert_called_once_with(scheduler._stream)
+        assert scheduled == [request]
+
+    def test_chunked_prefill_converts_after_sized_arrays_restore(
+        self, mock_model, mock_tokenizer
+    ):
+        """Restored ArraysCache wrappers must not skip the TQ epilogue."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler._turboquant_skip_last = False
+
+        arrays_cache = ArraysCache(size=2)
+        arrays_cache.cache[0] = mx.random.normal((1, 3, 16))
+        arrays_cache.cache[1] = mx.random.normal((1, 2, 16, 16))
+        sized_arrays_cache = SizedArraysCache(arrays_cache, token_count=4)
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+
+        request = Request(
+            request_id="req-chunked-tq-sized-arrays",
+            prompt=[11, 12, 13, 14, 15],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13, 14, 15]
+        request.num_prompt_tokens = 5
+        request.cached_tokens = 4
+        state = _PrefillState(
+            request=request,
+            cache=[sized_arrays_cache, kv_cache],
+            tokens_remaining=mx.array([[]]),
+            last_token=[15],
+            tokens_processed=4,
+            base_size=4,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        scheduled = []
+
+        with patch("omlx.scheduler._materialize_cache_storage") as materialize:
+            with patch("omlx.scheduler._sync_and_clear_cache") as sync_clear:
+                scheduler._insert_prefilled_request(request, state, scheduled)
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        inserted_cache = call_kwargs["caches"][0]
+        assert inserted_cache[0] is sized_arrays_cache
+        assert isinstance(inserted_cache[1], TurboQuantKVCache)
+        assert state.cache[1] is inserted_cache[1]
         materialize.assert_called_once_with(state.cache)
         sync_clear.assert_called_once_with(scheduler._stream)
         assert scheduled == [request]

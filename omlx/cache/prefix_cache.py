@@ -188,6 +188,17 @@ class BlockAwarePrefixCache(CacheManager):
         """
         self.paged_ssd_cache = paged_ssd_cache_manager
         if paged_ssd_cache_manager is not None:
+            # If the manager already knows its layer-cache signature (e.g.,
+            # eager scheduler plumb-through), purge any indexed blocks left
+            # over from a prior cache-config run for the current model.
+            # When the signature is unset, this is a no-op; the manager
+            # adopts on the first save and sweeps then.
+            try:
+                paged_ssd_cache_manager.invalidate_stale_layer_signature()
+            except Exception as e:
+                logger.warning(
+                    "Stale-signature sweep on manager attach failed: %s", e
+                )
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
     def _forget_incompatible_ssd_block(
@@ -219,6 +230,20 @@ class BlockAwarePrefixCache(CacheManager):
             self.paged_ssd_cache.forget_block(block_hash)
         except Exception as e:
             logger.debug(f"Failed to forget incompatible SSD block: {e}")
+
+    @staticmethod
+    def _canonical_layer_cache_types(
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> list[str] | None:
+        """Normalize wrapper class names for metadata compatibility checks.
+
+        Thin wrapper around the canonical implementation in
+        :mod:`omlx.cache.paged_ssd_cache` so the two sites that compare
+        signatures stay in lock-step.
+        """
+        from .paged_ssd_cache import _canonicalize_layer_cache_types
+
+        return _canonicalize_layer_cache_types(layer_cache_types)
 
     def _detect_window_padding_from_blocks(
         self,
@@ -1600,8 +1625,28 @@ class BlockAwarePrefixCache(CacheManager):
             valid_block_count = 0
             valid_token_count = 0
 
-            # Cache type information from blocks
-            layer_cache_types = None
+            # Cache type information from blocks.
+            # Anchor the per-block comparison to the live model's signature
+            # rather than block 0's metadata. Bootstrapping from block 0
+            # means a stale block (saved before TurboQuant/MTP toggled)
+            # silently becomes the truth and every newer, correctly-typed
+            # block trips the mismatch warning forever. With the live
+            # signature as the reference, the stale block 0 itself gets
+            # forgotten on the first failed comparison and reuse can
+            # extend past it on the next request.
+            manager_expected = (
+                getattr(self.paged_ssd_cache, "_expected_layer_cache_types", None)
+                if self.paged_ssd_cache is not None
+                else None
+            )
+            # Only adopt when the manager really has a concrete signature.
+            # Guard against MagicMock auto-attrs in tests and empty lists
+            # (which would unanimously trip the mismatch check); fall back
+            # to the historical block-0 bootstrap in those cases.
+            if isinstance(manager_expected, (list, tuple)) and manager_expected:
+                layer_cache_types = list(manager_expected)
+            else:
+                layer_cache_types = None
             first_block_meta_states = None  # meta_states from first block
             last_block_meta_states = (
                 None  # meta_states from last block (for non-sliceable caches)
@@ -1703,7 +1748,8 @@ class BlockAwarePrefixCache(CacheManager):
                         layer_cache_types = block_layer_cache_types
                     elif (
                         block_layer_cache_types is not None
-                        and block_layer_cache_types != layer_cache_types
+                        and self._canonical_layer_cache_types(block_layer_cache_types)
+                        != self._canonical_layer_cache_types(layer_cache_types)
                     ):
                         logger.warning(
                             "Cache layer type mismatch at block %s: got %s, "
