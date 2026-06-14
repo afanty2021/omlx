@@ -396,6 +396,8 @@ class CompletionRequest(BaseModel):
     frequency_penalty: float | None = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
+    thinking_budget: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod
