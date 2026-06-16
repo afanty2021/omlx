@@ -28,19 +28,16 @@ limit being below the chosen ceiling.
 from __future__ import annotations
 
 import asyncio
-import ctypes
-import ctypes.util
 import inspect
 import logging
 import subprocess
-import sys
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-import psutil
 
+from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
@@ -99,29 +96,6 @@ def _format_gb(b: int) -> str:
     return f"{b / 1024**3:.1f}GB"
 
 
-_HOST_VM_INFO64 = 4
-_HOST_INFO64_MAX_COUNT = 256
-_VM_STATS_MIN_COUNT = 4
-_VM_PAGE_SIZE = 16384  # default on Apple Silicon; refined at import
-
-if sys.platform == "darwin":
-    try:
-        _libc = ctypes.CDLL(ctypes.util.find_library("c"))
-        _libc.mach_host_self.restype = ctypes.c_uint
-        _MACH_HOST = _libc.mach_host_self()
-        # Read actual page size once at import time
-        _ps = ctypes.c_uint(0)
-        _libc.host_page_size(_MACH_HOST, ctypes.byref(_ps))
-        if _ps.value > 0:
-            _VM_PAGE_SIZE = _ps.value
-    except Exception:  # noqa: BLE001
-        _libc = None
-        _MACH_HOST = None
-else:
-    _libc = None
-    _MACH_HOST = None
-
-
 def get_macos_vm_stats() -> dict[str, int] | None:
     """Snapshot of mach `vm_statistics64` in bytes.
 
@@ -134,25 +108,7 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     `vm_statistics64`; using a max-sized `host_info64_t` buffer avoids
     pinning oMLX to an SDK-specific tail layout.
     """
-    if _libc is None or _MACH_HOST is None:
-        return None
-    try:
-        stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
-        count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
-        rc = _libc.host_statistics64(
-            _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
-        )
-        if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
-            return None
-        ps = _VM_PAGE_SIZE
-        return {
-            "free": int(stats[0]) * ps,
-            "active": int(stats[1]) * ps,
-            "inactive": int(stats[2]) * ps,
-            "wired": int(stats[3]) * ps,
-        }
-    except Exception:  # noqa: BLE001
-        return None
+    return psutil_compat.get_macos_vm_stats()
 
 
 def get_iogpu_wired_limit_bytes() -> int:
@@ -515,10 +471,12 @@ class ProcessMemoryEnforcer:
             subsets of free / inactive, so we deliberately do not add
             them (would double count).
 
-        Non-macOS or vm_stat failure: falls back to psutil's available
-        (= roughly free + inactive on macOS, similar elsewhere). If psutil
-        is also unavailable or broken, fall back to the static ceiling so
-        telemetry failures do not disable the server's health endpoints.
+        VM stats failure: falls back to psutil_compat.virtual_memory().available
+        (= roughly free + inactive on macOS, similar elsewhere). On macOS that
+        compat layer avoids psutil's HOST_VM_INFO64 adapter and uses a cached
+        vm_stat fallback only if the fast host_statistics64 path is unavailable.
+        If all telemetry is unavailable, fall back to the static ceiling so
+        server health endpoints and the enforcer keep running.
         """
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
@@ -526,10 +484,8 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
-            if sys.platform == "darwin":
-                return self._get_static_ceiling()
             try:
-                available = int(psutil.virtual_memory().available)
+                available = int(psutil_compat.virtual_memory().available)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Memory guard could not read available memory; "
@@ -545,6 +501,10 @@ class ProcessMemoryEnforcer:
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
 
+        Thin wrapper over ``_get_ceiling_breakdown`` that discards the
+        component breakdown. Hot callers that don't need to know which
+        ceiling is binding should keep using this helper.
+
         `metal_cap` is the effective Metal allocation cap (kernel
         iogpu.wired_limit_mb when set, otherwise Apple's
         max_recommended_working_set_size). Including it here means oMLX
@@ -559,17 +519,37 @@ class ProcessMemoryEnforcer:
         Returns 0 if the memory guard is disabled (callers treat 0 as
         "no limit").
         """
+        return self._get_ceiling_breakdown()["hard_limit"]
+
+    def _get_ceiling_breakdown(self) -> dict[str, int]:
+        """Compute the hard limit AND the three component ceilings.
+
+        Returns a dict with keys ``static``, ``dynamic``, ``metal_cap``,
+        ``hard_limit`` (= min of the three non-zero values, or 0 when
+        the guard is disabled). Used by ``_propagate_memory_limit`` to
+        push the breakdown to schedulers so the prefill-rejection error
+        message can identify which constraint is binding and suggest the
+        right remedy. Single computation so the subprocess to ``sysctl``
+        (inside ``get_effective_metal_cap_bytes``) only fires once per
+        call.
+        """
         if not self._prefill_memory_guard:
-            return 0
-        candidates = [self._get_static_ceiling()]
+            return {"static": 0, "dynamic": 0, "metal_cap": 0, "hard_limit": 0}
+        static_ceiling = self._get_static_ceiling()
         if self._memory_guard_tier == "custom":
-            candidates.append(max(0, self._memory_guard_custom_ceiling_bytes))
+            dynamic_ceiling = max(0, self._memory_guard_custom_ceiling_bytes)
         else:
-            candidates.append(self._get_dynamic_ceiling())
+            dynamic_ceiling = self._get_dynamic_ceiling()
         metal_cap = self._get_effective_metal_cap_bytes()
+        candidates = [static_ceiling, dynamic_ceiling]
         if metal_cap > 0:
             candidates.append(metal_cap)
-        return min(candidates)
+        return {
+            "static": static_ceiling,
+            "dynamic": dynamic_ceiling,
+            "metal_cap": metal_cap,
+            "hard_limit": min(candidates),
+        }
 
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
@@ -774,10 +754,13 @@ class ProcessMemoryEnforcer:
         used = self._hot_cache_used_bytes()
         return min(max_bytes, used + _HOT_CACHE_RESERVATION_SLACK_BYTES)
 
-    def _scheduler_limit_bytes(self, process_limit: int) -> int:
+    def _scheduler_limit_bytes(
+        self, process_limit: int, *, reserved: int | None = None
+    ) -> int:
         if process_limit <= 0:
             return 0
-        reserved = self._hot_cache_reserved_bytes()
+        if reserved is None:
+            reserved = self._hot_cache_reserved_bytes()
         if reserved <= 0:
             return process_limit
         return max(1, process_limit - reserved)
@@ -915,15 +898,22 @@ class ProcessMemoryEnforcer:
         Called on every enforcer tick so the dynamic ceiling reaches the
         schedulers as fast as the poll interval allows.
         """
-        ceiling = self._get_hard_limit_bytes()
-        scheduler_ceiling = self._scheduler_limit_bytes(ceiling)
+        breakdown = self._get_ceiling_breakdown()
+        ceiling = breakdown["hard_limit"]
+        abort_limit = self._get_abort_limit_bytes()
+        hot_cache_reserved = (
+            self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
+        )
+        scheduler_ceiling = self._scheduler_limit_bytes(
+            ceiling, reserved=hot_cache_reserved
+        )
         soft_limit = (
             int(scheduler_ceiling * self._soft_threshold)
             if scheduler_ceiling > 0
             else 0
         )
         scheduler_abort_limit = self._scheduler_limit_bytes(
-            self._get_abort_limit_bytes()
+            abort_limit, reserved=hot_cache_reserved
         )
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
@@ -973,6 +963,20 @@ class ProcessMemoryEnforcer:
             scheduler._memory_hard_limit_bytes = scheduler_ceiling
             scheduler._memory_abort_limit_bytes = scheduler_abort_limit
             scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
+            # Propagate the component ceilings too so the rejection
+            # message in ``_preflight_memory_check`` can name the binding
+            # constraint and steer the user toward the right remedy
+            # (close apps for dynamic, raise sysctl for metal_cap, raise
+            # tier or reduce context for static).
+            scheduler._memory_static_ceiling_bytes = breakdown["static"]
+            scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
+            scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
+            scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
+            # Tier name disambiguates dynamic = computed reclaimable
+            # (safe/balanced/aggressive) from dynamic = user-pinned
+            # custom_ceiling_bytes (custom). The advice ladder needs
+            # the distinction to point at the right knob.
+            scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
@@ -1349,9 +1353,15 @@ class ProcessMemoryEnforcer:
         dynamic_ceiling = self._get_dynamic_ceiling() if self._running else 0
         current = self._current_usage_bytes() if self._running else 0
         hot_reserved = self._hot_cache_reserved_bytes() if self._running else 0
-        scheduler_ceiling = self._scheduler_limit_bytes(ceiling) if self._running else 0
+        scheduler_ceiling = (
+            self._scheduler_limit_bytes(ceiling, reserved=hot_reserved)
+            if self._running
+            else 0
+        )
         scheduler_abort = (
-            self._scheduler_limit_bytes(self._get_abort_limit_bytes())
+            self._scheduler_limit_bytes(
+                self._get_abort_limit_bytes(), reserved=hot_reserved
+            )
             if self._running
             else 0
         )

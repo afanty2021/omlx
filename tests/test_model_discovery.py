@@ -2,7 +2,6 @@
 """Tests for model discovery functionality."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -228,6 +227,26 @@ class TestDetectModelType:
         config = {
             "model_type": "cohere2_moe",
             "architectures": ["Cohere2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_minimax_m3_vl_as_vlm(self, tmp_path):
+        """MiniMax M3 VL is served by mlx-vlm."""
+        config = {
+            "model_type": "minimax_m3_vl",
+            "architectures": ["MiniMaxM3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1280},
+            "text_config": {"hidden_size": 6144},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_minimax_m3_text_as_vlm_native_text(self, tmp_path):
+        """MiniMax M3 text-only checkpoints are implemented by mlx-vlm."""
+        config = {
+            "model_type": "minimax_m3",
+            "architectures": ["MiniMaxM3ForCausalLM"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"

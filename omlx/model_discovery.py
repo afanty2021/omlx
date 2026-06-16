@@ -59,6 +59,7 @@ VLM_MODEL_TYPES = {
     "deepseekocr_2",
     "dots_ocr",
     "glm_ocr",
+    "minimax_m3_vl",
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
@@ -70,6 +71,7 @@ VLM_MODEL_TYPES = {
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
+    "minimax_m3",
 }
 
 # Known VLM architectures

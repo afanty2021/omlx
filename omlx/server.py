@@ -153,7 +153,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
-from .api.thinking import ThinkingParser, extract_thinking
+from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -171,6 +171,7 @@ from .api.utils import (
     extract_text_content,
     has_nonleading_system_message,
     prepare_system_messages_for_template,
+    uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
@@ -981,23 +982,23 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     # Import audio engine classes lazily so that oMLX without the [audio]
     # extra still imports this module.
     try:
-        from omlx.engine.stt import STTEngine
+        from omlx.engine.stt import STTEngine as stt_engine_cls
     except Exception:  # pragma: no cover - defensive
-        STTEngine = None  # type: ignore[assignment]
+        stt_engine_cls = None
     try:
-        from omlx.engine.tts import TTSEngine
+        from omlx.engine.tts import TTSEngine as tts_engine_cls
     except Exception:  # pragma: no cover - defensive
-        TTSEngine = None  # type: ignore[assignment]
+        tts_engine_cls = None
     try:
-        from omlx.engine.sts import STSEngine
+        from omlx.engine.sts import STSEngine as sts_engine_cls
     except Exception:  # pragma: no cover - defensive
-        STSEngine = None  # type: ignore[assignment]
+        sts_engine_cls = None
 
-    if STTEngine is not None and isinstance(engine, STTEngine):
+    if stt_engine_cls is not None and isinstance(engine, stt_engine_cls):
         return "Use /v1/audio/transcriptions for speech-to-text models."
-    if TTSEngine is not None and isinstance(engine, TTSEngine):
+    if tts_engine_cls is not None and isinstance(engine, tts_engine_cls):
         return "Use /v1/audio/speech for text-to-speech models."
-    if STSEngine is not None and isinstance(engine, STSEngine):
+    if sts_engine_cls is not None and isinstance(engine, sts_engine_cls):
         return "Use /v1/audio/process for speech-to-speech / audio processing models."
     if isinstance(engine, EmbeddingEngine):
         return "Use /v1/embeddings for embedding models."
@@ -1117,8 +1118,11 @@ def get_sampling_params(
     Get effective sampling parameters with per-model settings support.
 
     Priority:
-    - If force_sampling is True (global or model level): use forced values
-    - Otherwise: request > model settings > ocr_defaults > global defaults
+    - If force_sampling is True (global or model level): force sampling knobs
+      that affect token selection.
+    - max_tokens is an output length cap, so it always uses
+      request > model settings > ocr_defaults > global defaults.
+    - Otherwise: request > model settings > ocr_defaults > global defaults.
 
     Returns:
         tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
@@ -1226,23 +1230,16 @@ def get_sampling_params(
     else:
         frequency_penalty = 0.0
 
-    # Max tokens: same hierarchy as other params
-    if force:
-        if model_settings and model_settings.max_tokens is not None:
-            max_tokens = model_settings.max_tokens
-        elif ocr_defaults and "max_tokens" in ocr_defaults:
-            max_tokens = ocr_defaults["max_tokens"]
-        else:
-            max_tokens = global_sampling.max_tokens
+    # Max tokens is an output length cap, not a sampling knob. Honor request
+    # bounds even when force_sampling pins token-selection parameters.
+    if req_max_tokens is not None:
+        max_tokens = req_max_tokens
+    elif model_settings and model_settings.max_tokens is not None:
+        max_tokens = model_settings.max_tokens
+    elif ocr_defaults and "max_tokens" in ocr_defaults:
+        max_tokens = ocr_defaults["max_tokens"]
     else:
-        if req_max_tokens is not None:
-            max_tokens = req_max_tokens
-        elif model_settings and model_settings.max_tokens is not None:
-            max_tokens = model_settings.max_tokens
-        elif ocr_defaults and "max_tokens" in ocr_defaults:
-            max_tokens = ocr_defaults["max_tokens"]
-        else:
-            max_tokens = global_sampling.max_tokens
+        max_tokens = global_sampling.max_tokens
 
     # XTC probability: request > default (0.0 = disabled)
     xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
@@ -1270,6 +1267,20 @@ def get_sampling_params(
         xtc_probability,
         xtc_threshold,
     )
+
+
+def _strip_synthetic_think_prefix(chunk_text: str, think_tag: str) -> str:
+    """Drop the scheduler's synthetic think opener from a raw completions chunk.
+
+    Raw completions are a pure continuation of the prompt. When the prompt
+    itself ends with an open think tag, the scheduler still prepends a
+    synthetic ``"<think>\\n"`` to the first streamed chunk (chat streams rely
+    on it to rebuild the reasoning block), but the opener belongs to the
+    prompt and the non-streaming completions path never returns it. Stripping
+    it keeps both completion paths returning the same continuation.
+    """
+    prefix = f"{think_tag}\n"
+    return chunk_text[len(prefix) :] if chunk_text.startswith(prefix) else chunk_text
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -2728,9 +2739,11 @@ async def create_completion(
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
     # Validate context window for each prompt
+    prompt_token_ids_by_prompt = []
     for prompt in prompts:
-        num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        prompt_token_ids = list(engine.tokenizer.encode(prompt))
+        prompt_token_ids_by_prompt.append(prompt_token_ids)
+        validate_context_window(len(prompt_token_ids), request.model)
 
     # Pre-flight prefill memory guard — see create_chat_completion for
     # the reason this must precede any StreamingResponse return.
@@ -2745,7 +2758,11 @@ async def create_completion(
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_completion(
-                    engine, prompts[0], request, model_load_duration=model_load_duration
+                    engine,
+                    prompts[0],
+                    request,
+                    model_load_duration=model_load_duration,
+                    prompt_token_ids=prompt_token_ids_by_prompt[0],
                 ),
                 http_request=http_request,
                 keepalive_chunk=_resolve_keepalive("openai_completion"),
@@ -2946,7 +2963,18 @@ async def create_chat_completion(
     # get reasoning as a separate field; others fall back to <think> inlined
     # in content.
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
     is_vlm = isinstance(engine, VLMBatchedEngine)
     is_dflash_vlm = not is_vlm and getattr(
         engine, "supports_multimodal_fallback", False
@@ -3764,11 +3792,18 @@ async def stream_completion(
     prompt: str,
     request: CompletionRequest,
     model_load_duration: float = 0.0,
+    prompt_token_ids: list[int] | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
+    # Parity with the non-streaming path: when the prompt opens a thinking
+    # block, the first chunk carries the scheduler's synthetic think opener;
+    # strip it once so the stream is a pure continuation of the prompt.
+    pending_think_prefix_strip, think_tag = prompt_opens_thinking(
+        getattr(engine, "tokenizer", None), prompt, prompt_token_ids=prompt_token_ids
+    )
 
     (
         temperature,
@@ -3819,6 +3854,11 @@ async def stream_completion(
                 first_token_time = time.perf_counter()
             last_output = output
 
+            chunk_text = output.new_text
+            if pending_think_prefix_strip and chunk_text:
+                chunk_text = _strip_synthetic_think_prefix(chunk_text, think_tag)
+                pending_think_prefix_strip = False
+
             data = {
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
@@ -3827,7 +3867,7 @@ async def stream_completion(
                 "choices": [
                     {
                         "index": 0,
-                        "text": output.new_text,
+                        "text": chunk_text,
                         "finish_reason": (
                             output.finish_reason if output.finished else None
                         ),
@@ -4732,7 +4772,18 @@ async def create_anthropic_message(
         engine, "supports_multimodal_fallback", False
     )
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request,

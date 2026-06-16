@@ -7,14 +7,22 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 
 import json
 import logging
-import pytest
-
 from unittest.mock import MagicMock
 
+import pytest
+
+from omlx.api.openai_models import (
+    FunctionCall,
+    ResponseFormat,
+    ResponseFormatJsonSchema,
+    ToolCall,
+    ToolDefinition,
+)
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _gemma4_args_to_json_robust,
     _parse_gemma4_tool_call_fallback,
+    _remap_tool_call_names,
     _serialize_tool_call_arguments,
     build_json_system_prompt,
     convert_tools_for_template,
@@ -27,13 +35,6 @@ from omlx.api.tool_calling import (
     parse_tool_calls_with_thinking_fallback,
     restore_gemma4_param_names,
     validate_json_schema,
-)
-from omlx.api.openai_models import (
-    FunctionCall,
-    ResponseFormat,
-    ResponseFormatJsonSchema,
-    ToolCall,
-    ToolDefinition,
 )
 
 
@@ -579,6 +580,81 @@ class TestConvertToolsForTemplate:
             "properties": {},
         }
 
+    def test_missing_descriptions_are_template_safe(self):
+        """Missing function and parameter descriptions render under strict Jinja."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "filters": {
+                                "type": "object",
+                                "properties": {
+                                    "limit": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_for_template(tools)
+
+        assert result is not None
+        func = result[0]["function"]
+        assert func["description"] == ""
+        props = func["parameters"]["properties"]
+        assert props["query"]["description"] == ""
+        assert props["filters"]["description"] == ""
+        assert props["filters"]["properties"]["limit"]["description"] == ""
+
+        from jinja2 import Environment, StrictUndefined
+
+        template = Environment(undefined=StrictUndefined).from_string(
+            "{% for tool in tools %}"
+            "{% set tool = tool.function %}"
+            "{{ '// ' + tool.description }}"
+            "{% for param_name, param_spec in tool.parameters.properties.items() %}"
+            "{{ '// ' + param_spec.description }}"
+            "{% endfor %}"
+            "{% endfor %}"
+        )
+        template.render(tools=result)
+
+    def test_schema_defaults_do_not_mutate_input(self):
+        """Template safety normalization copies the input schema."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_for_template(tools)
+
+        assert result is not None
+        assert (
+            "description"
+            not in tools[0]["function"]["parameters"]["properties"]["query"]
+        )
+        assert (
+            result[0]["function"]["parameters"]["properties"]["query"]["description"]
+            == ""
+        )
+
 
 class TestFormatToolCallForMessage:
     """Tests for format_tool_call_for_message function."""
@@ -734,6 +810,14 @@ class TestToolCallStreamFilter:
         result = f.feed(
             'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> After'
         )
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_minimax_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """MiniMax M3 namespaced envelope suppression should not eat prose."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed('Before ]<]minimax[>[<tool_call><invoke name="x">')
+        result += f.feed("]<]minimax[>[</invoke>]<]minimax[>[</tool_call> After")
         result += f.finish()
         assert result == "Before  After"
 
@@ -1788,6 +1872,40 @@ class TestParseGemma4ToolCallFallback:
         assert result["name"] == "search"
         assert result["arguments"] == {"query": "hello world"}
 
+    def test_unbalanced_open_brace_in_json_string(self):
+        """A lone ``{`` inside a JSON string must not unbalance the span
+        (#1854). Before the string-aware scan this drove brace depth above
+        zero so the span never closed and the whole call was dropped."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:ns:create{"content": "open { brace"}'
+        )
+        assert result["name"] == "ns:create"
+        assert result["arguments"] == {"content": "open { brace"}
+
+    def test_multi_call_with_brace_in_first_args(self):
+        """A ``}`` inside the first call's JSON string must not corrupt the
+        consumed-span bookkeeping that separates sibling calls (#1854).
+        Pre-fix the first span truncated early, so the second call's head
+        landed inside the supposed-consumed region."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:ns:create{"a": "x } y"}call:foo{"b": 1}'
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["name"] == "ns:create"
+        assert result[0]["arguments"] == {"a": "x } y"}
+        assert result[1]["name"] == "foo"
+        assert result[1]["arguments"] == {"b": 1}
+
+    def test_escaped_backslash_before_closing_quote(self):
+        """A value ending in an escaped backslash (Windows path) closes on
+        the following quote, not on the backslash-escaped one (#1854)."""
+        result = _parse_gemma4_tool_call_fallback(
+            r'call:ns:create{"path": "C:\\tmp\\"}'
+        )
+        assert result["name"] == "ns:create"
+        assert result["arguments"] == {"path": "C:\\tmp\\"}
+
     def test_empty_args(self):
         result = _parse_gemma4_tool_call_fallback("call:get_time{}")
         assert result["name"] == "get_time"
@@ -1880,6 +1998,64 @@ class TestParseToolCallsGemma4Integration:
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
 
+    def test_brace_in_json_string_survives_remap(self):
+        """A ``}`` inside a JSON double-quoted value must not truncate the
+        args span, even when the parse then remaps onto a registered tool
+        (#1854). Before the fix the span scanner stopped at the brace inside
+        the string, the legacy recovery produced a corrupted ``{"content":
+        "has }`` parse, and the suffix remap turned ``ns:create`` into an
+        executable ``create`` call carrying silently mangled arguments. The
+        full content must round-trip intact."""
+        tok = self._make_gemma4_tokenizer()
+        tools = [{"type": "function", "function": {"name": "create"}}]
+        text = (
+            '<|tool_call>\n'
+            'call:ns:create{"content": "has } brace"}\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        # Remap fired: ns:create -> registered create.
+        assert tool_calls[0].function.name == "create"
+        # ...and the brace inside the string did not corrupt the value.
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["content"] == "has } brace"
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_escaped_quote_in_json_string_does_not_close_early(self):
+        """An escaped ``\\"`` inside a JSON value must not be read as the
+        closing quote, so a following ``}`` stays string content (#1854)."""
+        tok = self._make_gemma4_tokenizer()
+        tools = [{"type": "function", "function": {"name": "create"}}]
+        text = (
+            '<|tool_call>\n'
+            'call:ns:create{"content": "a \\" } b"}\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "create"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["content"] == 'a " } b'
+
+    def test_deep_standard_json_failure_strips_markers(self):
+        """Deep valid JSON args are dropped cleanly, not surfaced as 500s."""
+        tok = self._make_gemma4_tokenizer()
+        args = '{"a": ' * 80 + "1" + "}" * 80
+        text = f"<|tool_call>\ncall:ns:create{args}\n<tool_call|>"
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is None
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
     def test_markers_stripped_on_total_failure(self, caplog):
         """Even when fallback fails, markers are stripped and warning is logged."""
         tok = self._make_gemma4_tokenizer()
@@ -1931,6 +2107,294 @@ class TestParseToolCallsGemma4Integration:
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "search"
+
+
+class TestGemma4SingleQuotedArgs:
+    """Single-quoted and structurally hard Gemma 4 args (#1830).
+
+    Table-driven round-trips: each row is (rendered args, expected dict).
+    """
+
+    @pytest.mark.parametrize(
+        "rendered,expected",
+        [
+            # Issue #1830's reported shape: single-quoted values
+            (
+                "{filename: 'output.pdf', title: 'My Doc'}",
+                {"filename": "output.pdf", "title": "My Doc"},
+            ),
+            # Commas and colons inside a quoted value must not shred keys
+            (
+                "{content: 'a, b: and more', x: 1}",
+                {"content": "a, b: and more", "x": 1},
+            ),
+            # Braces inside a quoted value must not truncate or nest
+            (
+                "{content: 'has a { brace and } close'}",
+                {"content": "has a { brace and } close"},
+            ),
+            # Apostrophes inside a quoted value (anchored close)
+            (
+                "{msg: 'don't worry, be happy'}",
+                {"msg": "don't worry, be happy"},
+            ),
+            # Apostrophes in BARE values must not pair across values
+            (
+                "{a: it's ok, b: don't}",
+                {"a": "it's ok", "b": "don't"},
+            ),
+            # Brace inside a <|"|> string (gap vs mlx-lm's own regex)
+            (
+                '{a: <|"|>has a { brace<|"|>}',
+                {"a": "has a { brace"},
+            ),
+            # Arrays of quoted strings and of numbers
+            (
+                "{files: ['a.txt', 'b.txt'], counts: [1, 2]}",
+                {"files": ["a.txt", "b.txt"], "counts": [1, 2]},
+            ),
+            # Nested object with a quoted value containing a comma
+            (
+                "{opts: {size: 'a4, landscape', deep: {x: 1}}}",
+                {"opts": {"size": "a4, landscape", "deep": {"x": 1}}},
+            ),
+            # Mixed delimiter styles in one call
+            (
+                '{a: <|"|>x<|"|>, b: \'y\', c: bare, d: 5, e: true}',
+                {"a": "x", "b": "y", "c": "bare", "d": 5, "e": True},
+            ),
+            # Capitalized booleans normalize (models emit True/False)
+            ("{flag: True}", {"flag": True}),
+        ],
+    )
+    def test_round_trip(self, rendered, expected):
+        assert _gemma4_args_to_json_robust(rendered) == expected
+
+    def test_nul_bytes_cannot_forge_references(self):
+        """Literal NUL bytes in model output are data, not placeholders.
+
+        The previous implementation substituted \\x00N\\x00 placeholders for
+        captured strings; bare NULs in output forged those references and
+        cross-contaminated argument values.
+        """
+        result = _gemma4_args_to_json_robust(
+            '{a: <|"|>captured<|"|>, b: \x000\x00}'
+        )
+        assert result["a"] == "captured"
+        assert result["b"] == "\x000\x00"  # literal, NOT a copy of a
+
+    def test_deep_nesting_fails_cleanly(self):
+        """Depth bound surfaces as ValueError, never RecursionError.
+
+        RecursionError is a RuntimeError subclass that no except tuple in
+        the parse chain catches; it would escape as a 500.
+        """
+        deep = "call:f" + "{a: " * 80 + "1" + "}" * 80
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_deep_standard_json_nesting_fails_cleanly(self):
+        """Valid JSON args must not bypass the Gemma 4 depth bound."""
+        deep = "call:f" + '{"a": ' * 80 + "1" + "}" * 80
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_oversized_args_fail_cleanly(self):
+        """Args beyond the length cap are a clean no-match, not a hang."""
+        huge = "call:f{a: " + "x" * 300_000 + "}"
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(huge)
+
+    def test_issue_1830_exact_format(self):
+        """The reporter's namespaced-name + single-quoted-args emission."""
+        result = _parse_gemma4_tool_call_fallback(
+            "call:google:mcp:text_generation:create-pdf-file"
+            "{filename: 'output.pdf', title: 'Quarterly Report', "
+            "content: 'Revenue grew 12%, costs fell: margins improved. "
+            "Don't forget the appendix {tables}.'}"
+        )
+        assert result["name"] == "google:mcp:text_generation:create-pdf-file"
+        assert result["arguments"]["filename"] == "output.pdf"
+        assert result["arguments"]["title"] == "Quarterly Report"
+        assert result["arguments"]["content"] == (
+            "Revenue grew 12%, costs fell: margins improved. "
+            "Don't forget the appendix {tables}."
+        )
+
+    def test_call_inside_quoted_value_not_double_parsed(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:a{x: 1}\ncall:b{note: 'use call:c{y: 2} later'}"
+        )
+        assert isinstance(result, list)
+        assert [r["name"] for r in result] == ["a", "b"]
+        assert result[1]["arguments"]["note"] == "use call:c{y: 2} later"
+
+    def test_one_malformed_call_does_not_drop_siblings(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:bad{:::}\ncall:good{x: 1}"
+        )
+        assert result == {"name": "good", "arguments": {"x": 1}}
+
+
+class TestRemapToolCallNames:
+    """Tests for _remap_tool_call_names() (#1830)."""
+
+    @staticmethod
+    def _call(name):
+        return ToolCall(
+            id="call_test",
+            type="function",
+            function=FunctionCall(name=name, arguments="{}"),
+        )
+
+    @staticmethod
+    def _tools(*names):
+        return [{"type": "function", "function": {"name": n}} for n in names]
+
+    def test_namespaced_name_remaps_to_unique_suffix(self, caplog):
+        calls = [self._call("google:mcp:text_generation:create-pdf-file")]
+        with caplog.at_level(logging.INFO, logger="omlx.api.tool_calling"):
+            _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "create-pdf-file"
+        assert any("Remapped" in msg for msg in caplog.messages)
+
+    def test_exact_match_is_untouched(self):
+        calls = [self._call("tavily:search")]
+        _remap_tool_call_names(calls, self._tools("tavily:search", "search"))
+        assert calls[0].function.name == "tavily:search"
+
+    def test_ambiguous_suffixes_keep_verbatim(self):
+        """Two registered suffix candidates: refuse to guess."""
+        calls = [self._call("ns:text_generation:create-pdf-file")]
+        _remap_tool_call_names(
+            calls,
+            self._tools("text_generation:create-pdf-file", "create-pdf-file"),
+        )
+        assert calls[0].function.name == "ns:text_generation:create-pdf-file"
+
+    def test_endswith_attack_does_not_remap(self):
+        """Boundary-aligned matching: 'evilcreate-pdf-file' must not coerce
+        into 'create-pdf-file' (no ':' boundary), and neither must a
+        namespaced name whose last segment merely ENDS with a registered
+        name."""
+        calls = [self._call("evilcreate-pdf-file")]
+        _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "evilcreate-pdf-file"
+
+        calls = [self._call("evil:xcreate-pdf-file")]
+        _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "evil:xcreate-pdf-file"
+
+    def test_no_suffix_match_keeps_verbatim(self):
+        calls = [self._call("ns:unknown-tool")]
+        _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "ns:unknown-tool"
+
+    def test_no_tools_is_noop(self):
+        calls = [self._call("ns:create-pdf-file")]
+        _remap_tool_call_names(calls, None)
+        assert calls[0].function.name == "ns:create-pdf-file"
+        _remap_tool_call_names(calls, [])
+        assert calls[0].function.name == "ns:create-pdf-file"
+
+
+class TestParseToolCallsGemma4RealParser:
+    """E2e through parse_tool_calls with mlx-lm's REAL Gemma 4 parser.
+
+    Uses the real parser and real PAIRED markers (tool_call_end is
+    "<tool_call|>"; parse_tool_calls takes a different extraction branch
+    for paired vs one-sided markers, so a mock without the end marker
+    would test the wrong branch).  This also pins the dispatch contract:
+    if a future mlx-lm bump makes the native parser accept colon names,
+    test_native_parser_rejects_namespaced_names fails and tells us the
+    fallback is no longer exercised.
+    """
+
+    ISSUE_PAYLOAD = (
+        "call:google:mcp:text_generation:create-pdf-file"
+        "{filename: 'output.pdf', content: 'Revenue grew 12%, costs "
+        "fell: margins improved.'}"
+    )
+
+    @staticmethod
+    def _make_real_gemma4_tokenizer():
+        from mlx_lm.tool_parsers import gemma4 as mlx_gemma4
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = mlx_gemma4.tool_call_start
+        tok.tool_call_end = mlx_gemma4.tool_call_end
+        tok.tool_parser = mlx_gemma4.parse_tool_call
+        return tok
+
+    @staticmethod
+    def _pdf_tool():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "create-pdf-file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+    def test_native_parser_rejects_namespaced_names(self):
+        """Dispatch contract: mlx-lm's parser raises on colon names, which
+        is what routes #1830's emission into the oMLX fallback."""
+        from mlx_lm.tool_parsers import gemma4 as mlx_gemma4
+
+        with pytest.raises(ValueError):
+            mlx_gemma4.parse_tool_call(self.ISSUE_PAYLOAD)
+
+    def test_issue_1830_end_to_end(self):
+        """Marker-wrapped issue payload parses and remaps end to end."""
+        tok = self._make_real_gemma4_tokenizer()
+        text = (
+            f"{tok.tool_call_start}{self.ISSUE_PAYLOAD}{tok.tool_call_end}"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, self._pdf_tool())
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "create-pdf-file"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["filename"] == "output.pdf"
+        assert args["content"] == (
+            "Revenue grew 12%, costs fell: margins improved."
+        )
+        assert tok.tool_call_start not in cleaned
+        assert tok.tool_call_end not in cleaned
+
+    def test_thinking_path_promotes_remapped_call(self):
+        """Defect #4: a namespaced call in THINKING content must survive
+        extract_tool_calls_with_thinking's exact-name validity filter.
+        Without post-parse remapping, the filter silently drops the
+        cleanly parsed call because the emitted name matches no tool."""
+        tok = self._make_real_gemma4_tokenizer()
+        thinking = (
+            f"{tok.tool_call_start}"
+            "call:google:mcp:text_generation:create-pdf-file"
+            "{filename: 'output.pdf'}"
+            f"{tok.tool_call_end}"
+        )
+
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content=thinking,
+            regular_content="Some unrelated prose.",
+            tokenizer=tok,
+            tools=self._pdf_tool(),
+        )
+
+        assert extraction.tool_calls is not None
+        assert extraction.tool_calls[0].function.name == "create-pdf-file"
+        assert extraction.tool_calls_from_thinking
 
 
 class TestEnrichToolParamsForGemma4:

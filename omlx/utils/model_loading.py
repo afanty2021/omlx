@@ -159,6 +159,20 @@ def maybe_apply_pre_load_patches(
         if apply_mlx_vlm_diffusion_patch():
             logger.info("mlx-vlm diffusion patch applied for %s", model_name)
 
+    minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
+    if for_vlm and (
+        model_type in minimax_m3_types or text_model_type in minimax_m3_types
+    ):
+        from ..patches.minimax_m3_sparse_attention import (
+            apply_minimax_m3_sparse_attention_patch,
+        )
+
+        if apply_minimax_m3_sparse_attention_patch():
+            logger.info(
+                "MiniMax M3 sparse attention patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a

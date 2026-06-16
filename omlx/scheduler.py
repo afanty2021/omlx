@@ -19,13 +19,13 @@ import logging
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import (
@@ -411,7 +411,166 @@ class _PrefillState:
 # TEMPORARILY DISABLED: GenerationBatch not available in mlx-lm 0.31.2
 # TODO: Re-enable when mlx-lm adds GenerationBatch back or alternative is found
 # ---------------------------------------------------------------------------
-# NOTE: Re-enabled in mlx-lm commit dcbf6e3 - GenerationBatch is now available
+# NOTE: Re-enabled in mlx-lm commit 2c008fd (v0.31.3) - GenerationBatch is now available
+# Authoritative per-uid row state for the generation batch.
+#
+# mlx-lm keeps ``samplers`` / ``logits_processors`` as positional lists that
+# must stay aligned with ``uids``.  Heterogeneous continuous batching
+# (extend/filter/split across prompt and generation batches) can leave stale
+# or offset row slots behind; #1799 made the step crash-safe by normalising
+# ``None`` slots, but a misaligned row silently runs the WRONG sampler and
+# logits processors (e.g. a grammar/thinking-budget request decoding with no
+# constraints at all).  The registry below records, at insert time, what each
+# uid is supposed to run; the step chokepoint realigns the positional lists
+# from it.  Bounded so a missing cleanup can never grow it unbounded.
+class _RegisteredRow(NamedTuple):
+    """What a uid is supposed to run, recorded at request insert."""
+
+    sampler: Any
+    logits_processors: list
+
+
+_UID_ROW_REGISTRY_MAX = 4096
+# Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
+# instance starting at 0, so two engines serving concurrently (or an engine
+# reload) produce colliding uid sequences. The model object is the one
+# identity both the insert sites and the step chokepoint can see.
+_uid_row_registry: "OrderedDict[tuple[int, int], _RegisteredRow]" = OrderedDict()
+# Engines run on separate executor threads and share this module-level
+# registry; a plain OrderedDict is not safe under concurrent mutation.
+_uid_row_registry_lock = threading.Lock()
+# Drift corrections are worth one log line each, but a pathological batching
+# pattern could correct on every merge; cap the WARNING rate and route the
+# rest to DEBUG so the signal survives without flooding the logs.
+_UID_ROW_DRIFT_WARNING_INTERVAL_S = 60.0
+_uid_row_drift_last_warning = float("-inf")
+
+
+def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
+    """Record the sampler and logits processors each freshly-inserted uid must run.
+
+    Each (model, uid) key is inserted exactly once per request, so plain
+    insertion order is enough for the oldest-first backstop eviction.
+    """
+    with _uid_row_registry_lock:
+        for uid, sampler, lps in zip(uids, samplers, lps_rows):
+            _uid_row_registry[(id(model), uid)] = _RegisteredRow(
+                sampler, list(lps or ())
+            )
+        while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
+            _uid_row_registry.popitem(last=False)
+
+
+def _unregister_uid_row(model, uid) -> None:
+    """Drop a finished request's row so heavy processors are not pinned
+    until FIFO eviction; the bounded size stays as the backstop."""
+    with _uid_row_registry_lock:
+        _uid_row_registry.pop((id(model), uid), None)
+
+
+def _unregister_uid_rows_for_model(model) -> None:
+    """Drop every registry row for a model (generator reset, recovery, shutdown).
+
+    The recovery and reset paths clear the uid maps wholesale instead of
+    finishing requests one by one; releasing by model covers them, and leaves
+    nothing behind that a later engine load could match if ``id(model)`` were
+    recycled.
+    """
+    model_id = id(model)
+    with _uid_row_registry_lock:
+        for key in [key for key in _uid_row_registry if key[0] == model_id]:
+            del _uid_row_registry[key]
+
+
+def _row_drifted(current_lps, expected_lps) -> bool:
+    """True when a slot's processors genuinely differ from the registered row.
+
+    Two distinct empty lists are equivalent — the #1799 normalisation mints
+    fresh ``[]`` objects every step — so only differing content counts. The
+    caller's identity check is the steady-state fast path; this only runs
+    past it.
+    """
+    if not current_lps and not expected_lps:
+        return False
+    return current_lps != expected_lps
+
+
+def _log_drift_correction(uids, slot_count) -> None:
+    """Log a corrected drift: one WARNING per window, the rest at DEBUG."""
+    global _uid_row_drift_last_warning
+    now = time.monotonic()
+    rate_limited = now - _uid_row_drift_last_warning < _UID_ROW_DRIFT_WARNING_INTERVAL_S
+    if not rate_limited:
+        _uid_row_drift_last_warning = now
+    (logger.debug if rate_limited else logger.warning)(
+        "Realigned generation-batch row state from the uid registry "
+        f"(uids={list(uids)}, had {slot_count} processor slots); "
+        "stale or offset slots would have run the wrong sampler/processors."
+    )
+
+
+def _realigned_rows(model, uids, cur_samplers, cur_lps):
+    """Rebuild the positional row lists in uid order from the registry.
+
+    Registered uids take their recorded row; unregistered uids keep their
+    current slot (the #1799 fallback), padding when the lists are shorter
+    than ``uids``. Returns ``(samplers, logits_processors, drift)`` — drift
+    only drives logging, the rebuilt lists are always installed. In steady
+    state the slots already are the registry lists, so the identity check
+    skips any comparison work.
+    """
+    model_id = id(model)
+    with _uid_row_registry_lock:
+        rows = [_uid_row_registry.get((model_id, uid)) for uid in uids]
+
+    drift = len(cur_lps) != len(uids)
+    samplers, lps = [], []
+    for i, row in enumerate(rows):
+        if row is not None:
+            if not drift:
+                if i >= len(cur_samplers):
+                    drift = row.sampler is not None
+                elif cur_samplers[i] is not row.sampler:
+                    drift = True
+            if (
+                not drift
+                and i < len(cur_lps)
+                and cur_lps[i] is not row.logits_processors
+            ):
+                drift = _row_drifted(cur_lps[i], row.logits_processors)
+            samplers.append(row.sampler)
+            lps.append(row.logits_processors)
+        else:
+            samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
+            lps.append(cur_lps[i] if i < len(cur_lps) else [])
+    return samplers, lps, drift
+
+
+def _omlx_realign_generation_batch_rows(self) -> None:
+    """Realign positional row state with ``uids`` before any decode path reads it."""
+    if self.logits_processors is None:
+        self.logits_processors = []
+    else:
+        self.logits_processors = [
+            procs if procs is not None else [] for procs in self.logits_processors
+        ]
+
+    uids = getattr(self, "uids", None) or []
+    if not uids:
+        return
+
+    new_samplers, new_lps, drift = _realigned_rows(
+        getattr(self, "model", None),
+        uids,
+        getattr(self, "samplers", None) or [],
+        self.logits_processors,
+    )
+    if drift:
+        _log_drift_correction(uids, len(self.logits_processors))
+    self.logits_processors = new_lps
+    self.samplers = new_samplers
+
+
 _original_generation_batch_step = GenerationBatch._step
 
 
@@ -443,12 +602,7 @@ def _patched_generation_batch_step(self):
     # that is serving a structured json_schema request).  Per-row normalisation
     # at this chokepoint is the only place that covers both insert and merge.
     # See #934 / #1747.
-    if self.logits_processors is None:
-        self.logits_processors = []
-    else:
-        self.logits_processors = [
-            procs if procs is not None else [] for procs in self.logits_processors
-        ]
+    _omlx_realign_generation_batch_rows(self)
 
     result = _original_generation_batch_step(self)
 
@@ -474,6 +628,7 @@ def _patched_generation_batch_step(self):
     return result
 
 
+GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
 GenerationBatch._step = _patched_generation_batch_step
 
 
@@ -874,6 +1029,7 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
+        "MiniMaxM3KVCache",
     }
 )
 
@@ -1325,6 +1481,19 @@ class Scheduler:
         # executor thread. The background memory enforcer reads this cached
         # value during active decode instead of touching MLX/Metal directly.
         self._last_mlx_active_memory_bytes: int = 0
+        # Component ceilings — propagated alongside the hard limit so the
+        # rejection-path error message can identify which constraint is
+        # binding and suggest the right remedy (close apps / raise tier /
+        # raise iogpu.wired_limit_mb / reduce context). 0 = not set yet.
+        self._memory_static_ceiling_bytes: int = 0
+        self._memory_dynamic_ceiling_bytes: int = 0
+        self._memory_metal_cap_bytes: int = 0
+        self._memory_hot_cache_reserved_bytes: int = 0
+        # Tier name propagated alongside the breakdown. For ``custom`` the
+        # "dynamic" ceiling is the user-pinned ``custom_ceiling_bytes``
+        # rather than computed reclaimable memory, so the advice ladder
+        # must steer the user to that knob instead of "close other apps".
+        self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -1819,6 +1988,7 @@ class Scheduler:
                         e,
                     )
                 # Cleanup uid maps now that the slot is reclaimable.
+                _unregister_uid_row(self.model, uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 if request_id in self.request_id_to_uid:
@@ -2176,7 +2346,7 @@ class Scheduler:
         NOTE: Detokenizers are NOT pooled - each request gets a fresh instance
         to prevent state contamination that causes text corruption.
         """
-        detok = self._request_detokenizers.pop(request_id, None)
+        self._request_detokenizers.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
 
     def _get_output_parser_session(
@@ -2464,6 +2634,8 @@ class Scheduler:
                 "BatchTurboQuantKVCache",
             ):
                 return True
+            if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
+                return False
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
             return False
@@ -2483,9 +2655,7 @@ class Scheduler:
         from mlx_vlm.turboquant import TurboQuantKVCache
 
         kv_indices = [
-            i
-            for i, c in enumerate(prompt_cache)
-            if _is_turboquant_kv_family_cache(c)
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
@@ -2527,9 +2697,7 @@ class Scheduler:
         from mlx_vlm.turboquant import TurboQuantKVCache
 
         kv_indices = [
-            i
-            for i, c in enumerate(prompt_cache)
-            if _is_turboquant_kv_family_cache(c)
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
@@ -2626,9 +2794,6 @@ class Scheduler:
             block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
-        )
-        all_boundaries = (
-            boundary_enabled  # always stop at every boundary for hybrid models
         )
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
@@ -3745,8 +3910,8 @@ class Scheduler:
             logits_processors=[per_row_lps],
             state_machines=[state.sm],
         )
-
         if uids:
+            _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
@@ -4088,6 +4253,20 @@ class Scheduler:
             return None
         return getattr(factory, "thinking_end_text", None)
 
+    def _get_output_parser_thinking_start_text(self) -> str | None:
+        """Return parser-provided thinking open text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_text", None)
+
+    def _get_output_parser_thinking_start_output_text(self) -> str | None:
+        """Return normalized text to prepend when parser thinking starts in prompt."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_output_text", None)
+
     def _encode_thinking_marker(self, text: str) -> list[int] | None:
         """Encode a parser/tokenizer thinking marker into token IDs."""
         try:
@@ -4288,29 +4467,48 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
+        think_start_ids = None
         think_start_id = self._get_think_token_id("think_start_id")
-        if think_start_id is None:
+        if think_start_id is not None:
+            think_start_ids = [think_start_id]
+        else:
+            think_start_text = self._get_output_parser_thinking_start_text() or "<think>"
             try:
-                think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                if think_start_id == getattr(self.tokenizer, "unk_token_id", None):
-                    return False
+                token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
+                if (
+                    isinstance(token_id, int)
+                    and token_id != getattr(self.tokenizer, "unk_token_id", None)
+                ):
+                    think_start_ids = [token_id]
             except (AttributeError, KeyError, TypeError):
-                return False
+                think_start_ids = None
 
-        if not think_start_id or not request.prompt_token_ids:
+            if think_start_ids is None:
+                think_start_ids = self._encode_thinking_marker(think_start_text)
+
+        if not think_start_ids or not request.prompt_token_ids:
             return False
 
-        last_tokens = list(request.prompt_token_ids[-3:])
-        if think_start_id not in last_tokens:
+        lookback = max(3, len(think_start_ids) + 2)
+        last_tokens = list(request.prompt_token_ids[-lookback:])
+        last_idx = None
+        for idx in range(len(last_tokens) - len(think_start_ids), -1, -1):
+            if last_tokens[idx : idx + len(think_start_ids)] == think_start_ids:
+                last_idx = idx
+                break
+        if last_idx is None:
             return False
 
         # <think> found. Check if </think> follows it (disabled thinking pattern).
-        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
-        after_start = last_tokens[last_idx + 1 :]
+        after_start = last_tokens[last_idx + len(think_start_ids) :]
 
         if after_start:
             think_end_ids = self._resolve_think_end_token_ids()
-            if think_end_ids and think_end_ids[0] in after_start:
+            if think_end_ids and len(after_start) >= len(think_end_ids):
+                for idx in range(len(after_start) - len(think_end_ids) + 1):
+                    if after_start[idx : idx + len(think_end_ids)] == think_end_ids:
+                        return False
+            elif think_end_ids and think_end_ids[0] in after_start:
                 return False
 
         return True
@@ -4983,10 +5181,12 @@ class Scheduler:
 
                 # Determine cache type using registry if available
                 cache_type_name = class_name
+                handler = None
                 if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
                     try:
                         cache_type = CacheTypeRegistry.detect_cache_type(layer_cache)
                         cache_type_name = cache_type.value
+                        handler = CacheTypeRegistry.get_handler(cache_type)
                     except Exception:
                         pass
 
@@ -5041,8 +5241,15 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    state = layer_cache.state
-                    meta = getattr(layer_cache, "meta_state", ())
+                    if handler is not None and class_name in (
+                        "MiniMaxM3KVCache",
+                        "MiniMaxM3BatchKVCache",
+                    ):
+                        state = handler.serialize_state(layer_cache)
+                        meta = handler.serialize_meta_state(layer_cache)
+                    else:
+                        state = layer_cache.state
+                        meta = getattr(layer_cache, "meta_state", ())
 
                     if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
                         state, meta = self._normalize_rotating_snapshot_state(
@@ -6114,6 +6321,7 @@ class Scheduler:
                     close = getattr(mtp_state.generator, "close", None)
                     if callable(close):
                         close()
+            _unregister_uid_row(self.model, uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -6279,7 +6487,9 @@ class Scheduler:
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
-        # Reset batch generator only (cache is not corrupted)
+        # Reset batch generator only (cache is not corrupted). Every row dies
+        # with it; survivors re-register at re-insert.
+        _unregister_uid_rows_for_model(self.model)
         self.batch_generator = None
         self._current_sampler_params = None
         # Reclaim fragmented Metal buffers after generation failure.
@@ -6365,17 +6575,12 @@ class Scheduler:
                 requested_tokens=min(new_tokens, self.config.prefill_step_size),
                 reason="prefill_preflight",
             )
-            from .utils.hardware import format_bytes
 
-            usage_gb = current / (1024**3)
-            ceiling_gb = hard_limit / (1024**3)
-            message = (
-                f"Prefill would require ~{format_bytes(estimated)} peak "
-                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but ceiling is {format_bytes(hard_limit)} "
-                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                f"Reduce context length, free system memory, or loosen "
-                f"memory_guard_tier (safe → balanced → aggressive)."
+            message = self._format_rejection_message(
+                estimated=estimated,
+                current=current,
+                peak=peak,
+                hard_limit=hard_limit,
             )
             return _PreflightRejection(
                 message=message,
@@ -6401,6 +6606,101 @@ class Scheduler:
             )
             return safety_rejection
         return None
+
+    def _memory_component_limit_for_rejection(self, component_limit: int) -> int:
+        if component_limit <= 0:
+            return 0
+        hot_reserved = max(0, int(self._memory_hot_cache_reserved_bytes or 0))
+        if hot_reserved <= 0:
+            return component_limit
+        return max(1, component_limit - hot_reserved)
+
+    def _format_rejection_message(
+        self,
+        *,
+        estimated: int,
+        current: int,
+        peak: int,
+        hard_limit: int,
+    ) -> str:
+        """Build the prefill-rejection diagnostic.
+
+        Identifies which of static / dynamic / metal_cap is binding so the
+        message can steer the user to the right remedy (close apps for
+        dynamic, raise sysctl for metal_cap, raise tier or reduce context
+        for static). Component ceilings are propagated by
+        ``ProcessMemoryEnforcer._propagate_memory_limit``; if a caller
+        wired this scheduler outside that path the components stay 0 and
+        we fall back to a generic message.
+        """
+        from .utils.hardware import format_bytes
+
+        static = self._memory_static_ceiling_bytes
+        dynamic = self._memory_dynamic_ceiling_bytes
+        metal_cap = self._memory_metal_cap_bytes
+
+        binding: list[str] = []
+        if static and self._memory_component_limit_for_rejection(static) == hard_limit:
+            binding.append("static")
+        if (
+            dynamic
+            and self._memory_component_limit_for_rejection(dynamic) == hard_limit
+        ):
+            binding.append("dynamic")
+        if (
+            metal_cap
+            and self._memory_component_limit_for_rejection(metal_cap) == hard_limit
+        ):
+            binding.append("metal_cap")
+        binding_str = "/".join(binding) if binding else "effective"
+
+        # Order remedies by likelihood of helping for the binding cause.
+        # Dynamic-bound on a reclaim tier (safe/balanced/aggressive) means
+        # reclaimable memory is low right now even though the static cap
+        # has room — closing apps raises ``free`` / ``inactive`` and a
+        # more aggressive ``memory_guard_tier`` raises the active-reclaim
+        # ratio. Dynamic-bound under ``custom`` means the user pinned the
+        # ceiling there; the only knob that helps is raising
+        # ``custom_ceiling_bytes`` itself. Metal-cap bound means the
+        # kernel sysctl is the ceiling, so raising ``iogpu.wired_limit_mb``
+        # is the only knob that helps. Static-bound (or no breakdown
+        # available) leaves ``memory_guard_tier`` / context length as the
+        # levers.
+        is_custom = self._memory_guard_tier == "custom"
+        if "dynamic" in binding and is_custom:
+            advice = (
+                f"raise custom_ceiling_bytes in admin Memory settings "
+                f"(currently pinned at {format_bytes(dynamic)}), "
+                f"or reduce context length"
+            )
+        elif "dynamic" in binding and static and static > dynamic:
+            headroom = max(0, dynamic - current)
+            advice = (
+                f"close other apps to free RAM "
+                f"(static cap is {format_bytes(static)} but only "
+                f"{format_bytes(headroom)} is reclaimable right now), "
+                f"raise memory_guard_tier (safe → balanced → aggressive), "
+                f"or reduce context length"
+            )
+        elif "metal_cap" in binding:
+            advice = (
+                f"raise kernel iogpu.wired_limit_mb in Terminal "
+                f"(currently caps Metal at {format_bytes(metal_cap)}), "
+                f"or reduce context length"
+            )
+        else:
+            advice = (
+                "reduce context length or raise memory_guard_tier "
+                "(safe → balanced → aggressive)"
+            )
+        advice = advice[:1].upper() + advice[1:]
+
+        return (
+            f"Prefill would require ~{format_bytes(estimated)} peak "
+            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+            f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
+            f"{advice}."
+        )
 
     def preflight_or_raise(
         self,
@@ -6445,17 +6745,11 @@ class Scheduler:
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
         if current + peak > self._memory_hard_limit_bytes:
-            from .utils.hardware import format_bytes
-
-            usage_gb = current / (1024**3)
-            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
-            message = (
-                f"Prefill would require ~{format_bytes(current + peak)} peak "
-                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
-                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                f"Reduce context length, free system memory, or loosen "
-                f"memory_guard_tier (safe → balanced → aggressive)."
+            message = self._format_rejection_message(
+                estimated=current + peak,
+                current=current,
+                peak=peak,
+                hard_limit=self._memory_hard_limit_bytes,
             )
 
             logger.warning(
@@ -6989,9 +7283,9 @@ class Scheduler:
                     # Phase 2: conversation sparse prefill
                     conv_tokens = all_tokens[sys_count:]
                     selected = request.specprefill_indices
-                    M = len(conv_tokens)
+                    conv_len = len(conv_tokens)
                     pos_offset = request.specprefill_position_offset
-                    last_idx = M - 1
+                    last_idx = conv_len - 1
 
                     # Remove last token from selected set — BatchGenerator
                     # will process it separately for generation kickoff.
@@ -7010,11 +7304,11 @@ class Scheduler:
                             phase="specprefill_sparse",
                             detail="sparse target prefill",
                             extra={
-                                "scored_tokens": M,
+                                "scored_tokens": conv_len,
                                 "selected_tokens": int(selected.shape[0]),
                                 "keep_percent": (
-                                    round(int(selected.shape[0]) / M * 100)
-                                    if M > 0
+                                    round(int(selected.shape[0]) / conv_len * 100)
+                                    if conv_len > 0
                                     else 0
                                 ),
                                 "prompt_tokens": request.num_prompt_tokens,
@@ -7035,7 +7329,7 @@ class Scheduler:
                         progress_callback=_sparse_progress,
                     )
                     # sparse_prefill installs _OffsetAdjustedRoPE with
-                    # adjustment = M - N'. Subtract 1 to account for the
+                    # adjustment = conv_len - selected_len'. Subtract 1 to account for the
                     # extra token BatchGenerator will process.
                     for _, layer in _find_attention_layers(self.model):
                         attn = _get_attn_module(layer)
@@ -7046,14 +7340,14 @@ class Scheduler:
                         ):
                             attn.rope._adjustment -= 1
 
-                    N = int(selected.shape[0])
+                    selected_len = int(selected.shape[0])
                     t_prefill = time.monotonic() - t0
                     total_prompt = request.num_prompt_tokens
                     cached = request.cached_tokens
                     logger.info(
-                        f"SpecPrefill: sparse prefill {N}/{M} conv tokens in {t_prefill:.1f}s "
+                        f"SpecPrefill: sparse prefill {selected_len}/{conv_len} conv tokens in {t_prefill:.1f}s "
                         f"(total {total_prompt}, cached {cached}, "
-                        f"system {sys_count} full, conv {M} sparse)"
+                        f"system {sys_count} full, conv {conv_len} sparse)"
                     )
 
                     # Set up request as if we had a prefix cache hit
@@ -7339,8 +7633,8 @@ class Scheduler:
                 logits_processors=[per_row_lps],
                 state_machines=[sm],
             )
-
             if uids:
+                _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
@@ -7480,12 +7774,23 @@ class Scheduler:
                             new_text = ""
                         break
 
-            # Prepend <think> tag for first chunk if this is a reasoning model
-            # (skip when a protocol parser already manages reasoning formatting)
-            if parser_session is None and getattr(request, "needs_think_prefix", False):
+            # Prepend <think> tag for first chunk if this is a reasoning model.
+            # Protocol parsers may expose a normalized prefix when their prompt
+            # uses a model-specific open-think marker (e.g. MiniMax <mm:think>).
+            if getattr(request, "needs_think_prefix", False):
                 if not getattr(request, "think_prefix_sent", False):
-                    think_tag = getattr(self.tokenizer, "think_start", "<think>")
-                    new_text = think_tag + "\n" + new_text
+                    if parser_session is None:
+                        think_tag = getattr(self.tokenizer, "think_start", "<think>")
+                        prefix_text = think_tag + "\n"
+                    else:
+                        prefix_text = (
+                            self._get_output_parser_thinking_start_output_text()
+                            or ""
+                        )
+                    if prefix_text:
+                        new_text = prefix_text + new_text
+                        if parser_session is not None:
+                            request.output_text = prefix_text + request.output_text
                     request.think_prefix_sent = True
 
             # Immediately discard logprobs if not requested to free memory (~800KB per response)
@@ -7907,6 +8212,7 @@ class Scheduler:
                     self._remove_uid_from_active_batch(uid)
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
+                    _unregister_uid_row(self.model, uid)
                     if uid in self.uid_to_request_id:
                         del self.uid_to_request_id[uid]
                     del self.request_id_to_uid[request_id]
@@ -8024,6 +8330,7 @@ class Scheduler:
         self._cache_rate_tracker.clear()
 
         # Clear UID mappings
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
 
@@ -8053,6 +8360,7 @@ class Scheduler:
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._deferred_clear_at = None
@@ -8594,6 +8902,7 @@ class Scheduler:
         self.running.clear()
         self.requests.clear()
         self.finished_req_ids.clear()
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._generation_overflow_recovery_ids.clear()
@@ -8708,6 +9017,9 @@ class Scheduler:
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
+        # Release whatever the per-path unregisters did not reach, so nothing
+        # survives this engine in the module-level row registry.
+        _unregister_uid_rows_for_model(self.model)
         logger.info("Scheduler shutdown completed")
 
     def adjust_store_cache_cap(self, pressure_level: str) -> None:
@@ -8852,8 +9164,7 @@ class Scheduler:
                     self._turboquant_eligible(cache_list_for_tq)
                     if cache_list_for_tq is not None
                     else not (
-                        self._model_uses_mla()
-                        or self._model_uses_attention_sinks()
+                        self._model_uses_mla() or self._model_uses_attention_sinks()
                     )
                 )
             ):
@@ -8947,9 +9258,7 @@ class Scheduler:
             return layer_cache_types
 
         kv_indices = [
-            i
-            for i, c in enumerate(cache_list)
-            if _is_turboquant_kv_family_cache(c)
+            i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1

@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.4rc1.tar.gz"
-  sha256 "0adaa65c1900f3bc1b3f9fb3ac7a288991495968477e4ebeea18e831b994f448"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.4rc2.tar.gz"
+  sha256 "5ed909d88ee9abc2a58c0f13201d501138868430774c5be569614c1d29a153d6"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -10,9 +10,9 @@ class Omlx < Formula
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
-  depends_on "python@3.11"
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
+  depends_on "python@3.11"
 
   # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
   # mlx-lm. Fetch source separately so we can patch the pin before install.
@@ -76,7 +76,7 @@ class Omlx < Formula
   # write to RECORD inside `def install` is wiped before the user
   # sees it.
   def post_install
-    return unless build.with?("grammar")
+    return if build.without?("grammar")
 
     ohai "Patching xgrammar macOS arm64 wheel"
     py = libexec/"bin/python"

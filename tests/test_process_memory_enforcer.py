@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import omlx.process_memory_enforcer as pme
+import omlx.utils.psutil_compat as psutil_compat
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
@@ -19,14 +20,19 @@ def _make_enforcer(
     poll_interval: float = 0.1,
     soft_threshold: float = 1.0,
     hard_threshold: float = 1.0,
+    breakdown: dict | None = None,
     **kwargs,
 ) -> ProcessMemoryEnforcer:
     """Build an enforcer with a deterministic hard ceiling.
 
     The new enforcer derives its ceiling from system_memory + tier +
-    psutil.virtual_memory().available, which is impractical to mock per
-    test. We replace `_get_hard_limit_bytes` with a constant so tests can
-    exercise the watermark logic without juggling system mocks.
+    live available memory, which is impractical to mock per
+    test. We replace `_get_hard_limit_bytes` AND `_get_ceiling_breakdown`
+    with constants so tests can exercise the watermark logic without
+    juggling system mocks. Pass ``breakdown`` to distinguish the three
+    component ceilings (static/dynamic/metal_cap) for propagation tests;
+    omit to use the same ``ceiling`` for all three (equivalent old
+    behavior).
 
     Passing `ceiling=0` disables the limit.
     """
@@ -39,6 +45,14 @@ def _make_enforcer(
         **kwargs,
     )
     enforcer._get_hard_limit_bytes = lambda: int(ceiling)
+    if breakdown is None:
+        breakdown = {
+            "static": int(ceiling),
+            "dynamic": int(ceiling),
+            "metal_cap": int(ceiling),
+            "hard_limit": int(ceiling),
+        }
+    enforcer._get_ceiling_breakdown = lambda: dict(breakdown)
     return enforcer
 
 
@@ -94,8 +108,8 @@ class TestMacOSVMStats:
         class FakeLibc:
             def host_statistics64(self, host, flavor, stats, count):
                 assert host == 123
-                assert flavor == pme._HOST_VM_INFO64
-                assert count._obj.value == pme._HOST_INFO64_MAX_COUNT
+                assert flavor == psutil_compat._HOST_VM_INFO64
+                assert count._obj.value == psutil_compat._HOST_INFO64_MAX_COUNT
                 stats[0] = 10
                 stats[1] = 20
                 stats[2] = 30
@@ -104,9 +118,9 @@ class TestMacOSVMStats:
                 return 0
 
         with (
-            patch.object(pme, "_libc", FakeLibc()),
-            patch.object(pme, "_MACH_HOST", 123),
-            patch.object(pme, "_VM_PAGE_SIZE", 4096),
+            patch.object(psutil_compat, "_libc", FakeLibc()),
+            patch.object(psutil_compat, "_MACH_HOST", 123),
+            patch.object(psutil_compat, "_VM_PAGE_SIZE", 4096),
         ):
             stats = pme.get_macos_vm_stats()
 
@@ -124,8 +138,8 @@ class TestMacOSVMStats:
                 return 0
 
         with (
-            patch.object(pme, "_libc", FakeLibc()),
-            patch.object(pme, "_MACH_HOST", 123),
+            patch.object(psutil_compat, "_libc", FakeLibc()),
+            patch.object(psutil_compat, "_MACH_HOST", 123),
         ):
             assert pme.get_macos_vm_stats() is None
 
@@ -523,7 +537,16 @@ class TestDisabledWhenCeilingZero:
     @pytest.mark.asyncio
     async def test_propagate_zero_disables_inline_prefill_check(self, mock_engine_pool):
         """Propagating ceiling=0 sets scheduler limit to 0 (disabled)."""
-        enforcer = _make_enforcer(mock_engine_pool, ceiling=0)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=0,
+            breakdown={
+                "static": 0,
+                "dynamic": 0,
+                "metal_cap": 0,
+                "hard_limit": 0,
+            },
+        )
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 999
         bg._memory_hard_limit_bytes = 999
@@ -542,6 +565,96 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_hard_limit_bytes == 0
         assert bg._memory_limit_bytes == 0
         assert bg._memory_hard_limit_bytes == 0
+
+    @pytest.mark.asyncio
+    async def test_propagate_ceiling_components_to_scheduler(self, mock_engine_pool):
+        """All three component ceilings + the tier name must reach the
+        scheduler so the binding-aware rejection message has the inputs
+        it needs to identify which knob the operator should turn."""
+        static_b = 64 * 1024**3
+        dynamic_b = 16 * 1024**3
+        metal_b = 48 * 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            tier="custom",
+            ceiling=min(static_b, dynamic_b, metal_b),
+            breakdown={
+                "static": static_b,
+                "dynamic": dynamic_b,
+                "metal_cap": metal_b,
+                "hard_limit": min(static_b, dynamic_b, metal_b),
+            },
+        )
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_static_ceiling_bytes = 0
+        scheduler._memory_dynamic_ceiling_bytes = 0
+        scheduler._memory_metal_cap_bytes = 0
+        scheduler._memory_guard_tier = "balanced"
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_static_ceiling_bytes == static_b
+        assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
+        assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_hot_cache_reserved_bytes == 0
+        assert scheduler._memory_guard_tier == "custom", (
+            "tier name must reach the scheduler so the advice ladder can "
+            "distinguish dynamic-on-custom (raise custom_ceiling_bytes) "
+            "from dynamic-on-reclaim-tier (close other apps)"
+        )
+        assert (
+            scheduler._memory_hard_limit_bytes == dynamic_b
+        ), "hard limit must be min of the three components"
+
+    @pytest.mark.asyncio
+    async def test_propagates_hot_cache_reservation_for_binding_messages(
+        self, mock_engine_pool
+    ):
+        """The scheduler hard limit subtracts hot-cache reservation, so the
+        rejection formatter needs the same reservation to identify which
+        original component is binding."""
+        static_b = 64 * 1024**3
+        dynamic_b = 32 * 1024**3
+        metal_b = 16 * 1024**3
+        hot_reserved_b = 2 * 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=metal_b,
+            breakdown={
+                "static": static_b,
+                "dynamic": dynamic_b,
+                "metal_cap": metal_b,
+                "hard_limit": metal_b,
+            },
+        )
+        enforcer._hot_cache_reserved_bytes = lambda: hot_reserved_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_static_ceiling_bytes = 0
+        scheduler._memory_dynamic_ceiling_bytes = 0
+        scheduler._memory_metal_cap_bytes = 0
+        scheduler._memory_hot_cache_reserved_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hard_limit_bytes == metal_b - hot_reserved_b
+        assert scheduler._memory_static_ceiling_bytes == static_b
+        assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
+        assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
 
 
 class TestPrefillMemoryGuardToggle:
@@ -710,12 +823,11 @@ class TestDynamicCeilingActiveRatio:
         expected = 1 * 1024**3 + 10 * 1024**3 + 4 * 1024**3 + int(8 * 1024**3 * ratio)
         assert result == expected
 
-    def test_non_macos_falls_back_to_psutil_available(self, mock_engine_pool):
+    def test_non_macos_falls_back_to_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
         with (
-            patch("omlx.process_memory_enforcer.sys.platform", "linux"),
             patch(
                 "omlx.process_memory_enforcer.get_phys_footprint",
                 return_value=2 * 1024**3,
@@ -724,18 +836,20 @@ class TestDynamicCeilingActiveRatio:
                 "omlx.process_memory_enforcer.get_macos_vm_stats",
                 return_value=None,
             ),
-            patch("omlx.process_memory_enforcer.psutil") as mock_psutil,
+            patch(
+                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
+                return_value=SimpleNamespace(available=15 * 1024**3),
+            ) as mock_virtual_memory,
         ):
-            mock_psutil.virtual_memory.return_value.available = 15 * 1024**3
             result = enforcer._get_dynamic_ceiling()
         assert result == 2 * 1024**3 + 15 * 1024**3
+        mock_virtual_memory.assert_called_once()
 
-    def test_macos_vm_stat_failure_uses_static_ceiling(self, mock_engine_pool):
+    def test_macos_vm_stat_failure_uses_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
         with (
-            patch("omlx.process_memory_enforcer.sys.platform", "darwin"),
             patch(
                 "omlx.process_memory_enforcer.get_phys_footprint",
                 return_value=2 * 1024**3,
@@ -745,21 +859,20 @@ class TestDynamicCeilingActiveRatio:
                 return_value=None,
             ),
             patch(
-                "omlx.process_memory_enforcer.psutil.virtual_memory"
+                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
+                return_value=SimpleNamespace(available=15 * 1024**3),
             ) as mock_virtual_memory,
-            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
         ):
             result = enforcer._get_dynamic_ceiling()
 
-        assert result == 58 * 1024**3
-        mock_virtual_memory.assert_not_called()
+        assert result == 2 * 1024**3 + 15 * 1024**3
+        mock_virtual_memory.assert_called_once()
 
-    def test_psutil_failure_falls_back_to_static_ceiling(self, mock_engine_pool):
+    def test_compat_failure_falls_back_to_static_ceiling(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
         with (
-            patch("omlx.process_memory_enforcer.sys.platform", "linux"),
             patch(
                 "omlx.process_memory_enforcer.get_phys_footprint",
                 return_value=2 * 1024**3,
@@ -769,7 +882,7 @@ class TestDynamicCeilingActiveRatio:
                 return_value=None,
             ),
             patch(
-                "omlx.process_memory_enforcer.psutil.virtual_memory",
+                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
                 side_effect=RuntimeError(
                     "host_statistics64(HOST_VM_INFO64) syscall failed"
                 ),
@@ -948,13 +1061,13 @@ class TestAbortLimitCalculation:
             # aggressive reserve = 4 GB → static = 44 GB
             assert enforcer._get_abort_limit_bytes() == 44 * 1024**3
 
-    def test_zero_when_guard_disabled(self, mock_engine_pool):
+    def test_abort_limit_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, prefill_memory_guard=False
         )
         assert enforcer._get_abort_limit_bytes() == 0
 
-    def test_zero_when_guard_disabled(self, mock_engine_pool):
+    def test_hard_limit_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
             memory_guard_tier="balanced",
@@ -1347,12 +1460,21 @@ class TestMemoryLimitPropagation:
         enforcer._engine_pool._entries = {"model-a": entry}
 
         enforcer._running = True
-        # Simulate the ceiling shrinking after the tier flip.
-        enforcer._get_hard_limit_bytes = lambda: 20 * 1024**3
+        # Simulate the ceiling shrinking after the tier flip. The new
+        # propagation path reads from ``_get_ceiling_breakdown``, not
+        # ``_get_hard_limit_bytes`` — patch both for completeness.
+        new_ceiling = 20 * 1024**3
+        enforcer._get_hard_limit_bytes = lambda: new_ceiling
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": new_ceiling,
+            "dynamic": new_ceiling,
+            "metal_cap": new_ceiling,
+            "hard_limit": new_ceiling,
+        }
         enforcer.memory_guard_tier = "safe"
 
-        assert scheduler._memory_limit_bytes == 20 * 1024**3
-        assert bg._memory_limit_bytes == 20 * 1024**3
+        assert scheduler._memory_limit_bytes == new_ceiling
+        assert bg._memory_limit_bytes == new_ceiling
 
     def test_skips_engine_without_scheduler(self, enforcer):
         """Gracefully skips engines without scheduler attribute."""

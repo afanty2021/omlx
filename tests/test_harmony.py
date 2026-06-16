@@ -332,6 +332,21 @@ class TestParseToolCallsFromTokens:
         assert analysis_text == ""
         assert "Hello world" in output_text
 
+    def test_unknown_channel_without_recipient_falls_back_to_final(self, encoding):
+        """Malformed channel names without recipients remain visible."""
+        tokens = encoding.encode(
+            "<|channel|>mardown<|message|>visible text<|return|>",
+            allowed_special="all",
+        )
+
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+
+        assert "visible text" in output_text
+        assert analysis_text == ""
+        assert tool_calls == []
+
     def test_does_not_prepend_duplicate_start_header(self, encoding):
         """Budget-forced Harmony completions may already include the start header."""
         tokens = encoding.encode(

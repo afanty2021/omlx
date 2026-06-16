@@ -47,8 +47,8 @@ def get_system_memory() -> int:
     """
     Return total system RAM in bytes.
 
-    Uses os.sysconf first so macOS does not depend on psutil's VM stats
-    adapter, which can lag new HOST_VM_INFO64 layouts.
+    Uses os.sysconf first, then psutil_compat so macOS does not depend on
+    psutil's VM stats adapter, which can lag new HOST_VM_INFO64 layouts.
 
     Returns:
         Total RAM in bytes.
@@ -63,13 +63,13 @@ def get_system_memory() -> int:
         pass
 
     try:
-        import psutil
+        from .utils import psutil_compat
 
-        return psutil.virtual_memory().total
-    except ImportError:
-        pass
+        memory = int(psutil_compat.get_total_memory())
+        if memory > 0:
+            return memory
     except Exception as exc:  # noqa: BLE001
-        logger.warning("psutil failed to detect system memory: %s", exc)
+        logger.warning("psutil_compat failed to detect system memory: %s", exc)
 
     # Default to 16GB if detection fails
     logger.warning("Could not detect system memory, defaulting to 16GB")

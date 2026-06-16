@@ -1614,13 +1614,8 @@ class TestHelperFunctions:
         memory = get_system_memory()
         assert isinstance(memory, int)
 
-    def test_get_system_memory_uses_sysconf_before_psutil(self):
+    def test_get_system_memory_uses_sysconf_before_compat(self):
         """macOS should not depend on psutil's HOST_VM_INFO64 adapter."""
-
-        class BrokenPsutil:
-            @staticmethod
-            def virtual_memory():
-                raise RuntimeError("host_statistics64 failed")
 
         def fake_sysconf(name):
             if name == "SC_PHYS_PAGES":
@@ -1630,23 +1625,21 @@ class TestHelperFunctions:
             raise ValueError(name)
 
         with (
-            patch.dict("sys.modules", {"psutil": BrokenPsutil}),
             patch("omlx.settings.os.sysconf", side_effect=fake_sysconf),
+            patch(
+                "omlx.utils.psutil_compat.get_total_memory",
+                side_effect=AssertionError("compat should not be called"),
+            ),
         ):
             assert get_system_memory() == 123 * 4096
 
-    def test_get_system_memory_falls_back_to_psutil_when_sysconf_fails(self):
-        class FakeVirtualMemory:
-            total = 32 * 1024**3
-
-        class FakePsutil:
-            @staticmethod
-            def virtual_memory():
-                return FakeVirtualMemory()
-
+    def test_get_system_memory_falls_back_to_compat_when_sysconf_fails(self):
         with (
-            patch.dict("sys.modules", {"psutil": FakePsutil}),
             patch("omlx.settings.os.sysconf", side_effect=ValueError("unsupported")),
+            patch(
+                "omlx.utils.psutil_compat.get_total_memory",
+                return_value=32 * 1024**3,
+            ),
         ):
             assert get_system_memory() == 32 * 1024**3
 

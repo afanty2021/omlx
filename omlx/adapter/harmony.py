@@ -55,6 +55,11 @@ _HARMONY_SPECIAL_TOKENS = [
 ]
 
 
+def _has_no_real_recipient(recipient: str | None) -> bool:
+    """Return True when the parser only preserved the primed assistant header."""
+    return recipient is None or recipient == "<|start|>assistant"
+
+
 @lru_cache(maxsize=1)
 def load_harmony_gpt_oss_encoding() -> HarmonyEncoding:
     """Load the Harmony gpt-oss encoding with a small retry window."""
@@ -305,6 +310,12 @@ class HarmonyStreamingParser:
             # Channel not yet determined (still in header parsing)
             # Buffer token but don't stream
             return control_text, None, None, is_stop
+        elif channel != "commentary" and _has_no_real_recipient(
+            self._parser.current_recipient
+        ):
+            # Some fine-tunes emit misspelled channels (for example "mardown").
+            # If there is no recipient, preserve the text as user-visible output.
+            return control_text, token_id, token_id, is_stop
         else:
             # commentary etc: buffer only (for tool calls)
             return control_text, None, None, is_stop
@@ -468,6 +479,14 @@ def parse_tool_calls_from_tokens(
                     if isinstance(text, str):
                         arguments += text
                 tool_calls.append({"name": name, "arguments": arguments})
+
+            elif msg.channel != "commentary" and _has_no_real_recipient(msg.recipient):
+                # Preserve malformed/unknown assistant channels as visible text
+                # instead of returning an empty assistant message.
+                for content in msg_content:
+                    text = getattr(content, "text", None)
+                    if isinstance(text, str):
+                        output_text += text
 
         return output_text, analysis_text, tool_calls
 

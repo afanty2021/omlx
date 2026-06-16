@@ -79,9 +79,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit (5a4222a, main) - includes DiffusionGemma support
-    # plus prior Gemma4/Qwen/Qwen3-VL/Phi VLM fixes.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@5a4222a15c70cb3725179d591442b1fbe1044b60",
+    # mlx-vlm from PR #1374 commit (086ab9d, minimax-m3-support)
+    # includes MiniMax M3 plus prior DiffusionGemma/Gemma4/Qwen VLM fixes.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@086ab9d5d575fec64d8d8ad907ce000007c25c1a",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
     # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.

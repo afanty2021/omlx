@@ -6,17 +6,15 @@ This module tests the block-aware prefix caching system that uses
 PagedCacheManager for block-based storage with SSD persistence.
 """
 
+import sys
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch, PropertyMock
+import types
+from unittest.mock import MagicMock
 
 import pytest
 
 from omlx.cache.paged_cache import (
-    BlockHash,
     BlockTable,
-    CacheBlock,
     PagedCacheManager,
     compute_block_hash,
 )
@@ -500,6 +498,101 @@ class TestBlockAwarePrefixCacheWithSSD:
             block.block_hash
         )
         prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
+
+    def test_minimax_m3_sliceable_nstate_blocks_round_trip(self, monkeypatch):
+        """MiniMax M3 single-cache blocks store K/V/index slices, not snapshots."""
+        mx = pytest.importorskip("mlx.core")
+
+        module = types.ModuleType("mlx_vlm.models.minimax_m3_vl.language")
+
+        class FakeInnerKVCache:
+            def __init__(self):
+                self.state = None
+
+        class MiniMaxM3KVCache:
+            def __init__(self):
+                self.kv_cache = FakeInnerKVCache()
+                self.index_keys = None
+                self.index_offset = 0
+
+        module.MiniMaxM3KVCache = MiniMaxM3KVCache
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_vlm.models.minimax_m3_vl.language",
+            module,
+        )
+
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        saved_by_hash = {}
+
+        def save_block(**kwargs):
+            saved_by_hash[kwargs["block_hash"]] = (
+                kwargs["cache_data"],
+                {
+                    "model_name": "test-model",
+                    "num_layers": 1,
+                    "block_size": 4,
+                    "layer_cache_types": kwargs["layer_cache_types"],
+                    "layer_meta_states": kwargs["layer_meta_states"],
+                },
+            )
+            return True
+
+        mock_ssd.save_block.side_effect = save_block
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        keys = mx.arange(1 * 2 * 8 * 3, dtype=mx.float32).reshape(1, 2, 8, 3)
+        values = keys + 100
+        index_keys = mx.arange(1 * 1 * 8 * 3, dtype=mx.float32).reshape(1, 1, 8, 3)
+        mx.eval(keys, values, index_keys)
+        cache_data = [
+            {
+                "state": (keys, values, index_keys),
+                "cache_type": "MiniMaxM3KVCache",
+                "class_name": "MiniMaxM3KVCache",
+                "meta_state": (999,),
+            }
+        ]
+
+        block_table = cache.store_cache("req-minimax", list(range(8)), cache_data)
+
+        assert block_table is not None
+        assert len(block_table.block_ids) == 2
+        assert mock_ssd.save_block.call_count == 2
+        for idx, call in enumerate(mock_ssd.save_block.call_args_list):
+            marker = call.kwargs["cache_data"][0]
+            assert marker[0] == "__nstate__"
+            assert marker[1] == "MiniMaxM3KVCache"
+            saved_keys, saved_values, saved_index = marker[2]
+            start = idx * 4
+            end = start + 4
+            assert saved_keys.tolist() == keys[:, :, start:end, :].tolist()
+            assert saved_values.tolist() == values[:, :, start:end, :].tolist()
+            assert saved_index.tolist() == index_keys[:, :, start:end, :].tolist()
+
+        def load_block_with_metadata(block_hash, **kwargs):
+            return saved_by_hash.get(block_hash, (None, None))
+
+        mock_ssd.load_block_with_metadata.side_effect = load_block_with_metadata
+        restored = cache.reconstruct_cache(block_table)
+
+        assert restored is not None
+        restored_cache = restored[0]
+        restored_keys, restored_values = restored_cache.kv_cache.state
+        assert restored_keys.tolist() == keys.tolist()
+        assert restored_values.tolist() == values.tolist()
+        assert restored_cache.index_keys.tolist() == index_keys.tolist()
+        assert restored_cache.index_offset == 8
 
 
 class TestPrefixIndexOperations:

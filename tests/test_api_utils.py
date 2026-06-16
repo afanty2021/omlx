@@ -53,6 +53,7 @@ from omlx.api.utils import (
     extract_multimodal_content,
     extract_text_content,
     prepare_system_messages_for_template,
+    uses_native_reasoning_content,
 )
 
 
@@ -585,6 +586,47 @@ class TestExtractTextContentNativeReasoningContent:
         assert len(result) == 1
         assert result[0]["content"] == "A"
         assert "reasoning_content" not in result[0]
+
+    def test_native_mode_recovers_inline_thinking_from_history(self):
+        """Inline <think> history is converted back to a native reasoning field."""
+        messages = [
+            Message(role="assistant", content="<think>\nR\n</think>\n\nA"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_recovers_minimax_inline_thinking_from_history(self):
+        """MiniMax native tags are also normalized into reasoning_content."""
+        messages = [
+            Message(role="assistant", content="<mm:think>R</mm:think>A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+
+
+class TestUsesNativeReasoningContent:
+    def test_detects_minimax_m3_by_config_type(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="minimax_m3_vl",
+        )
+
+    def test_detects_minimax_m3_by_model_name(self):
+        assert uses_native_reasoning_content("MiniMax-M3-4bit")
+
+    def test_preserve_thinking_models_are_native(self):
+        assert uses_native_reasoning_content(
+            "qwen",
+            preserve_thinking_default=True,
+        )
+
+    def test_plain_model_is_not_native(self):
+        assert not uses_native_reasoning_content("llama-3")
 
 
 class TestConvertAnthropicToInternal:

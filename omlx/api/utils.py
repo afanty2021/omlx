@@ -10,6 +10,30 @@ from typing import Any, List
 
 from .openai_models import Message
 
+# Model families whose chat templates consume message.reasoning_content directly.
+_NATIVE_REASONING_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
+
+
+def uses_native_reasoning_content(
+    model_name: str | None = None,
+    *,
+    config_model_type: str | None = None,
+    engine_model_type: str | None = None,
+    preserve_thinking_default: bool | None = None,
+) -> bool:
+    """Return whether history should keep reasoning in message fields."""
+    if preserve_thinking_default is True:
+        return True
+
+    if config_model_type in _NATIVE_REASONING_MODEL_TYPES:
+        return True
+    if engine_model_type in _NATIVE_REASONING_MODEL_TYPES:
+        return True
+
+    lowered = (model_name or "").lower()
+    return "minimax" in lowered and "m3" in lowered
+
+
 # =============================================================================
 # Partial Mode Detection
 # =============================================================================
@@ -48,6 +72,7 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|image\|>|<\|audio\|>|"  # Gemma 4 VLM special tokens
+    r"\[e~\[|\]~b\]|\]~!b\[|\]!p~\[|\]!d~\[|"  # MiniMax M3 special tokens
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
     r"<eos>|<bos>|<end_of_turn>|<start_of_turn>"  # Gemma special tokens (fixes #1087)
 )
@@ -795,6 +820,16 @@ def _apply_reasoning_reconstruction(
     string to attach as a ``reasoning_content`` field, or ``None`` to skip.
     """
     if role != "assistant" or not reasoning:
+        if role != "assistant" or not native:
+            return content, None
+        text = content if isinstance(content, str) else ""
+        if isinstance(content, list):
+            text = _extract_text_from_content_list(content)
+        from .thinking import extract_thinking
+
+        inline_reasoning, inline_content = extract_thinking(text)
+        if inline_reasoning:
+            return inline_content, inline_reasoning
         return content, None
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
