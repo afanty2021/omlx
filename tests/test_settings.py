@@ -1980,7 +1980,7 @@ class TestIntegrationSettings:
     def test_markitdown_defaults(self):
         settings = IntegrationSettings()
         assert settings.markitdown_enabled is True
-        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_expose_model is False
         assert settings.markitdown_max_file_size_mb == 25
         assert settings.markitdown_max_files_per_request == 5
         assert settings.markitdown_pdf_processing_engine == "markitdown"
@@ -2003,7 +2003,7 @@ class TestIntegrationSettings:
     def test_markitdown_from_dict_backward_compat(self):
         settings = IntegrationSettings.from_dict({})
         assert settings.markitdown_enabled is True
-        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_expose_model is False
         assert settings.markitdown_max_file_size_mb == 25
         assert settings.markitdown_max_files_per_request == 5
         assert settings.markitdown_pdf_processing_engine == "markitdown"

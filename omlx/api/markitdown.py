@@ -105,8 +105,8 @@ def markitdown_model_visible(global_settings: Any | None) -> bool:
         return False
     integrations = getattr(global_settings, "integrations", None)
     if integrations is None:
-        return True
-    return bool(getattr(integrations, "markitdown_expose_model", True))
+        return False
+    return bool(getattr(integrations, "markitdown_expose_model", False))
 
 
 def markitdown_limits(global_settings: Any | None) -> tuple[int, int]:

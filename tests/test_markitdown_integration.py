@@ -70,10 +70,30 @@ class _EmptyPool:
         }
 
 
-def test_openai_models_includes_markitdown_when_enabled():
+def _settings_with_markitdown_model() -> GlobalSettings:
+    settings = GlobalSettings()
+    settings.integrations.markitdown_expose_model = True
+    return settings
+
+
+def test_openai_models_hides_markitdown_by_default():
     state = ServerState()
     state.engine_pool = _EmptyPool()
     state.global_settings = GlobalSettings()
+
+    with patch("omlx.server._server_state", state):
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    ids = [m["id"] for m in response.json()["data"]]
+    assert MARKITDOWN_MODEL_ID not in ids
+
+
+def test_openai_models_includes_markitdown_when_exposed():
+    state = ServerState()
+    state.engine_pool = _EmptyPool()
+    state.global_settings = _settings_with_markitdown_model()
 
     with patch("omlx.server._server_state", state):
         client = TestClient(app, raise_server_exceptions=False)
@@ -87,7 +107,7 @@ def test_openai_models_includes_markitdown_when_enabled():
 def test_openai_models_hides_markitdown_when_disabled():
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
     state.global_settings.integrations.markitdown_enabled = False
 
     with patch("omlx.server._server_state", state):
@@ -117,7 +137,7 @@ def test_openai_models_hides_markitdown_when_not_exposed():
 def test_markitdown_chat_completion_converts_file(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
 
     def fake_convert(file: MarkItDownFile, **kwargs) -> str:
         assert file.filename == "sample.pdf"
@@ -144,7 +164,7 @@ def test_markitdown_chat_completion_converts_file(monkeypatch):
 def test_markitdown_chat_completion_uses_latest_user_turn(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
 
     def fake_convert(file: MarkItDownFile, **kwargs) -> str:
         return f"# Converted {file.filename}"
@@ -219,7 +239,7 @@ def test_markitdown_chat_completion_hidden_model_returns_404():
 def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
     started = False
 
     async def fake_stream_messages(*args, **kwargs):
@@ -268,7 +288,7 @@ def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
 def test_markitdown_non_stream_response_starts_before_conversion(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
     started = False
 
     async def fake_convert_messages(*args, **kwargs):

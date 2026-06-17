@@ -9,6 +9,7 @@ weights.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -311,6 +312,68 @@ class TestMoeConfigPatch:
         cfg = Qwen3_5MTPConfig.from_dict(dense_config)
         assert cfg.text_config is not None
         assert cfg.text_config.hidden_size == 64
+
+
+# ---------------------------------------------------------------------------
+# dense Qwen3.5 VLM runtime patch tests
+# ---------------------------------------------------------------------------
+
+
+def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
+    """Dense Qwen3.5 VLM MTP verify must satisfy mlx-vlm's output contract."""
+    from mlx_vlm.models.base import LanguageModelOutput
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+
+    logits = mx.zeros((1, 2, 16))
+    hidden = mx.zeros((1, 2, 8))
+    gdn_states = [{"state": "mock"}]
+
+    class FakeStockOutput:
+        def __init__(self):
+            self.logits = logits
+            self.hidden_states = [hidden]
+            self.gdn_states = gdn_states
+
+    class FakeLanguageModel:
+        def __init__(self, args, config=None):
+            self.args = args
+            self.config = config
+            self.model = SimpleNamespace(layers=[object(), object()])
+            self.forward_kwargs = None
+
+        def __call__(
+            self,
+            inputs,
+            inputs_embeds=None,
+            mask=None,
+            cache=None,
+            **kwargs,
+        ):
+            self.forward_kwargs = kwargs
+            return FakeStockOutput()
+
+    q35_lang = SimpleNamespace(LanguageModel=FakeLanguageModel)
+    qwen35_vlm_runtime._patch_vlm_language_model(q35_lang)
+
+    model = q35_lang.LanguageModel(
+        SimpleNamespace(mtp_num_hidden_layers=0, tie_word_embeddings=True),
+        config=None,
+    )
+    out = model(
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=[],
+        return_hidden=True,
+        return_shared_kv=True,
+        capture_layer_ids=[99],
+    )
+
+    assert isinstance(out, LanguageModelOutput)
+    assert out.logits is logits
+    assert out.hidden_states == [hidden]
+    assert out.hidden_states[-1] is hidden
+    assert out.gdn_states is gdn_states
+    assert out.shared_kv_states == {}
+    assert model.forward_kwargs["capture_layer_ids"] == [1]
 
 
 # ---------------------------------------------------------------------------

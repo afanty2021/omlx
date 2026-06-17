@@ -106,7 +106,7 @@
                     pi_model: null,
                     openclaw_tools_profile: 'full',
                     markitdown_enabled: true,
-                    markitdown_expose_model: true,
+                    markitdown_expose_model: false,
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
                     markitdown_pdf_processing_engine: 'markitdown',

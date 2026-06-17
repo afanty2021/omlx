@@ -1162,7 +1162,11 @@ class ProcessMemoryEnforcer:
             )
 
         if new_level == "hard":
-            freed_hot = self._shrink_hot_cache_for_pressure(current, soft)
+            freed_hot = await asyncio.to_thread(
+                self._shrink_hot_cache_for_pressure,
+                current,
+                soft,
+            )
             if freed_hot > 0:
                 current = self._current_usage_bytes()
                 emergency = self._is_emergency_pressure(current, ceiling)

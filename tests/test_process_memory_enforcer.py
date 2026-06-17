@@ -1981,14 +1981,27 @@ class TestTwoWatermarkPressureLevels:
             soft_threshold=0.90,
             hard_threshold=0.95,
         )
+        to_thread_calls = []
 
-        with patch.object(
-            enforcer,
-            "_current_usage_bytes",
-            side_effect=[98 * 1024**3, 80 * 1024**3],
+        async def run_inline(fn, *args, **kwargs):
+            to_thread_calls.append((fn, args, kwargs))
+            return fn(*args, **kwargs)
+
+        with (
+            patch.object(
+                enforcer,
+                "_current_usage_bytes",
+                side_effect=[98 * 1024**3, 80 * 1024**3],
+            ),
+            patch(
+                "omlx.process_memory_enforcer.asyncio.to_thread",
+                side_effect=run_inline,
+            ),
         ):
             await enforcer._check_and_enforce()
 
+        assert to_thread_calls
+        assert to_thread_calls[0][0] == enforcer._shrink_hot_cache_for_pressure
         budget.shrink_to.assert_called_once()
         target_hot = budget.shrink_to.call_args.args[0]
         assert target_hot == 12 * 1024**3

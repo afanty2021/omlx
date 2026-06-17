@@ -698,7 +698,7 @@ class IntegrationSettings:
     copilot_model: str | None = None
     openclaw_tools_profile: str = "coding"
     markitdown_enabled: bool = True
-    markitdown_expose_model: bool = True
+    markitdown_expose_model: bool = False
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
@@ -732,7 +732,7 @@ class IntegrationSettings:
             copilot_model=data.get("copilot_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
             markitdown_enabled=data.get("markitdown_enabled", True),
-            markitdown_expose_model=data.get("markitdown_expose_model", True),
+            markitdown_expose_model=data.get("markitdown_expose_model", False),
             markitdown_max_file_size_mb=data.get("markitdown_max_file_size_mb", 25),
             markitdown_max_files_per_request=data.get(
                 "markitdown_max_files_per_request", 5

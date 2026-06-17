@@ -2213,6 +2213,28 @@ class TestPreloadMatchedBlocks:
 
         manager2.close()
 
+    def test_preload_respects_available_hot_cache_capacity(self, tmp_path, mx):
+        """Preload must not load more cold blocks than remaining hot-cache bytes."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=5)
+
+        try:
+            file_sizes = [manager2._index.get(h).file_size for h in hashes]
+            manager2._hot_cache_max_bytes = sum(file_sizes[:4])
+
+            loaded = manager2.preload_matched_blocks(hashes)
+
+            assert loaded == 4
+            for h in hashes[:4]:
+                assert manager2._hot_cache_get(h) is not None
+            assert manager2._hot_cache_get(hashes[4]) is None
+        finally:
+            manager2.close()
+
     def test_preload_skips_when_shared_hot_cache_budget_full(self, tmp_path, mx):
         """Preload uses remaining shared budget, not only local hot cache bytes."""
         budget = SharedHotCacheBudget(1024)

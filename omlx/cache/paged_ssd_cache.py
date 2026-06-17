@@ -2684,6 +2684,25 @@ class PagedSSDCacheManager(CacheManager):
         available = self._hot_cache_available_bytes()
         if available <= 0:
             return 0
+        capped_to_load: list[tuple[bytes, PagedSSDBlockMetadata]] = []
+        selected_bytes = 0
+        for bh, metadata in to_load:
+            try:
+                block_bytes = max(0, int(getattr(metadata, "file_size", 0) or 0))
+            except (TypeError, ValueError):
+                block_bytes = 0
+            if block_bytes <= 0:
+                try:
+                    block_bytes = metadata.file_path.stat().st_size
+                except OSError:
+                    block_bytes = 0
+            if selected_bytes + block_bytes > available:
+                break
+            capped_to_load.append((bh, metadata))
+            selected_bytes += block_bytes
+        to_load = capped_to_load
+        if len(to_load) < 4:
+            return 0
 
         # Cap workers to limit peak memory (each load allocates ~122-275MB).
         # 8 workers ≈ 1.4GB peak, vs 2.8GB at 16. CPD-accepted (G1/Q3).

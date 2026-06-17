@@ -472,6 +472,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         assert request.cached_tokens == 3
         assert request.remaining_tokens == [14]
@@ -505,6 +506,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         assert request.cached_tokens == 0
         assert request.remaining_tokens == [21, 22, 23, 24]
@@ -542,6 +544,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         assert request.cached_tokens == 0
         assert request.remaining_tokens == [31, 32, 33, 34]
@@ -580,6 +583,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
@@ -618,6 +622,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
@@ -655,12 +660,237 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
             block_table
         )
         scheduler._current_usage_bytes.assert_not_called()
+
+    def test_admission_defers_for_relevant_inflight_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """A same-conversation request should defer lookup until store finishes."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(9000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert request.request_id in scheduler._cache_freshness_waits
+
+        future.done.return_value = True
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        scheduler._prepare_prefix_cache_for_request(request)
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+
+    def test_admission_defers_for_ratio_relevant_inflight_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """A large prompt should defer when the shared prefix is a high ratio."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(3000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_below_common_and_ratio_thresholds(
+        self, mock_model, mock_tokenizer
+    ):
+        """A moderate shared prefix should not defer below both relevance gates."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(30000))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(7000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_for_short_prompt_even_with_high_ratio(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prompts below the freshness minimum should never wait on store_cache."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(7000))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(6000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_defers_for_relevant_store_during_active_work(
+        self, mock_model, mock_tokenizer
+    ):
+        """Active decode/prefill rows should not skip a highly relevant store."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+        scheduler.running["req-running"] = MagicMock()
+        scheduler.prefilling.append(MagicMock())
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(9000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+
+    def test_schedule_waiting_defers_cache_freshness_without_blocking(
+        self, mock_model, mock_tokenizer
+    ):
+        """Freshness waits must defer admission, not block scheduler execution."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(9000)))
+        )
+        scheduler._ensure_batch_generator = MagicMock()
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+        scheduler.add_request(request)
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert request.request_id in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        scheduler._ensure_batch_generator.assert_not_called()
+
+    def test_admission_does_not_defer_for_mismatched_extra_keys(
+        self, mock_model, mock_tokenizer
+    ):
+        """Token-only overlap must not delay VLM requests with different cache keys."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(
+                tokens=list(range(9000)),
+                extra_keys=("image-a",),
+                extra_key_token_start=0,
+            )
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+            vlm_image_hash="image-b",
+            vlm_cache_key_start=0,
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        scheduler._prepare_prefix_cache_for_request(request)
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
 
     def test_async_store_cache_worker_forwards_hot_cache_write_back_flag(
         self, mock_model, mock_tokenizer
@@ -2921,6 +3151,81 @@ class TestStoreCacheAdmissionBackpressure:
         assert list(scheduler.waiting) == []
         assert scheduler.running[running.request_id] is running
 
+    def test_store_cache_gate_fails_persistent_non_memory_stall(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store-cache gate must not leave admission waiting forever."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=1)
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request("req-store-stalled")
+        self._queue_request(scheduler, request)
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=50)
+        scheduler._store_cache_admission_blocked_request_id = request.request_id
+        scheduler._store_cache_admission_blocked_since = 0.0
+        scheduler._ensure_batch_generator = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == request.request_id
+        assert rejected[0].finish_reason == "error"
+        assert rejected[0].error_code == "store_cache_admission_stalled"
+        assert rejected[0].error_metadata["store_cache_in_flight"] == 1
+        assert request.request_id not in scheduler.requests
+        assert list(scheduler.waiting) == []
+        scheduler._ensure_batch_generator.assert_not_called()
+
+    def test_store_cache_stall_timer_clears_when_gate_recovers_before_freshness_wait(
+        self, mock_model, mock_tokenizer
+    ):
+        """A recovered store-cache gate must not accumulate stale stall time."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=2)
+        gate.note_submitted()
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request("req-store-recovered")
+        self._queue_request(scheduler, request)
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=50)
+        scheduler._ensure_batch_generator = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert scheduler._store_cache_admission_blocked_request_id == request.request_id
+
+        gate.note_done()
+        scheduler._should_defer_for_cache_freshness = MagicMock(return_value=True)
+        with patch("omlx.scheduler.time.monotonic", return_value=30.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler._store_cache_admission_blocked_request_id is None
+
+        gate.note_submitted()
+        scheduler._should_defer_for_cache_freshness = MagicMock(return_value=False)
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler._store_cache_admission_blocked_request_id == request.request_id
+        assert scheduler._store_cache_admission_blocked_since == 61.0
+        scheduler._ensure_batch_generator.assert_not_called()
+
     def test_schedule_waiting_allows_when_gate_has_capacity(
         self, mock_model, mock_tokenizer
     ):
@@ -3031,6 +3336,12 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler.requests[done_request.request_id] = done_request
         scheduler._inflight_store_futures[slow_request.request_id] = slow_future
         scheduler._inflight_store_futures[done_request.request_id] = done_future
+        scheduler._inflight_store_info[slow_request.request_id] = (
+            scheduler_module._InflightStoreInfo(tokens=[1, 2, 3])
+        )
+        scheduler._inflight_store_info[done_request.request_id] = (
+            scheduler_module._InflightStoreInfo(tokens=[1, 2, 3])
+        )
         scheduler.request_id_to_uid[slow_request.request_id] = 1
         scheduler.request_id_to_uid[done_request.request_id] = 2
         scheduler.uid_to_request_id[1] = slow_request.request_id
@@ -3052,6 +3363,8 @@ class TestStoreCacheAdmissionBackpressure:
         assert slow_request.request_id in scheduler.requests
         assert done_request.request_id not in scheduler.requests
         assert done_request.request_id not in scheduler._inflight_store_futures
+        assert done_request.request_id not in scheduler._inflight_store_info
+        assert slow_request.request_id in scheduler._inflight_store_info
         assert done_request.request_id not in scheduler.request_id_to_uid
         assert 2 not in scheduler.uid_to_request_id
         assert gate.in_flight == 1
