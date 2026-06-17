@@ -27,7 +27,7 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model, onBack: { services.modelDetailID = nil })
+            Header(model: vm.model)
 
             SectionPicker(selection: $vm.section)
 
@@ -61,7 +61,25 @@ struct ModelSettingsScreen: View {
                     .padding(.top, 8)
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                backButton
+            }
+        }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+    }
+
+    @ViewBuilder
+    private var backButton: some View {
+        Button {
+            services.modelDetailID = nil
+        } label: {
+            Label(String(localized: "settings.header.back_to_models",
+                         defaultValue: "Back to Models",
+                         comment: "Back button label at the top of the per-model settings screen"),
+                  systemImage: "chevron.left")
+                .labelStyle(.iconOnly)
+        }
     }
 }
 
@@ -69,8 +87,6 @@ struct ModelSettingsScreen: View {
 
 private struct Header: View {
     let model: ModelDTO?
-    let onBack: () -> Void
-
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -96,17 +112,7 @@ private struct Header: View {
                 }
             }
             .layoutPriority(1)
-            Spacer(minLength: 8)
-            Button {
-                onBack()
-            } label: {
-                Label(String(localized: "settings.header.back_to_models",
-                             defaultValue: "Back to Models",
-                             comment: "Back button label at the top of the per-model settings screen"),
-                      systemImage: "chevron.left")
-                    .labelStyle(.titleAndIcon)
-            }
-            .buttonStyle(.omlx(.plain, size: .small))
+            Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
@@ -126,7 +132,6 @@ private struct SectionPicker: View {
                     ($0, $0.label)
                 }
             )
-            .frame(width: 320)
             Spacer()
         }
         .padding(.horizontal, 14)
@@ -328,7 +333,19 @@ private struct ProfilesTab: View {
                         self.preview = nil
                     }
                 },
-                onClosePreview: { self.preview = nil }
+                onClosePreview: { self.preview = nil },
+                exposeAsModel: modelProfile(named: preview.name)?.exposeAsModel ?? false,
+                exposedModelId: modelProfile(named: preview.name)?.modelId,
+                hasEngineFields: modelProfile(named: preview.name)?.hasEngineFields ?? false,
+                onToggleExpose: preview.scope == .model
+                    ? { exposed in
+                        Task {
+                            await vm.setExposeAsModel(
+                                name: preview.name, exposed: exposed, client: client
+                            )
+                        }
+                    }
+                    : nil
             )
         } else {
             // No preview → show the active state's detail.
@@ -358,7 +375,19 @@ private struct ProfilesTab: View {
                     basedOn: nil,
                     isWorkingBase: false,
                     compact: false,
-                    hasWorking: false
+                    hasWorking: false,
+                    exposeAsModel: modelProfile(named: name)?.exposeAsModel ?? false,
+                    exposedModelId: modelProfile(named: name)?.modelId,
+                    hasEngineFields: modelProfile(named: name)?.hasEngineFields ?? false,
+                    onToggleExpose: scope == .model
+                        ? { exposed in
+                            Task {
+                                await vm.setExposeAsModel(
+                                    name: name, exposed: exposed, client: client
+                                )
+                            }
+                        }
+                        : nil
                 )
             case .defaults:
                 ProfileDetailCard(
@@ -376,6 +405,12 @@ private struct ProfilesTab: View {
                 )
             }
         }
+    }
+
+    /// Per-model profile DTO lookup — source of the expose-as-model state
+    /// and the derived model ID shown on the detail card.
+    private func modelProfile(named name: String) -> ProfileDTO? {
+        vm.profiles.first { $0.name == name }
     }
 
     private func previewChip(scope: ProfileScope, name: String) {
@@ -2321,6 +2356,22 @@ final class ModelSettingsScreenVM: ObservableObject {
                 id: modelID,
                 name: original,
                 body: UpdateProfileRequest(newName: renamed)
+            )
+            await load(modelID: modelID, client: client)
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    /// Flip `expose_as_model` on a per-model profile via PUT. The body
+    /// carries only the flag (absent fields are merge-no-ops server-side);
+    /// reload picks up the derived `model_id` the profile serves under.
+    func setExposeAsModel(name: String, exposed: Bool, client: OMLXClient) async {
+        do {
+            _ = try await client.updateModelProfile(
+                id: modelID,
+                name: name,
+                body: UpdateProfileRequest(exposeAsModel: exposed)
             )
             await load(modelID: modelID, client: client)
         } catch {
