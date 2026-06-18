@@ -188,6 +188,8 @@ omlx/
 
 ## 开发指南
 
+> ⚠️ **本机开发必读：** oMLX 必须在 **`Quant-3.11` conda 环境**下运行（系统 python 的 mlx-vlm 太旧，缺 `speculative` 模块会启动崩溃），约定使用 **8001 端口**。完整的实操流程、命令、踩坑记录见 **[docs/DEVELOPMENT_AND_TESTING.md](docs/DEVELOPMENT_AND_TESTING.md)**。
+
 ### 环境设置
 
 ```bash
