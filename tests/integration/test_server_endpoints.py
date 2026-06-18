@@ -286,9 +286,15 @@ class MockEnginePool:
             "max_model_memory": self.max_model_memory,
         }
 
-    async def get_engine(self, model_id: str, _lease: bool = False):
+    async def get_engine(
+        self,
+        model_id: str,
+        _lease: bool = False,
+        runtime_settings=None,
+    ):
         # _lease mirrors the real EnginePool's acquire-vs-use lease (#1667);
         # the mock has no eviction so it just accepts the flag.
+        # runtime_settings mirrors exposed-profile variant loads.
         # Return appropriate engine based on model name pattern
         if "embed" in model_id.lower():
             if self._embedding_engine:

@@ -187,7 +187,7 @@
             _applySeq: 0,               // monotonic counter for apply race guard
             profileError: '',
             showNewProfileForm: false,
-            newProfile: { name: '', description: '', also_as_template: false },
+            newProfile: { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false },
             showNewTemplateForm: false,
             newTemplate: { name: '', display_name: '', description: '' },
             editingProfile: null,        // profile name being edited inline
@@ -1189,6 +1189,15 @@
                 }
                 return null;
             },
+            profileTooltip(profile) {
+                const lines = [];
+                if (profile?.expose_as_model && profile.model_id) {
+                    lines.push(profile.model_id);
+                }
+                const description = (profile?.description || '').trim();
+                if (description) lines.push(description);
+                return lines.join('\n');
+            },
             async loadProfilesForModel(modelId) {
                 this.profiles = [];
                 try {
@@ -1540,26 +1549,42 @@
 
             isValidProfileName(name) {
                 // Mirror of the backend rule (validate_profile_name) and the
-                // Mac app's isValidSlug. The profile name IS the exposed model
-                // ID suffix (<model>:<name>), so it must be a clean slug. We
-                // validate and reject rather than silently rewrite the user's
-                // input — matching the server and the native app.
+                // Mac app's isValidSlug. api_name is the exposed model ID
+                // suffix (<model>:<api_name>), so it must be a clean slug.
                 return /^[a-z0-9][a-z0-9_-]{0,31}$/.test((name || '').trim());
+            },
+            slugifyProfileApiName(value) {
+                let slug = (value || '')
+                    .normalize('NFKD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9_-]+/g, '-')
+                    .replace(/-+/g, '-')
+                    .replace(/^[-_]+|[-_]+$/g, '')
+                    .slice(0, 32)
+                    .replace(/[-_]+$/g, '');
+                return slug || 'profile';
             },
             async createProfile() {
                 if (!this.selectedModel) return;
                 this.profileError = '';
-                const name = this.newProfile.name.trim();
-                if (!this.isValidProfileName(name)) {
+                const displayName = (this.newProfile.display_name || '').trim();
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
+                if (!this.isValidProfileName(apiName)) {
                     this.profileError = window.t('modal.model_settings.profiles.invalid_name');
                     return;
                 }
-                // name doubles as the display label and the exposed model ID;
-                // duplicate names are caught by the server (409).
+                const autoId = 'p-' + Date.now().toString(36) + '-' +
+                               Math.random().toString(36).slice(2, 6);
                 const body = {
-                    name: name,
-                    display_name: name,
-                    description: this.newProfile.description.trim() || null,
+                    name: autoId,
+                    display_name: displayName,
+                    api_name: apiName,
+                    description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
                 };
@@ -1573,7 +1598,7 @@
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
-                        this.newProfile = { name: '', description: '', also_as_template: false };
+                        this.newProfile = { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1636,6 +1661,7 @@
                     const body = {
                         name: template.name,
                         display_name: template.display_name,
+                        api_name: this.slugifyProfileApiName(template.display_name || template.name),
                         description: template.description || null,
                         settings: template.settings,
                         source_template: template.name,
@@ -1681,25 +1707,36 @@
                 }
             },
             updateProfileFromEdit(p) {
-                // Edit-dialog save. The name IS the exposed model ID, so
-                // renaming re-IDs the profile (clients pinned to the old ID
-                // will need updating). Validate the new name rather than
-                // rewrite it; only send new_name when it actually changed.
+                // Edit-dialog save. Internal profile name stays stable; api_name
+                // is the API-visible suffix used by exposed model IDs.
                 this.profileError = '';
-                const newName = (p._editName ?? p.name).trim();
-                const patch = { settings: this.formValuesForProfile() };
-                if (newName !== p.name) {
-                    if (!this.isValidProfileName(newName)) {
-                        this.profileError = window.t('modal.model_settings.profiles.invalid_name');
-                        return;
-                    }
-                    patch.new_name = newName;
-                    patch.display_name = newName;  // keep display label == name
+                const displayName = (p._editDisplayName ?? p.display_name ?? p.name).trim();
+                const apiName = (p._editApiName ?? p.api_name ?? p.name).trim();
+                const description = (p._editDescription ?? p.description ?? '').trim();
+                const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
                 }
+                if (!this.isValidProfileName(apiName)) {
+                    this.profileError = window.t('modal.model_settings.profiles.invalid_name');
+                    return;
+                }
+                const patch = {
+                    display_name: displayName,
+                    api_name: apiName,
+                    description: description,
+                    expose_as_model: exposeAsModel,
+                };
                 return this.updateProfile(p.name, patch);
             },
+            updateProfileSettingsFromForm(p) {
+                return this.updateProfile(p.name, {
+                    settings: this.formValuesForProfile(),
+                });
+            },
             async updateProfile(name, patch) {
-                // patch: { new_name?, display_name?, description?, settings?, also_save_as_template? }
+                // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 try {

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -71,6 +72,7 @@ class EngineEntry:
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
+    runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
 
 
 class EnginePool:
@@ -150,6 +152,136 @@ class EnginePool:
         wake = getattr(enforcer, "wake", None) if enforcer is not None else None
         if callable(wake):
             wake(active=active)
+
+    @staticmethod
+    def _canonical_signature_value(value: object) -> str:
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return repr(value)
+
+    def _engine_runtime_signature(
+        self,
+        model_id: str,
+        runtime_settings: object | None = None,
+        *,
+        loaded_engine: object | None = None,
+    ) -> tuple[tuple[str, str], ...] | None:
+        settings = runtime_settings
+        if settings is None and self._settings_manager is not None:
+            get_settings = getattr(self._settings_manager, "get_settings", None)
+            if callable(get_settings):
+                settings = get_settings(model_id)
+        if settings is None:
+            return None
+
+        to_dict = getattr(settings, "to_dict", None)
+        data = to_dict() if callable(to_dict) else {}
+        entry = self._entries.get(model_id)
+        is_diffusion = bool(entry and self._entry_is_diffusion_model(entry))
+        loaded_engine_name = (
+            type(loaded_engine).__name__ if loaded_engine is not None else None
+        )
+
+        def has_value(key: str) -> bool:
+            value = data.get(key)
+            return value is not None and value != ""
+
+        def normalized_index_cache_freq() -> int | None:
+            value = data.get("index_cache_freq")
+            try:
+                freq = int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+            return freq if freq is not None and freq >= 2 else None
+
+        signature: list[tuple[str, str]] = []
+
+        def add(key: str, value: object) -> None:
+            signature.append((key, self._canonical_signature_value(value)))
+
+        # Security/load gates.
+        add("trust_remote_code", bool(data.get("trust_remote_code", False)))
+        add("index_cache_freq", normalized_index_cache_freq())
+
+        # Load-time model variants. Dependent fields only matter when their
+        # feature is active; stale draft paths or tuning defaults must not
+        # force a reload when the corresponding feature is disabled.
+        mtp_active = bool(data.get("mtp_enabled", False))
+        add("mtp_enabled", mtp_active)
+
+        turboquant_active = bool(data.get("turboquant_kv_enabled", False))
+        add("turboquant_kv_enabled", turboquant_active)
+        if turboquant_active:
+            add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
+            add("turboquant_skip_last", data.get("turboquant_skip_last", True))
+
+        specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
+            "specprefill_draft_model"
+        )
+        add("specprefill_enabled", specprefill_active)
+        if specprefill_active:
+            add("specprefill_draft_model", data.get("specprefill_draft_model"))
+            add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
+            add("specprefill_threshold", data.get("specprefill_threshold"))
+
+        dflash_active = (
+            bool(data.get("dflash_enabled", False))
+            and has_value("dflash_draft_model")
+            and not is_diffusion
+        )
+        if loaded_engine_name is not None:
+            dflash_active = loaded_engine_name == "DFlashEngine"
+        add("dflash_enabled", dflash_active)
+        if dflash_active:
+            add("dflash_draft_model", data.get("dflash_draft_model"))
+            add(
+                "dflash_draft_quant_enabled",
+                bool(data.get("dflash_draft_quant_enabled", False)),
+            )
+            if data.get("dflash_draft_quant_enabled", False):
+                add(
+                    "dflash_draft_quant_weight_bits",
+                    data.get("dflash_draft_quant_weight_bits", 4),
+                )
+                add(
+                    "dflash_draft_quant_activation_bits",
+                    data.get("dflash_draft_quant_activation_bits", 16),
+                )
+                add(
+                    "dflash_draft_quant_group_size",
+                    data.get("dflash_draft_quant_group_size", 64),
+                )
+            add("dflash_max_ctx", data.get("dflash_max_ctx"))
+            add("dflash_in_memory_cache", data.get("dflash_in_memory_cache", True))
+            add(
+                "dflash_in_memory_cache_max_entries",
+                data.get("dflash_in_memory_cache_max_entries", 4),
+            )
+            add(
+                "dflash_in_memory_cache_max_bytes",
+                data.get("dflash_in_memory_cache_max_bytes"),
+            )
+            add("dflash_ssd_cache", bool(data.get("dflash_ssd_cache", False)))
+            if data.get("dflash_ssd_cache", False):
+                add("dflash_ssd_cache_max_bytes", data.get("dflash_ssd_cache_max_bytes"))
+            add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
+            add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
+            add("dflash_verify_mode", data.get("dflash_verify_mode"))
+
+        vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
+            "vlm_mtp_draft_model"
+        )
+        if loaded_engine is not None and vlm_mtp_active:
+            drafter = getattr(loaded_engine, "vlm_mtp_drafter", None)
+            if callable(drafter):
+                drafter = drafter()
+            vlm_mtp_active = drafter is not None
+        add("vlm_mtp_enabled", vlm_mtp_active)
+        if vlm_mtp_active:
+            add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
+            add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
+
+        return tuple(signature)
 
     @property
     def model_count(self) -> int:
@@ -337,11 +469,12 @@ class EnginePool:
         if settings_manager is not None:
             # Exposed profiles resolve to the physical model they overlay
             # (handles provider prefixes internally).
-            profile_source = settings_manager.get_exposed_profile_source_model_id(
-                model_id_or_alias
-            )
-            if profile_source is not None:
-                return profile_source
+            if hasattr(settings_manager, "get_exposed_profile_source_model_id"):
+                profile_source = settings_manager.get_exposed_profile_source_model_id(
+                    model_id_or_alias
+                )
+                if profile_source is not None:
+                    return profile_source
             all_settings = settings_manager.get_all_settings()
             for mid, ms in all_settings.items():
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
@@ -367,6 +500,7 @@ class EnginePool:
         model_id: str,
         force_lm: bool = False,
         _lease: bool = False,
+        runtime_settings: object | None = None,
     ) -> (
         BaseEngine
         | EmbeddingEngine
@@ -389,6 +523,10 @@ class EnginePool:
             model_id: The model ID to get engine for
             force_lm: Force loading as LM (BatchedEngine) even for VLM models.
                 Useful for text-only tasks like accuracy benchmarks.
+            runtime_settings: Optional transient settings used for this engine
+                load. When its engine-construction signature differs from the
+                currently loaded engine, the old engine is unloaded and the new
+                variant is loaded without mutating persisted model settings.
 
         Returns:
             The loaded engine (BaseEngine for LLM, EmbeddingEngine for embeddings)
@@ -403,17 +541,41 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            expected_signature = self._engine_runtime_signature(
+                model_id,
+                runtime_settings,
+            )
 
             # Already loaded - just update access time
             if entry.engine is not None:
+                if (
+                    expected_signature is not None
+                    and entry.runtime_settings_signature is not None
+                    and entry.runtime_settings_signature != expected_signature
+                ) or (
+                    runtime_settings is not None
+                    and entry.runtime_settings_signature is None
+                ):
+                    logger.info(
+                        "Runtime settings variant changed for %s; "
+                        "unloading before reload.",
+                        model_id,
+                    )
+                    await self._unload_engine(model_id)
                 # If force_lm requested but current engine is VLM, unload and reload
-                if force_lm and isinstance(entry.engine, VLMBatchedEngine):
+                if (
+                    entry.engine is not None
+                    and force_lm
+                    and isinstance(entry.engine, VLMBatchedEngine)
+                ):
                     logger.info(
                         f"Unloading VLM engine for {model_id} "
                         f"(force_lm=True, reloading as LM)"
                     )
                     await self._unload_engine(model_id)
-                else:
+                elif entry.engine is not None:
+                    if entry.runtime_settings_signature is None:
+                        entry.runtime_settings_signature = expected_signature
                     entry.last_access = time.time()
                     if _lease:
                         entry.in_use += 1
@@ -477,7 +639,11 @@ class EnginePool:
                     )
 
             # Now load the model
-            await self._load_engine(model_id, force_lm=force_lm)
+            await self._load_engine(
+                model_id,
+                force_lm=force_lm,
+                runtime_settings=runtime_settings,
+            )
 
             loaded = self._entries[model_id]
             if _lease:
@@ -796,6 +962,7 @@ class EnginePool:
         entry.engine = None
         entry.last_access = 0.0
         entry.actual_size = None
+        entry.runtime_settings_signature = None
 
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
@@ -906,7 +1073,12 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
-    async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
+    async def _load_engine(
+        self,
+        model_id: str,
+        force_lm: bool = False,
+        runtime_settings: object | None = None,
+    ) -> None:
         """
         Load an engine for the specified model.
 
@@ -937,8 +1109,8 @@ class EnginePool:
                 logger.info(f"Loading model: {model_id}")
 
             # Retrieve per-model settings for post-load transforms
-            model_settings = None
-            if self._settings_manager is not None:
+            model_settings = runtime_settings
+            if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
             # Native MTP forces LM-only dispatch even for VLM models. Vision
@@ -1258,6 +1430,12 @@ class EnginePool:
                         f"VLM MTP toggle on for {model_id} but drafter "
                         f"load failed; toggle ignored"
                     )
+
+            entry.runtime_settings_signature = self._engine_runtime_signature(
+                model_id,
+                model_settings,
+                loaded_engine=engine,
+            )
 
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:

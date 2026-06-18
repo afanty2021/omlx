@@ -1212,14 +1212,17 @@
                                     </div>
 
                                     <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
-                                            <!-- 1. Profile pill (emerald) if active_profile_name -->
-                                            <template x-if="model.settings?.active_profile_name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                                    <i data-lucide="settings" class="w-3 h-3"></i>
-                                                    <span x-text="model.settings.active_profile_name"></span>
+                                            <!-- 1. API-exposed profile pills -->
+                                            <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                                      @mouseenter="showTip($event.currentTarget, profileTooltip(profile))"
+                                                      @mouseleave="hideTip()">
+                                                    <span class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
+                                                          :class="profile.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
+                                                    <span x-text="profile.api_name || profile.name"></span>
                                                 </span>
                                             </template>
                                             <!-- 2. Preset pill (cyan) if settings match a preset exactly -->

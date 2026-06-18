@@ -17,6 +17,7 @@ from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
     filter_profile_fields,
     filter_universal_fields,
+    slugify_profile_api_name,
     validate_profile_name,
     utcnow,
 )
@@ -112,27 +113,45 @@ class ModelSettings:
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
-    forced_ct_kwargs: Optional[list[str]] = None  # Keys that cannot be overridden by API requests
+    forced_ct_kwargs: Optional[list[str]] = (
+        None  # Keys that cannot be overridden by API requests
+    )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
-    model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
-    model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
-    index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
-    enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
-    preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    model_type_override: Optional[str] = (
+        None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+    )
+    model_alias: Optional[str] = (
+        None  # API-visible name (alternative to directory name)
+    )
+    index_cache_freq: Optional[int] = (
+        None  # IndexCache: every Nth layer keeps indexer (DSA models only)
+    )
+    enable_thinking: Optional[bool] = (
+        None  # Explicit toggle for thinking/reasoning mode (None = auto)
+    )
+    preserve_thinking: Optional[bool] = (
+        None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
-    reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    reasoning_parser: Optional[str] = (
+        None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    )
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
-    turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
+    turboquant_skip_last: bool = (
+        True  # Skip last KVCache layer (prevents corruption on sensitive models)
+    )
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
-    specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
+    specprefill_draft_model: Optional[str] = (
+        None  # Path to draft model (must share tokenizer)
+    )
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
@@ -143,13 +162,21 @@ class ModelSettings:
     dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
     dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
-    dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    dflash_max_ctx: Optional[int] = (
+        None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    )
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
     dflash_in_memory_cache: bool = True
-    dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
-    dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
-    dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    dflash_in_memory_cache_max_entries: int = (
+        4  # Matches dflash balanced profile default
+    )
+    dflash_in_memory_cache_max_bytes: int = (
+        8 * 1024 * 1024 * 1024
+    )  # 8 GiB (balanced profile default)
+    dflash_ssd_cache: bool = (
+        False  # Requires in-memory cache and an omlx paged SSD cache dir
+    )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
     # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
@@ -170,8 +197,12 @@ class ModelSettings:
     # Mutually exclusive with all other speculative paths because the wrapper
     # bypasses mlx-lm BatchGenerator at decode time.
     vlm_mtp_enabled: bool = False
-    vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
-    vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
+    vlm_mtp_draft_model: Optional[str] = (
+        None  # Path / model id of the assistant drafter
+    )
+    vlm_mtp_draft_block_size: Optional[int] = (
+        None  # Tokens per draft round (None = mlx-vlm default)
+    )
 
     # Model management flags
     is_pinned: bool = False
@@ -337,7 +368,7 @@ class ModelSettingsManager:
             "models": {
                 model_id: settings.to_dict()
                 for model_id, settings in self._settings.items()
-            }
+            },
         }
 
         try:
@@ -378,11 +409,12 @@ class ModelSettingsManager:
         """Get settings for an API-requested model name.
 
         Exposed profile model IDs return the base model's settings merged
-        with the profile's universal (request-time) overrides; engine-
-        construction fields in the profile are ignored here and only take
-        effect when the profile is applied to the base model. Any other
-        name falls back to the settings of the already-resolved physical
-        model.
+        with the profile's universal (request-time) overrides. Engine-
+        construction fields are handled separately by
+        get_exposed_profile_runtime_settings_for_request(), which may trigger
+        a transient engine variant reload without mutating persisted settings.
+        Any other name falls back to the settings of the already-resolved
+        physical model.
         """
         with self._lock:
             candidates = [model_id]
@@ -501,12 +533,45 @@ class ModelSettingsManager:
                     f"Profiles file version {version} differs from current {PROFILES_VERSION}"
                 )
             self._profiles = data.get("profiles", {}) or {}
-            # Migration: strip ttl_seconds from existing profile settings
+            # Migration: strip ttl_seconds from existing profile settings and
+            # add api_name for exposed-model IDs without changing internal keys.
+            changed = False
             for model_id, profiles in self._profiles.items():
+                model_changed = False
+                used_api_names: set[str] = set()
                 for name, profile in profiles.items():
                     settings = profile.get("settings")
                     if settings and "ttl_seconds" in settings:
                         del settings["ttl_seconds"]
+                        changed = True
+                        model_changed = True
+                    current_api_name = profile.get("api_name")
+                    if current_api_name:
+                        try:
+                            validate_profile_name(current_api_name)
+                            base_api_name = current_api_name
+                        except Exception:
+                            base_api_name = slugify_profile_api_name(
+                                profile.get("display_name") or name,
+                                fallback="profile",
+                            )
+                    else:
+                        base_api_name = slugify_profile_api_name(
+                            profile.get("display_name") or name,
+                            fallback="profile",
+                        )
+                    api_name = self._dedupe_profile_api_name(
+                        base_api_name,
+                        used_api_names,
+                    )
+                    if current_api_name != api_name:
+                        profile["api_name"] = api_name
+                        changed = True
+                        model_changed = True
+                if model_changed:
+                    logger.info(f"Migrated profile api names for model '{model_id}'")
+            if changed:
+                self._save_profiles()
         except Exception as e:
             logger.error(f"Failed to load profiles file: {e}")
             self._profiles = {}
@@ -525,11 +590,54 @@ class ModelSettingsManager:
                 temp_file.unlink(missing_ok=True)
             raise
 
-    def _profile_model_id(self, model_id: str, profile_name: str) -> str:
-        return f"{model_id}:{profile_name}"
+    @staticmethod
+    def _dedupe_profile_api_name(base: str, used: set[str]) -> str:
+        validate_profile_name(base)
+        candidate = base
+        index = 2
+        while candidate in used:
+            suffix = f"-{index}"
+            root = base[: 32 - len(suffix)].rstrip("-_") or "profile"
+            candidate = f"{root}{suffix}"
+            index += 1
+        used.add(candidate)
+        return candidate
+
+    @staticmethod
+    def _profile_api_name(profile: Dict[str, Any]) -> str:
+        api_name = profile.get("api_name") or profile["name"]
+        validate_profile_name(api_name)
+        return api_name
+
+    def _allocate_profile_api_name_locked(
+        self,
+        profiles: Dict[str, Dict[str, Any]],
+        value: str | None,
+        *,
+        display_name: str | None,
+        internal_name: str,
+        exclude_name: str | None = None,
+    ) -> str:
+        if value:
+            validate_profile_name(value)
+            base = value
+        else:
+            base = slugify_profile_api_name(
+                display_name or internal_name,
+                fallback="profile",
+            )
+        used = {
+            self._profile_api_name(profile)
+            for name, profile in profiles.items()
+            if name != exclude_name
+        }
+        return self._dedupe_profile_api_name(base, used)
+
+    def _profile_model_id(self, model_id: str, api_name: str) -> str:
+        return f"{model_id}:{api_name}"
 
     def _display_profile_model_id_locked(
-        self, model_id: str, profile_name: str
+        self, model_id: str, profile: Dict[str, Any]
     ) -> str:
         """Advertised form of an exposed profile's model ID.
 
@@ -540,7 +648,7 @@ class ModelSettingsManager:
         """
         base = self._settings.get(model_id)
         display_base = base.model_alias if base and base.model_alias else model_id
-        return self._profile_model_id(display_base, profile_name)
+        return self._profile_model_id(display_base, self._profile_api_name(profile))
 
     def _find_exposed_profile_locked(
         self, model_id: str
@@ -551,10 +659,10 @@ class ModelSettingsManager:
             for profile in profiles.values():
                 if not profile.get("expose_as_model"):
                     continue
-                name = profile["name"]
-                if model_id == self._profile_model_id(base_model_id, name):
+                api_name = self._profile_api_name(profile)
+                if model_id == self._profile_model_id(base_model_id, api_name):
                     return base_model_id, profile
-                if alias and model_id == self._profile_model_id(alias, name):
+                if alias and model_id == self._profile_model_id(alias, api_name):
                     return base_model_id, profile
         return None
 
@@ -563,11 +671,19 @@ class ModelSettingsManager:
     ) -> ModelSettings:
         base = self._settings.get(model_id)
         merged = base.to_dict() if base is not None else {}
-        # Exposed profiles are request-time overlays, so only universal
-        # (request-time) fields apply. Engine-construction knobs in the
-        # profile can't vary per request on the shared engine; they take
-        # effect only when the profile is applied to the base model.
+        # Request-time settings still use only universal fields. Engine-
+        # construction fields are handled separately by
+        # get_exposed_profile_runtime_settings_for_request(), which can
+        # trigger an engine variant reload without persisting base settings.
         merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        return ModelSettings.from_dict(merged)
+
+    def _runtime_settings_with_profile_locked(
+        self, model_id: str, profile: Dict[str, Any]
+    ) -> ModelSettings:
+        base = self._settings.get(model_id)
+        merged = base.to_dict() if base is not None else {}
+        merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -582,6 +698,112 @@ class ModelSettingsManager:
                     return match[0]
             return None
 
+    def get_exposed_profile_runtime_settings_for_request(
+        self,
+        model_id: str,
+    ) -> Optional[tuple[str, ModelSettings]]:
+        """Return full runtime settings for an exposed profile request.
+
+        Unlike ``get_settings_for_request()``, this includes model-specific
+        engine-construction fields. It is used only for transient engine
+        loading and never mutates the base model's persisted settings.
+        """
+        with self._lock:
+            candidates = [model_id]
+            if "/" in model_id:
+                candidates.append(model_id.split("/", 1)[1])
+            for candidate in candidates:
+                match = self._find_exposed_profile_locked(candidate)
+                if match is not None:
+                    base_model_id, profile = match
+                    return (
+                        base_model_id,
+                        self._runtime_settings_with_profile_locked(
+                            base_model_id, profile
+                        ),
+                    )
+            return None
+
+    def get_exposed_profile_model_ids(
+        self,
+        *,
+        exclude_model_id: str | None = None,
+        exclude_profile_name: str | None = None,
+    ) -> set[str]:
+        """Return every request ID accepted by exposed profiles."""
+        with self._lock:
+            model_ids: set[str] = set()
+            for base_model_id, profiles in self._profiles.items():
+                base = self._settings.get(base_model_id)
+                alias = base.model_alias if base else None
+                for profile in profiles.values():
+                    if not profile.get("expose_as_model"):
+                        continue
+                    if (
+                        exclude_model_id == base_model_id
+                        and exclude_profile_name == profile["name"]
+                    ):
+                        continue
+                    api_name = self._profile_api_name(profile)
+                    model_ids.add(self._profile_model_id(base_model_id, api_name))
+                    if alias:
+                        model_ids.add(self._profile_model_id(alias, api_name))
+            return model_ids
+
+    def _profile_request_ids_locked(
+        self,
+        model_id: str,
+        profile: Dict[str, Any],
+    ) -> set[str]:
+        base = self._settings.get(model_id)
+        base_ids = {model_id}
+        if base and base.model_alias:
+            base_ids.add(base.model_alias)
+        api_name = self._profile_api_name(profile)
+        return {self._profile_model_id(base_id, api_name) for base_id in base_ids}
+
+    def _validate_exposed_profile_ids_available_locked(
+        self,
+        model_id: str,
+        profile: Dict[str, Any],
+        *,
+        exclude_profile_name: str | None = None,
+        reserved_model_ids: set[str] | None = None,
+    ) -> None:
+        if not profile.get("expose_as_model"):
+            return
+        candidate_ids = self._profile_request_ids_locked(model_id, profile)
+
+        if reserved_model_ids:
+            for candidate_id in candidate_ids:
+                if candidate_id != model_id and candidate_id in reserved_model_ids:
+                    raise ValueError(
+                        f"Exposed profile model ID '{candidate_id}' conflicts "
+                        "with a model directory name"
+                    )
+
+        for mid, settings in self._settings.items():
+            if settings.model_alias and settings.model_alias in candidate_ids:
+                raise ValueError(
+                    f"Exposed profile model ID '{settings.model_alias}' "
+                    f"conflicts with model alias for '{mid}'"
+                )
+
+        existing_ids: set[str] = set()
+        for base_model_id, profiles in self._profiles.items():
+            for other in profiles.values():
+                if not other.get("expose_as_model"):
+                    continue
+                if base_model_id == model_id and other["name"] == exclude_profile_name:
+                    continue
+                existing_ids.update(
+                    self._profile_request_ids_locked(base_model_id, other)
+                )
+        conflict = candidate_ids & existing_ids
+        if conflict:
+            conflict_id = sorted(conflict)[0]
+            raise ValueError(f"Exposed profile model ID '{conflict_id}' already exists")
+
     def list_exposed_profile_models(self) -> list[dict]:
         """Return profile records promoted to independently visible model IDs."""
         with self._lock:
@@ -592,7 +814,7 @@ class ModelSettingsManager:
                         continue
                     item = dict(profile)
                     item["model_id"] = self._display_profile_model_id_locked(
-                        base_model_id, profile["name"]
+                        base_model_id, profile
                     )
                     item["source_model_id"] = base_model_id
                     item["settings"] = self._settings_with_profile_locked(
@@ -605,9 +827,9 @@ class ModelSettingsManager:
     def _has_engine_fields(profile: Dict[str, Any]) -> bool:
         """True when the profile overrides any engine-construction field.
 
-        Those fields are inert on the exposed-model overlay (see
-        ``_settings_with_profile_locked``); UIs use this flag to warn when
-        a profile that carries them is exposed as a model.
+        Those fields are ignored by the request-time sampling overlay but are
+        used for transient engine variant reloads on exposed-profile requests.
+        UIs use this flag to indicate that a profile changes load-time state.
         """
         settings = profile.get("settings", {}) or {}
         return any(
@@ -622,9 +844,7 @@ class ModelSettingsManager:
             return [
                 {
                     **p,
-                    "model_id": self._display_profile_model_id_locked(
-                        model_id, p["name"]
-                    ),
+                    "model_id": self._display_profile_model_id_locked(model_id, p),
                     "has_engine_fields": self._has_engine_fields(p),
                 }
                 for p in per_model.values()
@@ -643,6 +863,8 @@ class ModelSettingsManager:
         settings: Dict[str, Any],
         source_template: Optional[str] = None,
         expose_as_model: bool = False,
+        api_name: Optional[str] = None,
+        reserved_model_ids: Optional[set[str]] = None,
     ) -> dict:
         """Create a new profile. Raises if name is invalid or already exists."""
         validate_profile_name(name)
@@ -650,11 +872,20 @@ class ModelSettingsManager:
         with self._lock:
             per_model = self._profiles.setdefault(model_id, {})
             if name in per_model:
-                raise ValueError(f"Profile '{name}' already exists for model '{model_id}'")
+                raise ValueError(
+                    f"Profile '{name}' already exists for model '{model_id}'"
+                )
             now = utcnow().isoformat()
-            per_model[name] = {
+            profile_api_name = self._allocate_profile_api_name_locked(
+                per_model,
+                api_name,
+                display_name=display_name,
+                internal_name=name,
+            )
+            profile_record = {
                 "name": name,
                 "display_name": display_name or name,
+                "api_name": profile_api_name,
                 "description": description,
                 "created_at": now,
                 "updated_at": now,
@@ -662,6 +893,12 @@ class ModelSettingsManager:
                 "source_template": source_template,
                 "expose_as_model": bool(expose_as_model),
             }
+            self._validate_exposed_profile_ids_available_locked(
+                model_id,
+                profile_record,
+                reserved_model_ids=reserved_model_ids,
+            )
+            per_model[name] = profile_record
             self._save_profiles()
             return dict(per_model[name])
 
@@ -676,6 +913,8 @@ class ModelSettingsManager:
         settings: Optional[Dict[str, Any]] = None,
         source_template: Optional[str] = None,
         expose_as_model: Optional[bool] = None,
+        api_name: Optional[str] = None,
+        reserved_model_ids: Optional[set[str]] = None,
     ) -> Optional[dict]:
         """Update a profile's metadata/settings. Returns updated dict or None if not found."""
         with self._lock:
@@ -696,6 +935,14 @@ class ModelSettingsManager:
                 rename_mode = True
             if display_name is not None:
                 profile["display_name"] = display_name
+            if api_name is not None:
+                profile["api_name"] = self._allocate_profile_api_name_locked(
+                    per_model,
+                    api_name,
+                    display_name=profile.get("display_name"),
+                    internal_name=target_name,
+                    exclude_name=name,
+                )
             if description is not None:
                 profile["description"] = description
             if settings is not None:
@@ -705,6 +952,12 @@ class ModelSettingsManager:
             if expose_as_model is not None:
                 profile["expose_as_model"] = bool(expose_as_model)
             profile["updated_at"] = utcnow().isoformat()
+            self._validate_exposed_profile_ids_available_locked(
+                model_id,
+                profile,
+                exclude_profile_name=name,
+                reserved_model_ids=reserved_model_ids,
+            )
 
             # Snapshot for rollback on write failure
             profiles_snapshot = copy.deepcopy(self._profiles)

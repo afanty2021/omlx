@@ -164,6 +164,7 @@ class CreateProfileRequest(BaseModel):
 
     name: str
     display_name: str
+    api_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     also_save_as_template: bool = False
@@ -176,6 +177,7 @@ class UpdateProfileRequest(BaseModel):
 
     new_name: str | None = None
     display_name: str | None = None
+    api_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] | None = None
     source_template: str | None = None
@@ -1863,6 +1865,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = asdict(settings)
+        if settings_manager:
+            model_data["exposed_profiles"] = [
+                profile
+                for profile in settings_manager.list_profiles(model_id)
+                if profile.get("expose_as_model")
+            ]
 
         models.append(model_data)
 
@@ -2058,6 +2066,12 @@ async def update_model_settings(
                         status_code=400,
                         detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
                     )
+            _raise_if_alias_conflicts_exposed_profiles(
+                alias_value=alias_value,
+                model_id=model_id,
+                settings_manager=settings_manager,
+                engine_pool=engine_pool,
+            )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
         valid_types = {
@@ -2539,6 +2553,81 @@ def _require_model(model_id: str):
     return entry
 
 
+def _model_aliases(
+    settings_manager, *, exclude_model_id: str | None = None
+) -> dict[str, str]:
+    return {
+        ms.model_alias: mid
+        for mid, ms in settings_manager.get_all_settings().items()
+        if mid != exclude_model_id and ms.model_alias
+    }
+
+
+def _raise_if_profile_id_conflicts_model_id(
+    candidate_id: str,
+    *,
+    model_id: str,
+    engine_pool,
+):
+    for existing_id in engine_pool.get_model_ids():
+        if existing_id != model_id and existing_id == candidate_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Exposed profile model ID '{candidate_id}' conflicts with "
+                    f"model directory name '{existing_id}'"
+                ),
+            )
+
+
+def _raise_if_alias_conflicts_exposed_profiles(
+    *,
+    alias_value: str,
+    model_id: str,
+    settings_manager,
+    engine_pool,
+):
+    exposed_ids = settings_manager.get_exposed_profile_model_ids()
+    if alias_value in exposed_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Alias '{alias_value}' conflicts with an exposed profile model ID",
+        )
+
+    aliases = _model_aliases(settings_manager, exclude_model_id=model_id)
+    for profile in settings_manager.list_profiles(model_id):
+        if not profile.get("expose_as_model"):
+            continue
+        api_name = profile.get("api_name") or profile["name"]
+        candidate_id = f"{alias_value}:{api_name}"
+        _raise_if_profile_id_conflicts_model_id(
+            candidate_id,
+            model_id=model_id,
+            engine_pool=engine_pool,
+        )
+        if candidate_id in aliases:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Alias '{alias_value}' would expose profile model ID "
+                    f"'{candidate_id}', which conflicts with model alias "
+                    f"for '{aliases[candidate_id]}'"
+                ),
+            )
+        other_exposed_ids = settings_manager.get_exposed_profile_model_ids(
+            exclude_model_id=model_id,
+            exclude_profile_name=profile["name"],
+        )
+        if candidate_id in other_exposed_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Alias '{alias_value}' would expose duplicate profile "
+                    f"model ID '{candidate_id}'"
+                ),
+            )
+
+
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
     model_id: str,
@@ -2559,6 +2648,7 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     _require_model(model_id)
+    engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
             model_id=model_id,
@@ -2568,6 +2658,10 @@ async def create_model_profile(
             settings=request.settings or {},
             source_template=request.source_template,
             expose_as_model=request.expose_as_model,
+            api_name=request.api_name,
+            reserved_model_ids=(
+                set(engine_pool.get_model_ids()) if engine_pool is not None else None
+            ),
         )
     except InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2598,6 +2692,7 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     _require_model(model_id)
+    engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
             model_id=model_id,
@@ -2608,6 +2703,10 @@ async def update_model_profile(
             settings=request.settings,
             source_template=request.source_template,
             expose_as_model=request.expose_as_model,
+            api_name=request.api_name,
+            reserved_model_ids=(
+                set(engine_pool.get_model_ids()) if engine_pool is not None else None
+            ),
         )
     except InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))
