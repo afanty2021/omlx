@@ -27,11 +27,13 @@ from omlx.oq import (
     _TrackedTensor,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
+    _build_streaming_proxy_for_sensitivity,
     _build_quant_plan,
     _discover_sanitize_plan,
     _extract_layer_index,
     _format_size,
     _forward_layer,
+    _forward_layer_result,
     _get_predicate_bits,
     _is_audio_tensor,
     _is_moe_router,
@@ -1233,6 +1235,22 @@ class TestForwardLayer:
         result = _forward_layer(block_only_one_arg, tensor, None, None)
         assert isinstance(result, mx.array)
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_glm_state_signature_returns_aux(self):
+        tensor = mx.ones((2, 4, 8))
+        seen = []
+
+        def glm_block(x, mask, cache, prev_topk):
+            seen.append((mask, cache, prev_topk))
+            return x + 1, "next_topk"
+
+        state = {"kind": "glm_moe_dsa", "prev_topk_indices": "prev_topk"}
+        result, aux = _forward_layer_result(glm_block, tensor, "mask", state)
+
+        assert isinstance(result, mx.array)
+        assert aux == "next_topk"
+        assert seen == [("mask", None, "prev_topk")]
+
 
 # =============================================================================
 # Test _LazyTensorIndex
@@ -1465,6 +1483,14 @@ class TestTrackedTensor:
         # no-args reverses all axes
         assert t.transpose().transform == "transpose_2_1_0"
 
+    def test_swapaxes_method(self):
+        t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
+        r = t.swapaxes(-1, -2)
+        assert r.shape == (2, 4, 3)
+        assert r.transform == "transpose_0_2_1"
+        assert r.sources == ["a"]
+        assert r.recipe == [("transpose", (0, 2, 1))]
+
     def test_getitem_ellipsis_half_split(self):
         # Sanitize patterns like gate_up[..., :mid, :] must round-trip through
         # the tracked-tensor dry run so streaming discovery covers low-RAM
@@ -1567,15 +1593,68 @@ class TestDiscoverSanitizePlan:
         assert "model.embed_tokens.weight" not in plan
         assert len(plan) == len(tensors) - 1
 
-    def test_non_replayable_slice_fails_discovery(self, sf_file):
+    def test_swapaxes_sanitize(self, sf_file):
+        path, _tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def swapaxes_sanitize(weights):
+            key = "model.layers.0.self_attn.q_proj.weight"
+            return {"q_swapped.weight": weights[key].swapaxes(-1, -2)}
+
+        plan = _discover_sanitize_plan(swapaxes_sanitize, idx)
+        assert plan["q_swapped.weight"]["shape"] == (8, 8)
+        assert plan["q_swapped.weight"]["transform"] == "transpose_1_0"
+
+    def test_slice_sanitize_replays(self, sf_file):
         path, tensors = sf_file
         idx = _LazyTensorIndex([path])
 
         def slice_sanitize(weights):
             return {k: v[:, :3] for k, v in weights.items()}
 
-        with pytest.raises(ValueError, match="non-replayable"):
-            _discover_sanitize_plan(slice_sanitize, idx)
+        plan = _discover_sanitize_plan(slice_sanitize, idx)
+        discovered = _DiscoveredPlan(plan, idx)
+        key = "model.layers.0.self_attn.q_proj.weight"
+        arr = discovered.pop(key)
+        np.testing.assert_allclose(
+            np.array(arr),
+            tensors[key][:, :3],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_reshape_slice_swapaxes_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensor = np.arange(2 * 6 * 4, dtype=np.float16).reshape(12, 4)
+        _write_safetensors(str(path), {"kv_b_proj.weight": tensor})
+        idx = _LazyTensorIndex([str(path)])
+
+        def glm_like_sanitize(weights):
+            v = weights["kv_b_proj.weight"].reshape(2, 6, -1)
+            return {
+                "embed_q.weight": v[:, :2, :].swapaxes(-1, -2),
+                "unembed_out.weight": v[:, 2:, :],
+            }
+
+        plan = _discover_sanitize_plan(glm_like_sanitize, idx)
+        discovered = _DiscoveredPlan(plan, idx)
+
+        expected = tensor.reshape(2, 6, 4)
+        embed_q = discovered.pop("embed_q.weight")
+        unembed_out = discovered.pop("unembed_out.weight")
+
+        np.testing.assert_allclose(
+            np.array(embed_q),
+            expected[:, :2, :].swapaxes(-1, -2),
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        np.testing.assert_allclose(
+            np.array(unembed_out),
+            expected[:, 2:, :],
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
     def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
         path = tmp_path / "mtp_norms.safetensors"
@@ -1676,54 +1755,86 @@ class TestBuildProxyForSensitivity:
     Without it, quantize_oq_streaming aborts with a RuntimeError.
     """
 
-    def test_invokes_mlx_lm_convert_with_uniform_4bit_affine(self, tmp_path):
-        """Proxy build delegates to mlx_lm.convert with uniform 4-bit affine."""
-        fake_convert = MagicMock()
-        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}):
-            proxy_dir = _build_proxy_for_sensitivity(
-                str(tmp_path / "src_model"), dtype="bfloat16"
-            )
-        assert fake_convert.call_count == 1
-        kwargs = fake_convert.call_args.kwargs
-        assert kwargs["hf_path"] == str(tmp_path / "src_model")
-        assert kwargs["quantize"] is True
-        assert kwargs["q_bits"] == _PROXY_QUANT_BITS
-        assert kwargs["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
-        assert kwargs["q_mode"] == "affine"
-        assert kwargs["dtype"] == "bfloat16"
-        # Returned path is what was passed as mlx_path.
-        assert kwargs["mlx_path"] == str(proxy_dir)
+    def test_invokes_streaming_proxy_builder(self, tmp_path, monkeypatch):
+        """Proxy build uses oQ's streaming writer, not mlx_lm.convert."""
+        from omlx import oq as _oq
+
+        calls = []
+
+        def _fake_build(model_path, output_path, *, dtype, trust_remote_code=False):
+            calls.append((model_path, output_path, dtype, trust_remote_code))
+            output_path.mkdir()
+
+        monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
+        proxy_dir = _build_proxy_for_sensitivity(
+            str(tmp_path / "src_model"),
+            dtype="bfloat16",
+            trust_remote_code=True,
+        )
+
+        assert calls == [
+            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)
+        ]
+        assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
         """Proxy lives under the system temp dir, not next to the source."""
         import tempfile
 
-        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}):
+        from omlx import oq as _oq
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            _oq,
+            "_build_streaming_proxy_for_sensitivity",
+            lambda _model, output, **_kwargs: output.mkdir(),
+        )
+        try:
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"), dtype="bfloat16"
             )
+        finally:
+            monkeypatch.undo()
         # tempfile.gettempdir() is the system temp root (e.g. /tmp).
         assert str(proxy_dir).startswith(tempfile.gettempdir())
         assert proxy_dir.name.startswith("omlx_oq_proxy_")
 
     def test_caller_is_responsible_for_cleanup(self, tmp_path):
         """The helper does not auto-delete the proxy; caller cleans up."""
-        fake_convert = MagicMock(
-            side_effect=lambda **kw: __import__("os").makedirs(kw["mlx_path"])
+        from omlx import oq as _oq
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            _oq,
+            "_build_streaming_proxy_for_sensitivity",
+            lambda _model, output, **_kwargs: output.mkdir(),
         )
-        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}):
+        try:
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"), dtype="bfloat16"
             )
+        finally:
+            monkeypatch.undo()
         # The directory should still exist after the helper returns.
         assert proxy_dir.exists()
 
     def test_propagates_dtype_argument(self, tmp_path):
         """dtype is forwarded so the proxy matches the target output dtype."""
-        fake_convert = MagicMock()
-        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}):
+        from omlx import oq as _oq
+
+        captured = {}
+
+        def _fake_build(_model, output, **kwargs):
+            captured.update(kwargs)
+            output.mkdir()
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
+        try:
             _build_proxy_for_sensitivity(str(tmp_path / "src_model"), dtype="float16")
-        assert fake_convert.call_args.kwargs["dtype"] == "float16"
+        finally:
+            monkeypatch.undo()
+        assert captured["dtype"] == "float16"
 
     def test_working_dir_pins_proxy_to_output_volume(self, tmp_path):
         """working_dir sets where mkdtemp anchors the proxy.
@@ -1734,13 +1845,59 @@ class TestBuildProxyForSensitivity:
         """
         anchor = tmp_path / "out_volume"
         anchor.mkdir()
-        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}):
+        from omlx import oq as _oq
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            _oq,
+            "_build_streaming_proxy_for_sensitivity",
+            lambda _model, output, **_kwargs: output.mkdir(),
+        )
+        try:
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"),
                 dtype="bfloat16",
                 working_dir=str(anchor),
             )
+        finally:
+            monkeypatch.undo()
         assert proxy_dir.parent == anchor
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_streaming_proxy_writes_loadable_quantized_config(self, tmp_path):
+        """The streaming proxy can quantize from safetensors without convert()."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        out = tmp_path / "proxy"
+        src.mkdir()
+        (src / "config.json").write_text(
+            json.dumps({"model_type": "llama", "num_hidden_layers": 1}),
+            encoding="utf-8",
+        )
+        np_save(
+            {
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (8, 64), dtype=np.float16
+                ),
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    (64,), dtype=np.float16
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+
+        with patch("omlx.oq._build_model_sanitizer", return_value=None), patch(
+            "omlx.oq._build_non_quantizable_set", return_value=set()
+        ):
+            _build_streaming_proxy_for_sensitivity(
+                str(src), out, dtype="bfloat16"
+            )
+
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        assert config["quantization"]["bits"] == _PROXY_QUANT_BITS
+        assert config["quantization"]["group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert (out / "model.safetensors").exists()
 
 
 class TestSensitivityRequiredEnforcement:
@@ -1848,12 +2005,13 @@ class TestSensitivityRequiredEnforcement:
         from omlx import settings as _settings
 
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
-        # Stub mlx_lm.convert so that the proxy build raises.
-        fake_mlx_lm = MagicMock()
-        fake_mlx_lm.convert = MagicMock(
-            side_effect=RuntimeError("simulated build fail")
+        from omlx import oq as _oq
+
+        monkeypatch.setattr(
+            _oq,
+            "_build_streaming_proxy_for_sensitivity",
+            MagicMock(side_effect=RuntimeError("simulated build fail")),
         )
-        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
 
         with pytest.raises(RuntimeError, match="auto-proxy sensitivity failed"):
             quantize_oq_streaming(
@@ -1908,6 +2066,23 @@ class TestOnTheFlyFp8Dequant:
         result = idx.pop("layer.weight")
         assert result.dtype == mx.bfloat16
         assert "layer.weight" not in idx._index
+
+    def test_mxfp_partial_block_scale_convention(self, tmp_path):
+        """FP8 block scales may use ceil(rows / 128) partial tail blocks."""
+        w = np.random.randint(0, 255, (129, 256), dtype=np.uint8)
+        s = np.full((2, 2), 127, dtype=np.uint8)
+        path = str(tmp_path / "mxfp_partial.safetensors")
+        _write_safetensors(
+            path,
+            {
+                "layer.weight": (w.tobytes(), [129, 256], "F8_E4M3"),
+                "layer.scale": (s.tobytes(), [2, 2], "F8_E8M0"),
+            },
+        )
+        idx = _LazyTensorIndex([path])
+        result = idx.pop("layer.weight")
+        assert result.shape == (129, 256)
+        assert result.dtype == mx.bfloat16
 
     def test_i8_with_e8m0_scale_is_fp4_packed(self, tmp_path):
         """I8 bytes with a (rows, byte_cols/16) E8M0 scale are FP4-packed
@@ -2612,7 +2787,7 @@ class TestQuantizeOqStreamingFp8:
         meta = idx.logical_metadata()
         for k in meta:
             assert not k.endswith(".scale"), f"scale key visible: {k}"
-        for k, (shape, dtype) in meta.items():
+        for k, (_shape, dtype) in meta.items():
             if "self_attn" in k or "mlp" in k:
                 if k.endswith(".weight"):
                     assert dtype == "BF16", f"{k}: dtype={dtype}, expected BF16"
@@ -2638,6 +2813,35 @@ class TestQuantizeOqStreamingFp8:
         assert any("layernorm" in k for k in out_keys)
         # Attention weights should be quantized (have .scales)
         assert any("self_attn" in k and k.endswith(".scales") for k in out_keys)
+
+    def test_streaming_sensitivity_proxy_handles_fp8_source(
+        self, tmp_path, monkeypatch
+    ):
+        """The sensitivity proxy writer handles FP8 sources without convert()."""
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=64, fp8_convention="mxfp")
+        out = tmp_path / "proxy"
+
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *_a, **_k: None)
+        monkeypatch.setattr("omlx.oq._build_non_quantizable_set", lambda _config: set())
+
+        _build_streaming_proxy_for_sensitivity(str(src), out, dtype="bfloat16")
+
+        proxy_config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        assert proxy_config["quantization"]["bits"] == _PROXY_QUANT_BITS
+        assert proxy_config["quantization"]["group_size"] == _PROXY_QUANT_GROUP_SIZE
+
+        from safetensors import safe_open
+
+        out_keys = set()
+        for sf in out.glob("*.safetensors"):
+            with safe_open(str(sf), framework="numpy") as f:
+                out_keys.update(f.keys())
+
+        assert out_keys
+        assert not any(k.endswith(".scale") for k in out_keys)
+        assert any(k.endswith(".scales") for k in out_keys)
 
     def test_i8_expert_weights_with_mxfp_scale(self, tmp_path):
         """I8 expert weights with E8M0 microscaling (1x16 block) dequant
@@ -2811,41 +3015,26 @@ class TestBuildModelSanitizerTextOnly:
 
 
 class TestBuildProxyForSensitivityMtpPatch:
-    """Tests for the MTP patch gating in _build_proxy_for_sensitivity.
+    """Regression tests for MTP responsibility in proxy building.
 
-    The function must temporarily activate the MTP patch during
-    ``mlx_lm.convert()`` so that MTP-bearing models (Qwen3.5, DeepSeek-V4)
-    are converted correctly. After conversion the previous MTP state must
-    be restored regardless of success or failure.
+    _build_proxy_for_sensitivity is now a thin wrapper around the streaming
+    proxy writer. It must not toggle global MTP state itself; MTP attach/restore
+    belongs to the sanitizer and sensitivity-load paths.
     """
 
-    def _make_mocks(self, patch_return=True, is_active=False, convert_side_effect=None):
-        mock_apply = MagicMock(return_value=patch_return)
-        mock_is_active = MagicMock(return_value=is_active)
-        mock_set_active = MagicMock()
-        mock_convert = MagicMock(side_effect=convert_side_effect)
-        return (
-            MagicMock(
-                apply_mlx_lm_mtp_patch=mock_apply,
-                is_mtp_active=mock_is_active,
-                set_mtp_active=mock_set_active,
-            ),
-            mock_apply,
-            mock_is_active,
-            mock_set_active,
-            mock_convert,
+    def test_wrapper_does_not_toggle_mtp_state(self, tmp_path, monkeypatch):
+        mtp_mod = MagicMock(
+            apply_mlx_lm_mtp_patch=MagicMock(return_value=True),
+            is_mtp_active=MagicMock(return_value=False),
+            set_mtp_active=MagicMock(),
         )
-
-    def _patch(self, monkeypatch, mtp_mod, mock_convert):
         monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", mtp_mod)
-        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
 
-    def test_happy_path_with_active_patch(self, tmp_path, monkeypatch):
-        """MTP patch applied → state toggled → convert called with correct kwargs → state restored."""
-        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = (
-            self._make_mocks()
+        build_mock = MagicMock(side_effect=lambda _m, out, **_kw: out.mkdir())
+        monkeypatch.setattr(
+            "omlx.oq._build_streaming_proxy_for_sensitivity",
+            build_mock,
         )
-        self._patch(monkeypatch, mtp_mod, mock_convert)
 
         result = _build_proxy_for_sensitivity(
             "/my/model",
@@ -2858,29 +3047,19 @@ class TestBuildProxyForSensitivityMtpPatch:
         assert result.name.startswith("omlx_oq_proxy_")
         assert result.parent == tmp_path
 
-        mock_apply.assert_called_once()
-        assert mock_set_active.call_count == 2
-        assert mock_set_active.call_args_list[0] == ((True,),)
-        assert mock_set_active.call_args_list[-1] == ((False,),)
+        mtp_mod.apply_mlx_lm_mtp_patch.assert_not_called()
+        mtp_mod.is_mtp_active.assert_not_called()
+        mtp_mod.set_mtp_active.assert_not_called()
+        build_mock.assert_called_once()
+        assert build_mock.call_args.kwargs["dtype"] == "bfloat16"
+        assert build_mock.call_args.kwargs["trust_remote_code"] is True
 
-        kw = mock_convert.call_args.kwargs
-        assert kw["hf_path"] == "/my/model"
-        assert kw["quantize"] is True
-        assert kw["q_bits"] == _PROXY_QUANT_BITS
-        assert kw["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
-        assert kw["q_mode"] == "affine"
-        assert kw["dtype"] == "bfloat16"
-        assert kw["trust_remote_code"] is True
-
-    @pytest.mark.parametrize("prev_state", [False, True])
-    def test_state_restored_on_error(self, tmp_path, monkeypatch, prev_state):
-        """Convert error → finally block restores previous MTP state."""
-        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
-            convert_side_effect=RuntimeError("boom"),
-            is_active=prev_state,
+    def test_streaming_helper_error_propagates(self, tmp_path, monkeypatch):
+        build_mock = MagicMock(side_effect=RuntimeError("boom"))
+        monkeypatch.setattr(
+            "omlx.oq._build_streaming_proxy_for_sensitivity",
+            build_mock,
         )
-        self._patch(monkeypatch, mtp_mod, mock_convert)
-
         with pytest.raises(RuntimeError, match="boom"):
             _build_proxy_for_sensitivity(
                 "/fake/model",
@@ -2888,39 +3067,7 @@ class TestBuildProxyForSensitivityMtpPatch:
                 working_dir=str(tmp_path),
             )
 
-        assert mock_set_active.call_count == 2
-        assert mock_set_active.call_args_list[-1] == ((prev_state,),)
-
-    def test_patch_returns_false_no_toggle(self, tmp_path, monkeypatch):
-        """apply_mlx_lm_mtp_patch returns False → no MTP toggle, convert is still called."""
-        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
-            patch_return=False
-        )
-        self._patch(monkeypatch, mtp_mod, mock_convert)
-
-        _build_proxy_for_sensitivity(
-            "/fake/model",
-            dtype="float16",
-            working_dir=str(tmp_path),
-        )
-
-        mock_set_active.assert_not_called()
-        mock_convert.assert_called_once()
-
-    def test_import_fails_graceful_degradation(self, tmp_path, monkeypatch):
-        """MTP patch import raises → function proceeds without MTP gating."""
-        mock_convert = MagicMock()
-        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", None)
-        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
-
-        result = _build_proxy_for_sensitivity(
-            "/fake/model",
-            dtype="float16",
-            working_dir=str(tmp_path),
-        )
-
-        assert isinstance(result, Path)
-        mock_convert.assert_called_once()
+        build_mock.assert_called_once()
 
 
 # =============================================================================
@@ -3283,8 +3430,8 @@ class TestPrecomputedSensitivityMap:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestReplayChainGuards:
-    """Chained transforms (only the last is tracked) must fall back to
-    eager sanitize instead of silently mis-replaying."""
+    """Chained transforms should replay in order instead of silently
+    materializing only the final transform."""
 
     def _idx(self, tmp_path):
         path = str(tmp_path / "w.safetensors")
@@ -3294,7 +3441,7 @@ class TestReplayChainGuards:
         )
         return _LazyTensorIndex([path])
 
-    def test_reshape_then_astype_falls_back(self, tmp_path):
+    def test_reshape_then_astype_replays(self, tmp_path):
         idx = self._idx(tmp_path)
 
         def sanitize(weights):
@@ -3302,10 +3449,20 @@ class TestReplayChainGuards:
             out["w.weight"] = out["w.weight"].reshape(2, 2, -1).astype(mx.int32)
             return out
 
-        with pytest.raises(ValueError, match="shape-changing"):
-            _discover_sanitize_plan(sanitize, idx)
+        plan = _discover_sanitize_plan(sanitize, idx)
+        info = plan["w.weight"]
+        assert info["recipe"][0][0] == "reshape"
+        assert info["recipe"][1][0] == "astype"
 
-    def test_astype_then_reshape_falls_back(self, tmp_path):
+        result = _DiscoveredPlan(plan, idx).pop("w.weight")
+        assert result.shape == (2, 2, 8)
+        assert result.dtype == mx.int32
+        np.testing.assert_array_equal(
+            np.array(result),
+            np.arange(32, dtype=np.int32).reshape(2, 2, 8),
+        )
+
+    def test_astype_then_reshape_replays(self, tmp_path):
         idx = self._idx(tmp_path)
 
         def sanitize(weights):
@@ -3313,8 +3470,18 @@ class TestReplayChainGuards:
             out["w.weight"] = out["w.weight"].astype(mx.int32).reshape(2, 2, -1)
             return out
 
-        with pytest.raises(ValueError, match="dtype-changing"):
-            _discover_sanitize_plan(sanitize, idx)
+        plan = _discover_sanitize_plan(sanitize, idx)
+        info = plan["w.weight"]
+        assert info["recipe"][0][0] == "astype"
+        assert info["recipe"][1][0] == "reshape"
+
+        result = _DiscoveredPlan(plan, idx).pop("w.weight")
+        assert result.shape == (2, 2, 8)
+        assert result.dtype == mx.int32
+        np.testing.assert_array_equal(
+            np.array(result),
+            np.arange(32, dtype=np.int32).reshape(2, 2, 8),
+        )
 
 
 # =============================================================================

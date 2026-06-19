@@ -272,13 +272,14 @@ class _StoreCacheGate:
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
     from .cache.paged_ssd_cache import PagedSSDCacheManager
-    from .memory_monitor import MemoryMonitor
+    from .memory_monitor import MemoryMonitor, estimate_mla_kv_bytes_per_token
 
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
+    estimate_mla_kv_bytes_per_token = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -9621,6 +9622,16 @@ class Scheduler:
                 else:
                     dtype_size = tq_dtype_size
 
+            kv_bytes_per_token = (
+                estimate_mla_kv_bytes_per_token(
+                    config,
+                    cache_list_for_tq,
+                    base_dtype_size,
+                )
+                if estimate_mla_kv_bytes_per_token is not None
+                else None
+            )
+
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
             # ``model.config``) are truthy but fail any later numeric
@@ -9640,6 +9651,7 @@ class Scheduler:
                     # SDPA scores are materialized at the compute/activation
                     # dtype, not the (possibly fractional TurboQuant) KV width.
                     compute_dtype_size=base_dtype_size,
+                    kv_bytes_per_token=kv_bytes_per_token,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "

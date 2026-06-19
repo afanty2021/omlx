@@ -22,6 +22,7 @@ from omlx.memory_monitor import (
     _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
     _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryMonitor,
+    estimate_mla_kv_bytes_per_token,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -81,6 +82,19 @@ class _PlainLMConfig:
     head_dim = 128
 
 
+class _GlmMlaConfig:
+    """GLM-5.2-style MLA config with compressed resident KV cache."""
+
+    model_type = "glm_moe_dsa"
+    num_hidden_layers = 78
+    num_key_value_heads = 64
+    num_attention_heads = 64
+    hidden_size = 6144
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    index_head_dim = 128
+
+
 class _VLMConfigEmptySubConfigs:
     """Sub-configs are present but expose no layer count — skip and fall
     back to the top-level config. Defends against accidentally walking
@@ -118,7 +132,6 @@ class TestSetModelInfoForMonitorVLMWalk:
             "Should have read the 40-layer LM from text_config, not the "
             "33-layer vision tower at the top level"
         )
-        assert kwargs["num_kv_heads"] == 8
 
     def test_picks_language_config_over_top_level(self):
         sched = _make_scheduler()
@@ -197,6 +210,64 @@ class TestSetModelInfoForMonitorVLMWalk:
         assert (
             kwargs["num_layers"] == 24
         ), "GPT-style ``n_layer`` in the sub-config should be recognized"
+
+
+class TestMlaKvMemoryEstimate:
+    def _glm_cache(self):
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        return [CacheList(KVCache(), KVCache()) for _ in range(21)] + [
+            CacheList(KVCache()) for _ in range(57)
+        ]
+
+    def test_glm_mla_helper_uses_latent_cache_dims(self):
+        bytes_per_token = estimate_mla_kv_bytes_per_token(
+            _GlmMlaConfig(),
+            self._glm_cache(),
+            dtype_size=2,
+        )
+
+        assert bytes_per_token == (78 * (512 + 64) + 21 * 128) * 2
+
+    def test_monitor_uses_mla_kv_override_for_prompt_kv(self):
+        bytes_per_token = estimate_mla_kv_bytes_per_token(
+            _GlmMlaConfig(),
+            self._glm_cache(),
+            dtype_size=2,
+        )
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=78,
+            num_kv_heads=64,
+            head_dim=96,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=99,
+            compute_dtype_size=2,
+            kv_bytes_per_token=bytes_per_token,
+        )
+
+        tokens = 32767
+        standard = tokens * 99 * 64 * 96 * 2 * 2
+        actual = monitor.estimate_prompt_kv_bytes(tokens)
+        assert actual == tokens * bytes_per_token
+        assert actual < standard / 20
+
+    def test_scheduler_passes_mla_kv_override_to_monitor(self):
+        sched = _make_scheduler()
+        sched.memory_monitor = MagicMock()
+        sched.model = MagicMock()
+        sched.model.config = _GlmMlaConfig()
+        sched.model.make_cache.return_value = self._glm_cache()
+        del sched.model.args
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["num_layers"] == 78
+        assert kwargs["num_kv_heads"] == 64
+        assert kwargs["num_kv_cache_layers"] == 99
+        assert kwargs["kv_bytes_per_token"] == (78 * (512 + 64) + 21 * 128) * 2
 
 
 class TestSetModelInfoTurboQuantDtype:

@@ -50,7 +50,8 @@ class ModelSettings:
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
         model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
-        index_cache_freq: IndexCache: every Nth layer keeps indexer (DSA models only).
+        index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
+            only; GLM-5.2 uses its native checkpoint schedule).
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
@@ -124,7 +125,7 @@ class ModelSettings:
         None  # API-visible name (alternative to directory name)
     )
     index_cache_freq: Optional[int] = (
-        None  # IndexCache: every Nth layer keeps indexer (DSA models only)
+        None  # IndexCache: every Nth layer keeps indexer (DeepSeek DSA only)
     )
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)

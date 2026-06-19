@@ -129,7 +129,9 @@ class MemoryMonitor:
         self._num_layers: Optional[int] = None
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
-        self._dtype_size: float = 2  # KV storage width (may be fractional w/ TurboQuant)
+        # KV storage width; may be fractional with TurboQuant.
+        self._dtype_size: float = 2
+        self._kv_bytes_per_token_override: float | None = None
         # SDPA score-matrix width = model compute/activation dtype, distinct from
         # _dtype_size (which the scheduler may override to a fractional TurboQuant
         # KV width). Set via set_model_info(compute_dtype_size=...).
@@ -313,6 +315,7 @@ class MemoryMonitor:
         num_attention_heads: Optional[int] = None,
         num_kv_cache_layers: Optional[int] = None,
         compute_dtype_size: Optional[float] = None,
+        kv_bytes_per_token: Optional[float] = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -333,6 +336,10 @@ class MemoryMonitor:
                 for the unfused SDPA score-matrix transient, which is allocated
                 at the activation dtype regardless of KV quantization. Defaults
                 to the fp16/bf16 fallback when unknown.
+            kv_bytes_per_token: Optional exact resident KV-cache bytes added
+                per token. Use for compressed-cache architectures such as MLA
+                where stored cache tensors are not representable as uniform
+                ``num_kv_heads * head_dim * 2`` K/V tensors.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -343,19 +350,30 @@ class MemoryMonitor:
             if compute_dtype_size and compute_dtype_size > 0
             else _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         )
+        self._kv_bytes_per_token_override = (
+            float(kv_bytes_per_token)
+            if kv_bytes_per_token is not None and kv_bytes_per_token > 0
+            else None
+        )
         self._num_attention_heads = num_attention_heads or num_kv_heads
         self._num_kv_cache_layers = num_kv_cache_layers or num_layers
 
         # Log estimated memory per block
         if num_layers and num_kv_heads and head_dim:
             sample_block_mem = self.estimate_block_memory(64)  # 64 tokens
+            override_note = (
+                ", KV override "
+                f"{format_bytes(int(self._kv_bytes_per_token_override))}/tok"
+                if self._kv_bytes_per_token_override
+                else ""
+            )
             logger.info(
                 f"Model info set: {num_layers} layers "
                 f"({self._num_kv_cache_layers} KVCache), "
                 f"{num_kv_heads} KV heads, "
                 f"{self._num_attention_heads} Q heads, "
                 f"{head_dim} head_dim. Estimated memory per 64-token block: "
-                f"{format_bytes(sample_block_mem)}"
+                f"{format_bytes(sample_block_mem)}{override_note}"
             )
 
     def has_model_info(self) -> bool:
@@ -404,6 +422,15 @@ class MemoryMonitor:
         dim = head_dim or self._head_dim or 128
         dtype = dtype_size or self._dtype_size
 
+        if (
+            self._kv_bytes_per_token_override is not None
+            and num_layers is None
+            and num_kv_heads is None
+            and head_dim is None
+            and dtype_size is None
+        ):
+            return block_size * self._kv_bytes_per_token_override
+
         # Memory per layer: keys + values
         # Shape: (batch=1, kv_heads, block_size, head_dim)
         per_layer = block_size * kv_heads * dim * dtype * 2  # *2 for keys+values
@@ -431,6 +458,9 @@ class MemoryMonitor:
 
         if not (layers and kv_heads and dim):
             return 0
+
+        if self._kv_bytes_per_token_override is not None:
+            return num_tokens * self._kv_bytes_per_token_override
 
         # KVCache layers: memory grows with num_tokens
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
@@ -627,6 +657,67 @@ class MemoryMonitor:
         )
 
 
+def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _pos_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def estimate_mla_kv_bytes_per_token(
+    config: Any,
+    cache_list: Any,
+    dtype_size: float,
+) -> float | None:
+    """Estimate exact resident KV bytes/token for MLA-style caches.
+
+    GLM/DeepSeek MLA models do not store expanded ``num_kv_heads * head_dim``
+    K/V tensors. Their main cache stores a latent key and RoPE value
+    (``kv_lora_rank + qk_rope_head_dim``) with a single KV head. GLM-5.2's DSA
+    indexer adds a second cache on full-indexer layers containing only
+    ``index_head_dim`` keys and zero-width values. Falling back to the standard
+    uniform KV formula over-counts GLM-5.2 by more than an order of magnitude.
+    """
+    kv_lora_rank = _cfg_get(config, "kv_lora_rank")
+    rope_dim = _cfg_get(config, "qk_rope_head_dim")
+    if not (_pos_int(kv_lora_rank) and _pos_int(rope_dim)):
+        return None
+
+    if cache_list is None:
+        return None
+
+    main_cache_layers = 0
+    indexer_cache_layers = 0
+    try:
+        for layer_cache in cache_list:
+            caches = getattr(layer_cache, "caches", None)
+            if caches is None:
+                continue
+            n_caches = len(caches)
+            if n_caches >= 1:
+                main_cache_layers += 1
+            if n_caches >= 2:
+                indexer_cache_layers += 1
+    except Exception:
+        return None
+
+    if main_cache_layers <= 0:
+        return None
+
+    index_head_dim = _cfg_get(config, "index_head_dim", 0) or 0
+    if not _pos_int(index_head_dim):
+        index_head_dim = 0
+
+    elems_per_token = (
+        main_cache_layers * (kv_lora_rank + rope_dim)
+        + indexer_cache_layers * index_head_dim
+    )
+    return float(elems_per_token) * float(dtype_size)
+
+
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
@@ -654,11 +745,6 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         if config is None:
             logger.debug("Could not extract model config for memory estimation")
             return
-
-        def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
-            if isinstance(obj, dict):
-                return obj.get(key, default)
-            return getattr(obj, key, default)
 
         # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
         # language-model dimensions under a sub-config. Prefer
@@ -712,6 +798,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         # Count KVCache layers for hybrid models. Mirrors
         # Scheduler._set_model_info_for_monitor: recurse into CacheList so
         # wrapped full-attention layers are counted, not just bare KVCache.
+        cache_list = None
         num_kv_cache_layers = num_layers
         if hasattr(model, "make_cache"):
             try:
@@ -731,13 +818,14 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             except Exception:
                 pass
 
+        kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
+            config, cache_list, dtype_size
+        )
+
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
         # inside MemoryMonitor. Insist on real positive integers before calling.
-        def _pos_int(v: Any) -> bool:
-            return isinstance(v, int) and not isinstance(v, bool) and v > 0
-
         if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
             monitor.set_model_info(
                 num_layers=num_layers,
@@ -749,6 +837,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 # This path uses the uncompressed base dtype for KV, so
                 # dtype_size already equals the compute/activation dtype.
                 compute_dtype_size=dtype_size,
+                kv_bytes_per_token=kv_bytes_per_token,
             )
             logger.debug(
                 f"Model info for memory estimation: "
