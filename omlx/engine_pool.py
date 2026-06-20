@@ -37,6 +37,7 @@ from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
+    ModelBusyError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
@@ -55,23 +56,52 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: Literal[
+        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+    ]  # Model type
+    engine_type: Literal[
+        "batched",
+        "simple",
+        "embedding",
+        "reranker",
+        "vlm",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+    ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     actual_size: int | None = None  # Observed process-memory delta after load settles
-    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
-    preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
-    model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    config_model_type: str = (
+        ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    )
+    thinking_default: bool | None = (
+        None  # True if model thinks by default, False if not, None if unknown
+    )
+    preserve_thinking_default: bool | None = (
+        None  # True when template supports preserve_thinking (Qwen 3.6+)
+    )
+    model_context_length: int | None = (
+        None  # Declared context length from config.json (None if unknown)
+    )
     source_type: str = "local"
     source_repo_id: str | None = None
-    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
+    engine: (
+        BaseEngine
+        | EmbeddingEngine
+        | RerankerEngine
+        | STTEngine
+        | STSEngine
+        | TTSEngine
+        | None
+    ) = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
+    abort_requested: bool = False  # Set under hard pressure for leased requests
+    pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
 
 
@@ -263,7 +293,9 @@ class EnginePool:
             )
             add("dflash_ssd_cache", bool(data.get("dflash_ssd_cache", False)))
             if data.get("dflash_ssd_cache", False):
-                add("dflash_ssd_cache_max_bytes", data.get("dflash_ssd_cache_max_bytes"))
+                add(
+                    "dflash_ssd_cache_max_bytes", data.get("dflash_ssd_cache_max_bytes")
+                )
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
@@ -495,6 +527,98 @@ class EnginePool:
 
         return model_id_or_alias
 
+    @staticmethod
+    def _entry_has_active_requests(entry: EngineEntry) -> bool:
+        engine = entry.engine
+        if engine is None:
+            return False
+        has_active_requests = getattr(engine, "has_active_requests", None)
+        if not callable(has_active_requests):
+            return False
+        try:
+            return has_active_requests() is True
+        except Exception:
+            return True
+
+    def _entry_is_busy(self, entry: EngineEntry) -> bool:
+        return entry.in_use > 0 or self._entry_has_active_requests(entry)
+
+    def _raise_if_reload_busy(self, entry: EngineEntry, operation: str) -> None:
+        if self._entry_is_busy(entry):
+            raise ModelBusyError(entry.model_id, operation)
+
+    def _mark_pending_unload_locked(
+        self,
+        model_id: str,
+        reason: str,
+        *,
+        abort_requested: bool = False,
+    ) -> bool:
+        """Mark a loaded non-pinned model for unload once it is no longer busy.
+
+        Caller must hold ``self._lock``. Returns True when a pending marker was
+        installed. The method deliberately does not unload by itself; call
+        ``_unload_pending_if_idle_locked`` after abort/release state changes.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None or entry.engine is None or entry.is_loading or entry.is_pinned:
+            return False
+        entry.pending_unload_reason = reason
+        if abort_requested:
+            entry.abort_requested = True
+        return True
+
+    def _find_pending_unload_ready_locked(self) -> str | None:
+        candidates: list[tuple[float, str]] = []
+        for mid, entry in self._entries.items():
+            if not entry.pending_unload_reason:
+                continue
+            if (
+                entry.engine is None
+                or entry.is_loading
+                or entry.is_pinned
+                or self._entry_is_busy(entry)
+            ):
+                continue
+            candidates.append((entry.last_access, mid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    async def _unload_pending_if_idle_locked(self, model_id: str) -> bool:
+        """Unload a pending model if all leases and active requests have drained.
+
+        Caller must hold ``self._lock``.
+        """
+        entry = self._entries.get(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or not entry.pending_unload_reason
+            or entry.is_loading
+            or entry.is_pinned
+            or self._entry_is_busy(entry)
+        ):
+            return False
+
+        reason = entry.pending_unload_reason
+        entry.pending_unload_reason = None
+        entry.abort_requested = False
+        logger.warning(
+            "Unloading pending model '%s' after activity drained (%s)",
+            model_id,
+            reason,
+        )
+        await self._unload_engine(model_id)
+        return True
+
+    def is_abort_requested(self, model_id: str | None) -> bool:
+        if model_id is None:
+            return False
+        entry = self._entries.get(model_id)
+        return bool(entry and entry.abort_requested)
+
     async def get_engine(
         self,
         model_id: str,
@@ -556,6 +680,10 @@ class EnginePool:
                     runtime_settings is not None
                     and entry.runtime_settings_signature is None
                 ):
+                    self._raise_if_reload_busy(
+                        entry,
+                        "reload runtime settings variant",
+                    )
                     logger.info(
                         "Runtime settings variant changed for %s; "
                         "unloading before reload.",
@@ -568,6 +696,7 @@ class EnginePool:
                     and force_lm
                     and isinstance(entry.engine, VLMBatchedEngine)
                 ):
+                    self._raise_if_reload_busy(entry, "reload as LM")
                     logger.info(
                         f"Unloading VLM engine for {model_id} "
                         f"(force_lm=True, reloading as LM)"
@@ -656,6 +785,7 @@ class EnginePool:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+            await self._unload_pending_if_idle_locked(model_id)
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""
@@ -670,7 +800,7 @@ class EnginePool:
             ):
                 return False
 
-            if entry.engine.has_active_requests():
+            if self._entry_has_active_requests(entry):
                 entry.last_access = time.time()
                 return False
 
@@ -707,12 +837,9 @@ class EnginePool:
                 continue
             if e.in_use > 0:
                 continue
-            try:
-                if e.engine.has_active_requests():
-                    logger.debug(f"Skipping victim '{mid}': has active requests")
-                    continue
-            except AttributeError:
-                pass
+            if self._entry_has_active_requests(e):
+                logger.debug(f"Skipping victim '{mid}': has active requests")
+                continue
             candidates.append((e.last_access, mid))
         if not candidates:
             return None
@@ -777,11 +904,8 @@ class EnginePool:
         engine = entry.engine
         if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
             return False
-        try:
-            if engine.has_active_requests():
-                return False
-        except AttributeError:
-            pass
+        if self._entry_has_active_requests(entry):
+            return False
 
         scheduler = self._resolve_scheduler_from_engine(engine)
         if scheduler is None:
@@ -870,11 +994,8 @@ class EnginePool:
                 continue
             if e.in_use > 0:
                 return True
-            try:
-                if e.engine.has_active_requests():
-                    return True
-            except AttributeError:
-                pass
+            if self._entry_has_active_requests(e):
+                return True
         return False
 
     async def _unload_engine(self, model_id: str) -> None:
@@ -962,6 +1083,8 @@ class EnginePool:
         entry.engine = None
         entry.last_access = 0.0
         entry.actual_size = None
+        entry.abort_requested = False
+        entry.pending_unload_reason = None
         entry.runtime_settings_signature = None
 
         # Force garbage collection to release memory.

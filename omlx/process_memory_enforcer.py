@@ -1031,6 +1031,38 @@ class ProcessMemoryEnforcer:
                 aborted_total += max(0, int(result))
         return aborted_total
 
+    def _find_lru_busy_non_pinned_victim_locked(self) -> str | None:
+        """Find a non-pinned loaded model that is busy but abortable.
+
+        Caller must hold the engine-pool lock. This is used only at hard
+        pressure, after idle victims have already been considered.
+        """
+        candidates: list[tuple[float, str]] = []
+        for mid, entry in self._engine_pool._entries.items():
+            if (
+                getattr(entry, "engine", None) is None
+                or getattr(entry, "is_pinned", False)
+                or getattr(entry, "is_loading", False)
+            ):
+                continue
+
+            busy = getattr(entry, "in_use", 0) > 0
+            if not busy:
+                engine = getattr(entry, "engine", None)
+                has_active = getattr(engine, "has_active_requests", None)
+                if callable(has_active):
+                    try:
+                        busy = has_active() is True
+                    except Exception:  # noqa: BLE001
+                        busy = True
+            if busy:
+                candidates.append((getattr(entry, "last_access", 0.0), mid))
+
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
         self._running = False
@@ -1201,6 +1233,11 @@ class ProcessMemoryEnforcer:
 
         async with self._engine_pool._lock:
             while self._current_usage_bytes() > target:
+                pending = self._engine_pool._find_pending_unload_ready_locked()
+                if pending is not None:
+                    await self._engine_pool._unload_pending_if_idle_locked(pending)
+                    continue
+
                 victim = self._engine_pool._find_lru_victim()
                 if victim is not None:
                     loaded_non_pinned = [
@@ -1208,18 +1245,19 @@ class ProcessMemoryEnforcer:
                         for mid, e in self._engine_pool._entries.items()
                         if e.engine is not None and not e.is_pinned
                     ]
-                    if len(loaded_non_pinned) > 1:
-                        # Multiple non-pinned: evict LRU victim cleanly.
-                        # abort_all_requests is fired before _unload_engine
-                        # so clients receive proper error responses instead
-                        # of silent disconnect.
+                    if new_level == "hard" or len(loaded_non_pinned) > 1:
+                        # Evict idle LRU victims cleanly. At hard pressure even
+                        # the last idle non-pinned model should be unloaded; it
+                        # has no active KV to preserve and keeping it resident
+                        # does not reduce pressure.
                         entry = self._engine_pool._entries.get(victim)
                         if (
                             entry
                             and entry.engine is not None
                             and hasattr(entry.engine, "abort_all_requests")
                         ):
-                            aborted = await entry.engine.abort_all_requests()
+                            result = await entry.engine.abort_all_requests()
+                            aborted = max(0, int(result or 0))
                             if aborted > 0:
                                 logger.warning(
                                     f"Aborted {aborted} requests on "
@@ -1231,23 +1269,6 @@ class ProcessMemoryEnforcer:
                         await self._engine_pool._unload_engine(victim)
                         continue
 
-                    # Only one non-pinned model remains.
-                    if new_level == "hard":
-                        # Abort in-flight requests, keep model loaded —
-                        # frees KV blocks so short-context follow-ups work.
-                        entry = self._engine_pool._entries.get(victim)
-                        if (
-                            entry
-                            and entry.engine is not None
-                            and hasattr(entry.engine, "abort_all_requests")
-                        ):
-                            aborted = await entry.engine.abort_all_requests()
-                            if aborted > 0:
-                                logger.warning(
-                                    f"Aborted {aborted} requests on "
-                                    f"'{victim}' due to hard memory "
-                                    f"pressure (model kept loaded)"
-                                )
                     # soft: leave in-flight alone — admission pause already
                     # signaled, eviction can't help further without aborts.
                     break
@@ -1255,6 +1276,33 @@ class ProcessMemoryEnforcer:
                 # No non-pinned victim. Loaded models are pinned or no loaded
                 # engines exist at all.
                 if new_level == "hard":
+                    busy_victim = self._find_lru_busy_non_pinned_victim_locked()
+                    if busy_victim is not None:
+                        entry = self._engine_pool._entries.get(busy_victim)
+                        aborted = 0
+                        if (
+                            entry
+                            and entry.engine is not None
+                            and hasattr(entry.engine, "abort_all_requests")
+                        ):
+                            aborted = await entry.engine.abort_all_requests()
+                        if entry is not None:
+                            self._engine_pool._mark_pending_unload_locked(
+                                busy_victim,
+                                "hard memory pressure",
+                                abort_requested=True,
+                            )
+                            await self._engine_pool._unload_pending_if_idle_locked(
+                                busy_victim
+                            )
+                        logger.warning(
+                            "Hard memory pressure: requested abort/unload for "
+                            "'%s' (aborted=%d)",
+                            busy_victim,
+                            aborted,
+                        )
+                        break
+
                     # Hard only: abort any in-progress model loads.
                     aborted_any = False
                     for entry in self._engine_pool._entries.values():

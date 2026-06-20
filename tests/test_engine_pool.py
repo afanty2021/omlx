@@ -12,6 +12,7 @@ import pytest
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.exceptions import (
     InsufficientMemoryError,
+    ModelBusyError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
@@ -839,6 +840,36 @@ class TestEnginePoolAsync:
                 ModelSettings(mtp_enabled=True),
             )
         )
+
+    @pytest.mark.asyncio
+    async def test_runtime_settings_reload_rejected_while_leased(
+        self, pool_with_mock_engines
+    ):
+        """A profile variant switch must not unload an engine held by a request."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            mtp_enabled=False
+        )
+
+        base_engine = MagicMock()
+        base_engine.start = AsyncMock()
+        base_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=base_engine):
+            first = await pool.get_engine("model-a")
+            pool.get_entry("model-a").in_use = 1
+            with pytest.raises(ModelBusyError, match="runtime settings variant"):
+                await pool.get_engine(
+                    "model-a",
+                    runtime_settings=ModelSettings(mtp_enabled=True),
+                )
+
+        assert first is base_engine
+        assert pool.get_entry("model-a").engine is base_engine
+        base_engine.stop.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_runtime_sampling_only_profile_reuses_loaded_engine(
@@ -2221,6 +2252,43 @@ class TestEnginePoolInUseLease:
         assert entry.in_use == 0
         # Unknown model id is a harmless no-op.
         await pool.release_engine("nope")
+
+    @pytest.mark.asyncio
+    async def test_release_engine_unloads_pending_after_lease_drains(self):
+        """Pending hard-pressure unload runs as soon as the lease drains."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        entry.pending_unload_reason = "hard memory pressure"
+        entry.abort_requested = True
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+
+        await pool.release_engine("leased")
+
+        assert entry.in_use == 0
+        assert entry.pending_unload_reason is None
+        assert entry.abort_requested is False
+        pool._unload_engine.assert_awaited_once_with("leased")
+
+    @pytest.mark.asyncio
+    async def test_release_engine_keeps_pending_while_scheduler_active(self):
+        """A drained lease is not enough if scheduler requests are still active."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        entry.engine.has_active_requests.return_value = True
+        entry.pending_unload_reason = "hard memory pressure"
+        entry.abort_requested = True
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+
+        await pool.release_engine("leased")
+
+        assert entry.in_use == 0
+        assert entry.pending_unload_reason == "hard memory pressure"
+        assert entry.abort_requested is True
+        pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_acquire_leases_then_releases_on_success(self):

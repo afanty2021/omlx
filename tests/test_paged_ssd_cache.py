@@ -9,6 +9,7 @@ enabling larger effective cache sizes than GPU memory allows.
 import errno
 import json
 import logging
+import os
 import queue
 import shutil
 import threading
@@ -497,6 +498,31 @@ class TestPagedSSDCacheManager:
         # Delete non-existent
         result = manager.delete_block(b"nonexistent_hash_by")
         assert result is False
+
+    def test_forget_block_tracks_file_as_incompatible(self, tmp_path: Path):
+        """Forgetting a compatible block keeps it visible to global eviction."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+
+        block_hash = b"\x01" * 32
+        metadata = PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=tmp_path / "ssd_cache" / "0" / "dummy.safetensors",
+            file_size=1234,
+            token_count=1,
+            created_at=1.0,
+            last_access=1.0,
+            num_layers=1,
+            model_name="test-model",
+        )
+        manager._index.add(metadata)
+
+        assert manager.forget_block(block_hash) is True
+        assert not manager._index.contains(block_hash)
+        assert manager._incompatible_index.contains(block_hash)
+        assert manager._tracked_ssd_size() == metadata.file_size
 
     def test_clear(self, tmp_path: Path):
         """Test clearing all cache."""
@@ -1033,6 +1059,127 @@ class TestPagedSSDCacheManagerWithMLX:
         ]
         assert scan_lines, "scan completion log not emitted"
         assert "skipped_incompatible=3 blocks" in scan_lines[-1]
+
+    def test_model_switch_enforces_shared_ssd_limit_on_new_save(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Incompatible old-model blocks count against the shared SSD budget."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        old_hash = b"\x80" + b"\x00" * 31
+        old_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            old_hash,
+            num_layers=1,
+            model_name="old-model",
+        )
+        old_size = old_path.stat().st_size
+        max_size = old_size + old_size // 2
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="new-model",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            assert not manager.has_block(old_hash)
+            assert old_path.exists()
+            assert manager._incompatible_index.total_size == old_size
+
+            new_hash = b"\x81" + b"\x00" * 31
+            cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
+
+            assert manager.save_block(
+                block_hash=new_hash,
+                cache_data=cache_data,
+                token_count=32,
+                model_name="new-model",
+                layer_cache_types=["KVCache"],
+            )
+
+            assert manager.has_block(new_hash)
+            assert not old_path.exists()
+            assert manager._incompatible_index.total_size == 0
+            assert manager._tracked_ssd_size() <= max_size
+        finally:
+            manager.close()
+
+    def test_scan_cleans_oldest_incompatible_blocks_when_over_limit(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Startup cleanup converges an already-over-limit shared cache dir."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        paths = []
+        for i in range(3):
+            path = self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x90 + i]) + b"\x00" * 31,
+                num_layers=1,
+                model_name="old-model",
+            )
+            os.utime(path, (100 + i, 100 + i))
+            paths.append(path)
+
+        sizes = [path.stat().st_size for path in paths]
+        max_size = sum(sizes) - sizes[0] + 1
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="new-model",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            assert not paths[0].exists()
+            assert paths[1].exists()
+            assert paths[2].exists()
+            assert manager._tracked_ssd_size() <= max_size
+        finally:
+            manager.close()
+
+    def test_clear_removes_incompatible_scanned_files(self, tmp_path: Path, mock_mlx):
+        """Global clear deletes compatible and incompatible tracked files."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        other_hash = b"\xa0" + b"\x00" * 31
+        match_hash = b"\xa1" + b"\x00" * 31
+        other_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            other_hash,
+            num_layers=1,
+            model_name="old-model",
+        )
+        match_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            match_hash,
+            num_layers=1,
+            model_name="new-model",
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="new-model",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            assert manager.clear() == 2
+            assert not other_path.exists()
+            assert not match_path.exists()
+            assert manager._tracked_ssd_count() == 0
+        finally:
+            manager.close()
 
 
 class TestPagedSSDCacheManagerCacheList:
@@ -1919,6 +2066,29 @@ class TestEffectiveMaxSize:
 
         assert stats["utilization"] <= 1.0
         assert stats["max_size"] < stats["configured_max_size"]
+
+    def test_effective_max_size_uses_tracked_cache_not_filesystem_total(
+        self, tmp_path: Path
+    ):
+        """Disk pressure depends on tracked cache bytes plus free space."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,
+        )
+        manager._index._total_size = 50 * 1024**3
+        manager._incompatible_index._total_size = 10 * 1024**3
+
+        mock_usage = self._make_disk_usage(
+            total=200 * 1024**3,
+            used=190 * 1024**3,
+            free=10 * 1024**3,
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            effective = manager._get_effective_max_size()
+
+        expected = int(70 * 1024**3 * 0.99)
+        assert effective == expected
+        assert effective < manager.configured_max_size
 
     def test_stats_includes_effective_and_configured(self, tmp_path: Path):
         """Stats should include both effective and configured max sizes."""
@@ -3218,9 +3388,7 @@ class TestLayerSignatureSweep:
         assert dropped == 0
         assert mgr._index.get(b"aa" * 10) is not None
 
-    def test_sweep_canonicalizes_prefill_ready_rotating_cache(
-        self, tmp_path: Path
-    ):
+    def test_sweep_canonicalizes_prefill_ready_rotating_cache(self, tmp_path: Path):
         expected = ["KVCache", "RotatingKVCache", "KVCache"]
         stored = ["KVCache", "PrefillReadyRotatingKVCache", "KVCache"]
         mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
@@ -3359,9 +3527,9 @@ class TestLayerSignatureSweep:
         dropped = mgr.invalidate_stale_layer_signature()
 
         assert dropped == 1
-        assert mgr._index.get(b"bb" * 10) is not None, (
-            "model-B block must not be touched by model-A's sweep"
-        )
+        assert (
+            mgr._index.get(b"bb" * 10) is not None
+        ), "model-B block must not be touched by model-A's sweep"
         assert mgr._index.get(b"cc" * 10) is None
 
     def test_sweep_skips_legacy_unnamed_blocks(self, tmp_path: Path):

@@ -200,7 +200,7 @@ class TestResponsesEndpointReaches400:
         # preflight ever runs.
         engine.count_chat_tokens = MagicMock(return_value=128)
 
-        async def _get_engine_for_model(model_id):
+        async def _get_engine_for_model(model_id, *, lease=None):
             return engine
 
         # Override the engine resolver and disable auth so the test
