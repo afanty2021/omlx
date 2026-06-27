@@ -450,10 +450,14 @@ def test_step_prefill_reclaims_before_first_guard():
         config=SimpleNamespace(prefill_step_size=2, model_name=""),
         _stream="stream",
         _memory_limit_bytes=0,
+        _glm_dsa_adaptive_prefill=None,
         model=lambda *args, **kwargs: events.append("model"),
         _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
         _record_chunk_transient=MagicMock(),
+    )
+    ns._prefill_step_size_for_progress = (
+        Scheduler._prefill_step_size_for_progress.__get__(ns, Scheduler)
     )
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
 

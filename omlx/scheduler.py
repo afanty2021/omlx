@@ -888,6 +888,10 @@ def _patched_ppb_split(self, indices):
         new_batch.logits_processors = lps
         new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
+        if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
+            new_batch._omlx_glm_dsa_adaptive_prefill = (
+                self._omlx_glm_dsa_adaptive_prefill
+            )
 
         self.uids = []
         self.prompt_cache = []
@@ -1454,6 +1458,25 @@ class Scheduler:
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
+        self._glm_dsa_adaptive_prefill = None
+        try:
+            from .patches.glm_moe_dsa.generate_patch import (
+                _glm_dsa_adaptive_prefill_config,
+            )
+
+            self._glm_dsa_adaptive_prefill = _glm_dsa_adaptive_prefill_config(
+                model, self.config.prefill_step_size
+            )
+        except Exception:
+            logger.debug("GLM DSA adaptive prefill config unavailable", exc_info=True)
+        if self._glm_dsa_adaptive_prefill is not None:
+            logger.info(
+                "GLM DSA adaptive scheduler prefill enabled: step=%d after=%d "
+                "min_remaining=%d",
+                self._glm_dsa_adaptive_prefill.step_size,
+                self._glm_dsa_adaptive_prefill.after,
+                self._glm_dsa_adaptive_prefill.min_remaining,
+            )
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -2877,13 +2900,15 @@ class Scheduler:
 
         input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
         processed_tokens = 0
-        prefill_step_size = self.config.prefill_step_size
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: dict[int, int] = {}
 
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
+            prefill_step_size = self._prefill_step_size_for_progress(
+                processed_tokens, remaining
+            )
             n_to_process = min(prefill_step_size, remaining)
 
             if processed_tokens == 0:
@@ -3751,6 +3776,24 @@ class Scheduler:
     # Chunked prefill helpers (used when config.chunked_prefill=True)
     # ------------------------------------------------------------------
 
+    def _prefill_step_size_for_progress(
+        self, processed_tokens: int, remaining_tokens: int
+    ) -> int:
+        """Return the scheduler prefill chunk size for the current progress."""
+        adaptive_prefill = self._glm_dsa_adaptive_prefill
+        if adaptive_prefill is None:
+            return self.config.prefill_step_size
+        from .patches.glm_moe_dsa.generate_patch import (
+            _prefill_step_size_for_progress,
+        )
+
+        return _prefill_step_size_for_progress(
+            self.config.prefill_step_size,
+            processed_tokens,
+            remaining_tokens,
+            adaptive_prefill,
+        )
+
     def _begin_prefill(
         self,
         request: "Request",
@@ -3826,7 +3869,11 @@ class Scheduler:
         if state.tokens_remaining.shape[1] == 0:
             return True
 
-        n = min(self.config.prefill_step_size, state.tokens_remaining.shape[1])
+        remaining = state.tokens_remaining.shape[1]
+        prefill_step_size = self._prefill_step_size_for_progress(
+            state.tokens_processed, remaining
+        )
+        n = min(prefill_step_size, remaining)
 
         if state.tokens_processed == 0:
             _sync_and_clear_cache(self._stream)
@@ -8099,6 +8146,7 @@ class Scheduler:
         finished_ids = set()
 
         step_now = time.monotonic()
+        generated_at = time.perf_counter()
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
@@ -8109,6 +8157,7 @@ class Scheduler:
                 continue
 
             request.last_activity_at = step_now
+            completion_tokens_before = request.num_output_tokens
 
             # Release VLM embeddings after first decode token (prefill is done)
             if request.vlm_inputs_embeds is not None:
@@ -8127,7 +8176,7 @@ class Scheduler:
             # Check if this request uses a protocol-specific output parser
             parser_session = self._get_output_parser_session(request_id)
 
-            if parser_session is not None:
+            if parser_session is not None and not is_stop:
                 parser_result = parser_session.process_token(response.token)
                 new_text = parser_result.stream_text
                 if parser_result.visible_text:
@@ -8221,6 +8270,11 @@ class Scheduler:
                 response.logprobs = None
 
             # Create output
+            output_generated_at = (
+                generated_at
+                if request.num_output_tokens > completion_tokens_before
+                else None
+            )
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
@@ -8228,6 +8282,8 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                generated_at=output_generated_at,
+                generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
             )
 

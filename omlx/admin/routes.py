@@ -1779,6 +1779,54 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+def _model_display_name(
+    model_id: str,
+    model_path: str | Path | None,
+    model_dirs: list[Path],
+    *,
+    source_repo_id: str | None = None,
+) -> str:
+    """Return the UI-only display name for a discovered local model."""
+    repo_id = (source_repo_id or "").strip()
+    if "/" in repo_id:
+        return repo_id
+
+    if not model_path:
+        return model_id
+
+    path_text = str(model_path)
+    if "://" in path_text:
+        return model_id
+
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except (OSError, RuntimeError):
+        path = Path(path_text).expanduser()
+
+    for model_dir in model_dirs:
+        try:
+            rel = path.relative_to(model_dir.expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        parts = rel.parts
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return model_id
+
+    return model_id
+
+
+def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
+    if global_settings is None:
+        return []
+    try:
+        return global_settings.model.get_model_dirs(global_settings.base_path)
+    except Exception as e:  # pragma: no cover - defensive for partial test doubles
+        logger.debug("Could not resolve model dirs for display names: %s", e)
+        return []
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -1796,6 +1844,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     engine_pool = _get_engine_pool()
     settings_manager = _get_settings_manager()
     server_state = _get_server_state()
+    global_settings = _get_global_settings() if _get_global_settings else None
+    model_dirs = _model_dirs_for_display(global_settings)
 
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -1829,6 +1879,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
+            "display_name": _model_display_name(
+                model_id,
+                model_info.get("model_path", ""),
+                model_dirs,
+                source_repo_id=model_info.get("source_repo_id"),
+            ),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
@@ -1874,7 +1930,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         models.append(model_data)
 
-    global_settings = _get_global_settings() if _get_global_settings else None
     if markitdown_model_visible(global_settings) and not any(
         m.get("id") == MARKITDOWN_MODEL_ID for m in models
     ):
@@ -1882,6 +1937,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             {
                 "id": MARKITDOWN_MODEL_ID,
                 "model_path": "builtin://markitdown",
+                "display_name": MARKITDOWN_MODEL_ID,
                 "loaded": True,
                 "is_loading": False,
                 "estimated_size": 0,
@@ -5221,7 +5277,12 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
-    def _add_model(model_path: Path, model_name: str) -> None:
+    def _add_model(
+        model_path: Path,
+        model_name: str,
+        *,
+        source_repo_id: str | None = None,
+    ) -> None:
         if model_name in seen_names:
             return
         seen_names.add(model_name)
@@ -5230,6 +5291,12 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             {
                 "name": model_name,
                 "path": str(model_path),
+                "display_name": _model_display_name(
+                    model_name,
+                    model_path,
+                    model_dirs,
+                    source_repo_id=source_repo_id,
+                ),
                 "size": total_size,
                 "size_formatted": format_size(total_size),
             }
@@ -5252,7 +5319,11 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
                     if (hf_resolved.snapshot_path / "config.json").exists():
-                        _add_model(hf_resolved.snapshot_path, hf_resolved.model_id)
+                        _add_model(
+                            hf_resolved.snapshot_path,
+                            hf_resolved.model_id,
+                            source_repo_id=hf_resolved.source_repo_id,
+                        )
                     continue
 
                 # Level 2: organization folder — scan children
@@ -5262,8 +5333,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
-    # Sort case-insensitively by name for a stable, user-friendly order.
-    models.sort(key=lambda m: m["name"].lower())
+    # Sort by the UI display name so organization prefixes group together.
+    models.sort(key=lambda m: m["display_name"].lower())
     return {"models": models}
 
 

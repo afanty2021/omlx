@@ -59,7 +59,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         self.vm = vm
 
         let root = WelcomeView(vm: vm)
-            .environmentObject(services)
+            .environment(services)
 
         let hosting = NSHostingController(rootView: root)
         hosting.view.frame = NSRect(x: 0, y: 0, width: 680, height: 620)

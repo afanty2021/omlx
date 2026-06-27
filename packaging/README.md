@@ -34,6 +34,7 @@ Then the Swift bundle:
 ```bash
 apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # bundle optional native kernels
 ```
 
 ## Output

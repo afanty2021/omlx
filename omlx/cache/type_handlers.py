@@ -1264,6 +1264,12 @@ class MiniMaxM3KVCacheHandler(_MiniMaxM3CacheHandlerBase):
         meta_state: Any | None = None,
     ) -> Any:
         try:
+            from ..patches.mlx_vlm_minimax_m3_compat import (
+                apply_mlx_vlm_minimax_m3_compat_patch,
+            )
+
+            apply_mlx_vlm_minimax_m3_compat_patch()
+
             from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
         except Exception as e:  # noqa: BLE001
             logger.error("mlx-vlm MiniMaxM3KVCache unavailable: %s", e)
@@ -1342,6 +1348,12 @@ class MiniMaxM3BatchKVCacheHandler(_MiniMaxM3CacheHandlerBase):
         meta_state: Any | None = None,
     ) -> Any:
         try:
+            from ..patches.mlx_vlm_minimax_m3_compat import (
+                apply_mlx_vlm_minimax_m3_compat_patch,
+            )
+
+            apply_mlx_vlm_minimax_m3_compat_patch()
+
             from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3BatchKVCache
         except Exception as e:  # noqa: BLE001
             logger.error("mlx-vlm MiniMaxM3BatchKVCache unavailable: %s", e)

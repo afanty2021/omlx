@@ -277,6 +277,13 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Internal producer-side timestamp for the first generated token included in
+    # this output. Consumers may receive aggregated chunks later than the token
+    # was actually produced, so benchmark code must not rely only on receive time.
+    generated_at: Optional[float] = None
+    # Internal producer-side timestamp for the latest generated token included
+    # in this output. This lets aggregated chunks preserve the decode interval.
+    generated_until: Optional[float] = None
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None

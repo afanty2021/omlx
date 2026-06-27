@@ -15,7 +15,7 @@ struct AppView: View {
     @State private var presentedUpdate: AvailableUpdate?
 
     @Environment(\.colorScheme) private var scheme
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
 
     var body: some View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
@@ -45,7 +45,7 @@ struct AppView: View {
                 services.requestedSection = nil
             }
         }
-        .onReceive(services.updates.$confirmationUpdate) { update in
+        .onChange(of: services.updates.confirmationUpdate, initial: true) { _, update in
             presentedUpdate = update
         }
         .sheet(item: $presentedUpdate, onDismiss: {
@@ -122,7 +122,7 @@ struct AppView: View {
 @MainActor
 private struct UpdateConfirmationSheet: View {
     let update: AvailableUpdate
-    @ObservedObject var updates: UpdateController
+    let updates: UpdateController
     let onLater: () -> Void
     let onConfirm: () -> Void
 
@@ -501,7 +501,7 @@ private struct ContentScaffold<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
 
     private var titleText: String { detailTitle ?? section.title }
 

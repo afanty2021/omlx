@@ -77,6 +77,8 @@ class GenerationOutput:
     diffusion_work_tokens: int = 0
     diffusion_canvas_tps: float = 0.0
     diffusion_work_tps: float = 0.0
+    generated_at: Optional[float] = None
+    generated_until: Optional[float] = None
 
 
 class BaseEngine(ABC):

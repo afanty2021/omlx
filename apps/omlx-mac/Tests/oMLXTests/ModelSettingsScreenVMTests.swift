@@ -45,6 +45,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     private func makeModel(id: String, configModelType: String?) -> ModelDTO {
         ModelDTO(
             id: id,
+            displayName: nil,
             modelPath: nil,
             loaded: false,
             isLoading: false,

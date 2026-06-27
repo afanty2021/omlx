@@ -90,6 +90,32 @@ def _make_prefill_state(
     return state
 
 
+class _RecordingModel:
+    def __init__(self, model_type: str):
+        self.model_type = model_type
+        self.layers = []
+        self.chunk_lengths: list[int] = []
+
+    def __call__(self, tokens, cache=None):
+        self.chunk_lengths.append(int(tokens.shape[1]))
+
+
+def _make_recording_scheduler(model_type: str) -> tuple[Scheduler, _RecordingModel]:
+    model = _RecordingModel(model_type)
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            prefill_step_size=2048,
+            chunked_prefill=True,
+            paged_cache_block_size=0,
+        ),
+    )
+    return scheduler, model
+
+
 # ---------------------------------------------------------------------------
 # SchedulerConfig
 # ---------------------------------------------------------------------------
@@ -209,6 +235,46 @@ class TestGetStats:
         sched.prefilling.append(_make_request("r1"))
         sched.prefilling.append(_make_request("r2"))
         assert sched.get_stats()["num_prefilling"] == 2
+
+
+# ---------------------------------------------------------------------------
+# GLM adaptive chunked prefill
+# ---------------------------------------------------------------------------
+
+
+class TestGLMAdaptiveChunkedPrefill:
+    def test_glm_uses_adaptive_prefill_chunk_size(self, monkeypatch):
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", raising=False)
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", raising=False)
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_AFTER", raising=False)
+        monkeypatch.delenv(
+            "MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_MIN_REMAINING", raising=False
+        )
+
+        sched, model = _make_recording_scheduler("glm_moe_dsa")
+        req = _make_request("glm", n_tokens=8194)
+        state = _make_prefill_state(sched, req, n_remaining=8193)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [8192]
+        assert state.tokens_processed == 8192
+
+    def test_non_glm_keeps_configured_prefill_chunk_size(self, monkeypatch):
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler("deepseek_v32")
+        req = _make_request("deepseek", n_tokens=8193)
+        state = _make_prefill_state(sched, req, n_remaining=8192)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
 
 
 # ---------------------------------------------------------------------------

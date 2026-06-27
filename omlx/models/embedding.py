@@ -4,7 +4,7 @@ MLX Embedding Model wrapper.
 
 This module provides a wrapper around mlx-embeddings for generating
 text embeddings using Apple's MLX framework, with native fallback
-for XLMRoBERTa and BERT embedding models.
+for XLMRoBERTa, BERT, and Qwen2-decoder embedding models.
 """
 
 import inspect
@@ -58,6 +58,8 @@ class MLXEmbeddingModel:
     Supports:
     - Native XLMRoBERTa embedding (no mlx-embeddings dependency)
     - Native BERT embedding (no mlx-embeddings dependency)
+    - Native Qwen2-decoder embedding (last-token + L2; jina-code, gte-Qwen2)
+      — mlx-embeddings has no qwen2 module
     - mlx-embeddings fallback for other architectures
 
     Example:
@@ -111,8 +113,14 @@ class MLXEmbeddingModel:
         architectures = config_dict.get("architectures", [])
         arch = architectures[0] if architectures else ""
 
-        native_arches = {"XLMRobertaModel", "BertModel", "BertForMaskedLM"}
-        if arch not in native_arches:
+        native_arch_modules = {
+            "XLMRobertaModel": "xlm_roberta",
+            "BertModel": "xlm_roberta",
+            "BertForMaskedLM": "xlm_roberta",
+            "Qwen2ForCausalLM": "qwen2_embedding",
+        }
+        module_name = native_arch_modules.get(arch)
+        if module_name is None:
             logger.debug(
                 f"Architecture '{arch}' not natively supported for embedding, "
                 "trying mlx-embeddings"
@@ -120,7 +128,11 @@ class MLXEmbeddingModel:
             return False
 
         try:
-            from .xlm_roberta import Model, ModelArgs
+            from importlib import import_module
+
+            native_module = import_module(f"{__package__}.{module_name}")
+            Model = native_module.Model
+            ModelArgs = native_module.ModelArgs
 
             known_fields = {f.name for f in ModelArgs.__dataclass_fields__.values()}
             model_config = {

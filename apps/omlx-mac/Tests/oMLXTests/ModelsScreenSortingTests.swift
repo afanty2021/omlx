@@ -28,9 +28,22 @@ final class ModelsScreenSortingTests: XCTestCase {
         XCTAssertEqual(ids, ["qwen", "Qwen", "QWEN"])
     }
 
-    private func makeModel(_ id: String) -> ModelDTO {
+    func testSortModelsByNameUsesDisplayNameWhenPresent() {
+        let models = [
+            makeModel("llama", displayName: "Meta/llama"),
+            makeModel("Qwen", displayName: "deepsweet/Qwen"),
+            makeModel("gemma", displayName: "Google/gemma"),
+        ]
+
+        let ids = sortModelsByName(models).map(\.id)
+
+        XCTAssertEqual(ids, ["Qwen", "gemma", "llama"])
+    }
+
+    private func makeModel(_ id: String, displayName: String? = nil) -> ModelDTO {
         ModelDTO(
             id: id,
+            displayName: displayName,
             modelPath: nil,
             loaded: false,
             isLoading: false,

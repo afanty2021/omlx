@@ -1344,10 +1344,8 @@
             },
 
             isSpecPrefillDraftModel(model) {
-                const text = this.draftModelSearchText(model);
                 return !this.isDflashDraftModel(model)
-                    && !this.isVlmMtpDraftModel(model)
-                    && !/(^|[-_/\s])mtp($|[-_/\s])/i.test(text);
+                    && !this.isVlmMtpDraftModel(model);
             },
 
             draftModelCandidates(filterFn, { fallbackToBase = true } = {}) {
@@ -3953,8 +3951,8 @@
 
                     switch (this.sortBy) {
                         case 'id':
-                            aVal = (a.id || '').toLowerCase();
-                            bVal = (b.id || '').toLowerCase();
+                            aVal = (a.display_name || a.id || '').toLowerCase();
+                            bVal = (b.display_name || b.id || '').toLowerCase();
                             break;
                         case 'type':
                             aVal = (a.model_type || 'llm').toLowerCase();

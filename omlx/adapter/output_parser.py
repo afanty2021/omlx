@@ -417,6 +417,12 @@ class MiniMaxM3OutputParserSession:
         tool_calls: list[dict[str, str]] = []
         if _MINIMAX_TOOL_CALL_START in self._raw_text:
             try:
+                from ..patches.mlx_vlm_minimax_m3_compat import (
+                    apply_mlx_vlm_minimax_m3_compat_patch,
+                )
+
+                apply_mlx_vlm_minimax_m3_compat_patch()
+
                 from mlx_vlm.tool_parsers.minimax_m3 import parse_tool_call
 
                 parsed = parse_tool_call(self._raw_text)

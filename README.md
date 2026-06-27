@@ -386,6 +386,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# Stage with optional GLM native custom kernels
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.

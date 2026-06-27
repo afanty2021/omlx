@@ -188,7 +188,7 @@ class TestComputeMetrics:
         assert metrics["total_throughput"] == pytest.approx(834.8, abs=1.0)
 
     def test_zero_duration_safety(self):
-        """Test that zero/near-zero durations don't cause division by zero."""
+        """Single-token outputs do not report bogus decode throughput."""
         metrics = _compute_single_metrics(
             prompt_tokens=100,
             completion_tokens=1,
@@ -200,7 +200,8 @@ class TestComputeMetrics:
         )
         # Should not raise, values should be finite
         assert metrics["ttft_ms"] == 0.0
-        assert metrics["gen_tps"] > 0  # Protected by max(duration, 1e-9)
+        assert metrics["gen_tps"] == 0.0
+        assert metrics["tpot_ms"] == 0.0
 
     def test_native_duration_overrides(self):
         """Native engine timings can override streaming timing artifacts."""
@@ -219,6 +220,22 @@ class TestComputeMetrics:
         assert metrics["processing_tps"] == pytest.approx(256.0)
         assert metrics["gen_tps"] == pytest.approx(16.0)
         assert metrics["tpot_ms"] == pytest.approx(62.99, abs=0.01)
+
+    def test_single_token_completion_has_no_decode_rate(self):
+        """Immediate stop has no inter-token decode interval to benchmark."""
+        metrics = _compute_single_metrics(
+            prompt_tokens=16384,
+            completion_tokens=1,
+            start_time=0.0,
+            first_token_time=8.629,
+            end_time=8.629001,
+            peak_memory=0,
+            cached_tokens=0,
+        )
+
+        assert metrics["gen_tps"] == 0.0
+        assert metrics["tpot_ms"] == 0.0
+        assert metrics["total_throughput"] == pytest.approx(1898.7, abs=0.1)
 
 
 class TestRunSingleTest:
@@ -279,6 +296,63 @@ class TestRunSingleTest:
         assert metrics["completion_tokens"] == 128
         assert metrics["gen_tps"] == pytest.approx(64.0)
         assert metrics["tpot_ms"] == pytest.approx(15.75, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_uses_producer_timestamps_for_aggregated_output(self):
+        """Aggregated chunks should use producer-side decode timing."""
+
+        class AggregatedEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x" * 128,
+                    finished=True,
+                    finish_reason="length",
+                    generated_at=0.2,
+                    generated_until=1.2,
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.3]):
+            metrics = await _run_single_test(
+                AggregatedEngine(),
+                prompt="prompt",
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["ttft_ms"] == pytest.approx(200.0)
+        assert metrics["gen_tps"] == pytest.approx(128.0)
+        assert metrics["tpot_ms"] == pytest.approx(7.87, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_aggregated_output_without_end_time_has_no_decode_rate(self):
+        """Single aggregate chunks need a producer-side end time for tg TPS."""
+
+        class AggregatedEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x" * 128,
+                    finished=True,
+                    finish_reason="length",
+                    generated_at=0.2,
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.2]):
+            metrics = await _run_single_test(
+                AggregatedEngine(),
+                prompt="prompt",
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["ttft_ms"] == pytest.approx(200.0)
+        assert metrics["gen_tps"] == 0.0
+        assert metrics["tpot_ms"] == 0.0
 
 
 # =============================================================================
@@ -790,6 +864,67 @@ class TestUploadToOmlxAi:
 
         done_event = next(e for e in events if e["type"] == "upload_done")
         assert done_event["data"]["success"] == 1
+
+    @pytest.mark.asyncio
+    async def test_upload_skips_unmeasurable_generation_results(self):
+        """Rows without a measured decode rate are not uploaded."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
+
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="Qwen3-30B-4bit",
+                prompt_lengths=[1024, 8192],
+            ),
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 0.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 0,
+            },
+            {
+                "test_type": "single",
+                "pp": 8192,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 500.0,
+                "peak_memory_bytes": 0,
+            },
+        ]
+
+        mock_entry = MagicMock()
+        mock_entry.model_path = "/models/Qwen3-30B-4bit"
+        mock_pool = MagicMock()
+        mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
+
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {
+            "id": "abc12345",
+            "url": "https://omlx.ai/benchmarks/abc12345",
+        }
+        mock_to_thread = AsyncMock(return_value=mock_response)
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        assert mock_to_thread.await_count == 1
+
+        upload_events = [e for e in run.events if e["type"] == "upload"]
+        assert [e["data"]["context_length"] for e in upload_events] == [8192]
+
+        done_event = next(e for e in run.events if e["type"] == "upload_done")
+        assert done_event["data"]["total"] == 1
+        assert done_event["data"]["success"] == 1
+        assert done_event["data"]["failed"] == 0
+        assert done_event["data"]["skipped"] == 1
 
     @pytest.mark.asyncio
     async def test_upload_skipped_when_experimental_features_enabled(self):

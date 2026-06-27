@@ -209,6 +209,7 @@ def _compute_single_metrics(
     cached_tokens: int,
     prefill_duration_s: float | None = None,
     generation_duration_s: float | None = None,
+    generation_measured: bool = True,
 ) -> dict:
     """Compute all metrics for a single request benchmark."""
     ttft_s = first_token_time - start_time
@@ -223,8 +224,12 @@ def _compute_single_metrics(
     e2e_duration = end_time - start_time
 
     ttft_ms = ttft_s * 1000
-    tpot_ms = (gen_duration / max(completion_tokens - 1, 1)) * 1000
-    gen_tps = completion_tokens / max(gen_duration, 1e-9)
+    if generation_measured and completion_tokens > 1 and gen_duration > 0:
+        tpot_ms = (gen_duration / (completion_tokens - 1)) * 1000
+        gen_tps = completion_tokens / gen_duration
+    else:
+        tpot_ms = 0.0
+        gen_tps = 0.0
     processing_tps = prompt_tokens / max(prefill_duration, 1e-9)
     total_throughput = (prompt_tokens + completion_tokens) / max(e2e_duration, 1e-9)
 
@@ -282,6 +287,7 @@ async def _run_single_test(
 
     start_time = time.perf_counter()
     first_token_time = None
+    last_generated_token_time = None
     last_output = None
     prev_completion_tokens = 0
 
@@ -294,8 +300,19 @@ async def _run_single_test(
         # Detect first generated token via completion_tokens count,
         # not new_text. Some models (e.g. Harmony/gpt-oss) produce
         # protocol tokens that don't yield visible new_text.
-        if first_token_time is None and output.completion_tokens > prev_completion_tokens:
-            first_token_time = time.perf_counter()
+        completion_delta = output.completion_tokens - prev_completion_tokens
+        if completion_delta > 0:
+            generated_at = getattr(output, "generated_at", None)
+            generated_until = getattr(output, "generated_until", None)
+            output_first_token_time = (
+                float(generated_at) if generated_at is not None else time.perf_counter()
+            )
+            if first_token_time is None:
+                first_token_time = output_first_token_time
+            if generated_until is not None:
+                last_generated_token_time = float(generated_until)
+            elif completion_delta == 1:
+                last_generated_token_time = output_first_token_time
         prev_completion_tokens = output.completion_tokens
         last_output = output
 
@@ -322,7 +339,12 @@ async def _run_single_test(
 
     prefill_duration_s = None
     generation_duration_s = None
+    producer_generation_duration_s = None
     metric_completion_tokens = completion_tokens
+    if first_token_time is not None and last_generated_token_time is not None:
+        measured_duration = last_generated_token_time - first_token_time
+        if measured_duration > 0:
+            producer_generation_duration_s = measured_duration
     if last_output is not None:
         prompt_tps = float(getattr(last_output, "prompt_tps", 0.0) or 0.0)
         if prompt_tps > 0 and prompt_tokens > 0:
@@ -338,6 +360,11 @@ async def _run_single_test(
             if generation_tps > 0 and completion_tokens > 0:
                 generation_duration_s = completion_tokens / generation_tps
 
+    if generation_duration_s is None:
+        generation_duration_s = producer_generation_duration_s
+
+    generation_measured = generation_duration_s is not None
+
     return _compute_single_metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=metric_completion_tokens,
@@ -348,6 +375,7 @@ async def _run_single_test(
         cached_tokens=cached_tokens,
         prefill_duration_s=prefill_duration_s,
         generation_duration_s=generation_duration_s,
+        generation_measured=generation_measured,
     )
 
 
@@ -613,6 +641,10 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
 
     # Collect single results and batch results
     single_results = [r for r in run.results if r.get("test_type") == "single"]
+    uploadable_single_results = [
+        r for r in single_results if float(r.get("gen_tps", 0.0) or 0.0) > 0.0
+    ]
+    skipped_count = len(single_results) - len(uploadable_single_results)
     batch_results = [r for r in run.results if r.get("test_type") == "batch"]
 
     # Build batching_results from batch data
@@ -620,7 +652,11 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     pp1024_single = next(
         (r for r in single_results if r.get("pp") == 1024), None
     )
-    if pp1024_single and batch_results:
+    if (
+        pp1024_single
+        and float(pp1024_single.get("gen_tps", 0.0) or 0.0) > 0.0
+        and batch_results
+    ):
         baseline_tps = pp1024_single["gen_tps"]
         batching_results.append({
             "batch_size": 1,
@@ -638,7 +674,13 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     success_count = 0
     failed_count = 0
 
-    for result in single_results:
+    if skipped_count:
+        logger.info(
+            f"Benchmark upload skipped {skipped_count} result(s) without "
+            f"measurable generation throughput"
+        )
+
+    for result in uploadable_single_results:
         context_length = result["pp"]
         peak_mem_gb = None
         if result.get("peak_memory_bytes") and result["peak_memory_bytes"] > 0:
@@ -665,7 +707,10 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
             payload["owner_hash"] = owner_hash_full
 
         # Attach batching_results only to the first submission (lowest context_length)
-        if context_length == single_results[0]["pp"] and batching_results:
+        if (
+            context_length == uploadable_single_results[0]["pp"]
+            and batching_results
+        ):
             payload["batching_results"] = batching_results
 
         try:
@@ -742,22 +787,25 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
             logger.warning(f"Benchmark upload error for pp{context_length}: {e}")
 
     run.upload_state["phase"] = "done"
-    run.upload_state["total"] = len(single_results)
+    run.upload_state["total"] = len(uploadable_single_results)
     run.upload_state["success_count"] = success_count
     run.upload_state["failed_count"] = failed_count
+    run.upload_state["skipped_count"] = skipped_count
     run.upload_state["owner_hash"] = owner_hash_display
     await _send_event(run, {
         "type": "upload_done",
         "data": {
             "owner_hash": owner_hash_display,
-            "total": len(single_results),
+            "total": len(uploadable_single_results),
             "success": success_count,
             "failed": failed_count,
+            "skipped": skipped_count,
         },
     })
 
     logger.info(
-        f"Benchmark upload complete: {success_count}/{len(single_results)} succeeded"
+        f"Benchmark upload complete: {success_count}/"
+        f"{len(uploadable_single_results)} succeeded, skipped={skipped_count}"
     )
 
 

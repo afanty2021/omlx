@@ -37,6 +37,9 @@
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
+#   apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
+#                                                     # build and bundle optional
+#                                                     # native custom kernels
 #   apps/omlx-mac/Scripts/build.sh --rebuild-donor    # force venvstacks rebuild
 #   apps/omlx-mac/Scripts/build.sh --no-rebuild-donor # never rebuild; use
 #                                                       existing donor even if stale
@@ -48,6 +51,9 @@
 #   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
 #   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
 #                                       (default: PATH lookup of python3)
+#   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
+#   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=15.0
+#                                       # macOS min version for custom kernels
 
 set -euo pipefail
 
@@ -79,15 +85,21 @@ if [ $# -gt 0 ]; then
 fi
 
 BARE=0
+WITH_CUSTOM_KERNEL="${OMLX_WITH_CUSTOM_KERNEL:-0}"
 REBUILD_DONOR=auto    # auto | force | never
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
+        --with-custom-kernel) WITH_CUSTOM_KERNEL=1 ;;
         --rebuild-donor) REBUILD_DONOR=force ;;
         --no-rebuild-donor) REBUILD_DONOR=never ;;
         *) echo "error: unknown flag '$arg'" >&2; exit 2 ;;
     esac
 done
+case "$(echo "$WITH_CUSTOM_KERNEL" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) WITH_CUSTOM_KERNEL=1 ;;
+    *) WITH_CUSTOM_KERNEL=0 ;;
+esac
 if [ "$SWIFT_REBUILD" -eq 1 ] && [ "$REBUILD_DONOR" = "force" ]; then
     echo "error: swift cannot be combined with --rebuild-donor; use release --rebuild-donor." >&2
     exit 2
@@ -97,6 +109,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
+CUSTOM_KERNEL_DIR="$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
 # copy with platform-specific mlx-metal wheels swapped in.
@@ -193,6 +206,87 @@ _rebuild_venvstacks_export() {
         || die "venvstacks rebuild failed; see output above."
     [ -d "$LOCAL_EXPORT" ] || die "venvstacks rebuild reported success but $LOCAL_EXPORT is missing."
     ok "Venvstacks export ready at $LOCAL_EXPORT"
+}
+
+_custom_kernel_deployment_target() {
+    printf "%s\n" "${OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-15.0}}"
+}
+
+_custom_kernel_pythonpath() {
+    [ -n "${DONOR_LAYERS:-}" ] || die "custom kernel build requires resolved donor layers."
+    local mlx_site="$DONOR_LAYERS/framework-mlx-base/lib/python3.11/site-packages"
+    [ -d "$mlx_site" ] || die "donor missing framework MLX site-packages: $mlx_site"
+    if [ -n "${PYTHONPATH:-}" ]; then
+        printf "%s:%s\n" "$mlx_site" "$PYTHONPATH"
+    else
+        printf "%s\n" "$mlx_site"
+    fi
+}
+
+_clean_custom_kernel_build_artifacts() {
+    find "$CUSTOM_KERNEL_DIR" -maxdepth 1 -type f \( \
+        -name "*.so" -o \
+        -name "*.dylib" -o \
+        -name "*.metallib" \
+    \) -delete
+
+    if [ -d "$REPO_ROOT/build" ]; then
+        find "$REPO_ROOT/build" \
+            -type d \
+            -name "omlx.custom_kernels.glm_moe_dsa._ext" \
+            -prune \
+            -exec rm -rf {} +
+    fi
+}
+
+_custom_kernel_minos() {
+    otool -l "$1" 2>/dev/null | awk '
+        /LC_BUILD_VERSION/ { in_build = 1 }
+        in_build && /minos/ { print $2; exit }
+    '
+}
+
+_validate_custom_kernel_deployment_target() {
+    local expected="$1"
+    local path
+    local minos
+
+    command -v otool >/dev/null 2>&1 || return 0
+
+    for path in "$CUSTOM_KERNEL_DIR"/_ext*.so "$CUSTOM_KERNEL_DIR"/lib*.dylib; do
+        [ -e "$path" ] || continue
+        minos="$(_custom_kernel_minos "$path")"
+        [ -n "$minos" ] || die "could not read deployment target from $path."
+        [ "$minos" = "$expected" ] \
+            || die "custom kernel $path has macOS min $minos, expected $expected."
+    done
+}
+
+_build_custom_kernels() {
+    [ -n "$PYTHON_BIN" ] || die "python3 not found — install Python 3.11+ on PATH or set PYTHON_BIN."
+    local deployment_target
+    local cmake_args
+    local custom_kernel_pythonpath
+    deployment_target="$(_custom_kernel_deployment_target)"
+    cmake_args="${CMAKE_ARGS:-}"
+    custom_kernel_pythonpath="$(_custom_kernel_pythonpath)"
+
+    log "Building optional native custom kernels (macOS deployment target $deployment_target)…"
+    _clean_custom_kernel_build_artifacts
+    (
+        cd "$REPO_ROOT"
+        export PYTHONPATH="$custom_kernel_pythonpath"
+        export OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET="$deployment_target"
+        export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$deployment_target}"
+        if [[ "$cmake_args" != *"CMAKE_OSX_DEPLOYMENT_TARGET"* ]]; then
+            export CMAKE_ARGS="${cmake_args:+$cmake_args }-DCMAKE_OSX_DEPLOYMENT_TARGET=$deployment_target"
+        fi
+        "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
+    ) || die "custom kernel build failed; see output above."
+    [ -f "$CUSTOM_KERNEL_DIR/omlx_glm_kernels.metallib" ] \
+        || die "custom kernel build finished but GLM metallib is missing."
+    _validate_custom_kernel_deployment_target "$deployment_target"
+    ok "  + custom kernels ($deployment_target)"
 }
 
 resolve_donor_layers() {
@@ -350,15 +444,30 @@ fi
 
 # --- Embed omlx package ---------------------------------------------------
 
+if [ "$WITH_CUSTOM_KERNEL" = "1" ]; then
+    _build_custom_kernels
+fi
+
 log "Copying omlx package from source tree…"
 rm -rf "$RESOURCES_DIR/omlx"
 mkdir -p "$RESOURCES_DIR/omlx"
 # rsync gives us per-tree exclude semantics that ditto lacks.
+RSYNC_EXCLUDES=(
+    --exclude='__pycache__'
+    --exclude='*.pyc'
+    --exclude='tests'
+    --exclude='.git'
+    --exclude='custom_kernels/*/csrc'
+)
+if [ "$WITH_CUSTOM_KERNEL" != "1" ]; then
+    RSYNC_EXCLUDES+=(
+        --exclude='custom_kernels/*/*.so'
+        --exclude='custom_kernels/*/*.dylib'
+        --exclude='custom_kernels/*/*.metallib'
+    )
+fi
 rsync -a \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='tests' \
-    --exclude='.git' \
+    "${RSYNC_EXCLUDES[@]}" \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
 

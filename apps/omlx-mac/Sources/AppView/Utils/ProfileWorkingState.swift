@@ -35,7 +35,7 @@ enum ActiveProfileState: Equatable {
 
 /// Snapshot of all editable model-settings fields used to detect dirty
 /// state. The VM stores one of these on `load()` and compares the live
-/// `@Published` values against it to decide whether to surface the
+/// observable values against it to decide whether to surface the
 /// Working banner.
 ///
 /// Equality is intentionally permissive: empty string == nil, since the

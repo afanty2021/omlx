@@ -147,6 +147,9 @@ CAUSAL_LM_RERANKER_ARCHITECTURES = {
 # (no lm_head weights). Detected by architecture + directory name heuristic.
 CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
     "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
+    "Qwen2ForCausalLM",  # jina-code-embeddings & similar; only treated as an
+    # embedding when the dir-name heuristic (_is_causal_lm_embedding) also
+    # matches, so Qwen2/Qwen2.5 chat models are unaffected.
 }
 
 # Multimodal (VLM-based) reranker architectures.

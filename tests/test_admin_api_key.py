@@ -81,6 +81,78 @@ class TestListModelsSettings:
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
 
+    def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
+        """Ensure nested model paths only affect UI display names."""
+        model_root = tmp_path / "models"
+        model_path = model_root / "deepsweet" / "Qwen3.6-27B-MLX-oQ5-FP16"
+        model_path.mkdir(parents=True)
+        model_id = "Qwen3.6-27B-MLX-oQ5-FP16"
+
+        mock_engine_pool = MagicMock()
+        mock_engine_pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": model_id,
+                    "model_path": str(model_path),
+                    "loaded": False,
+                    "estimated_size": 1000,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                }
+            ]
+        }
+
+        mock_settings_manager = MagicMock()
+        mock_settings_manager.get_all_settings.return_value = {}
+
+        mock_server_state = MagicMock()
+        mock_server_state.default_model = None
+
+        mock_global_settings = SimpleNamespace(
+            base_path=tmp_path,
+            model=SimpleNamespace(get_model_dirs=lambda base_path: [model_root]),
+        )
+
+        with (
+            patch.object(
+                admin_routes, "_get_engine_pool", return_value=mock_engine_pool
+            ),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=mock_settings_manager,
+            ),
+            patch.object(
+                admin_routes, "_get_server_state", return_value=mock_server_state
+            ),
+            patch.object(
+                admin_routes,
+                "_get_global_settings",
+                return_value=mock_global_settings,
+            ),
+            patch.object(
+                admin_routes,
+                "_paroquant_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_dflash_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_mtp_compat_for_model",
+                return_value=(False, None),
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["id"] == model_id
+        assert model["display_name"] == f"deepsweet/{model_id}"
+
 
 class TestValidateApiKey:
     """Tests for validate_api_key() format validation."""

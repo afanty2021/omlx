@@ -131,6 +131,38 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_qwen2_causal_lm_embedding(self, tmp_path):
+        """Qwen2ForCausalLM with an embedding-named dir is an embedding (#686).
+
+        jina-code-embeddings ships a Qwen2ForCausalLM architecture without
+        lm_head weights, so it must classify as an embedding model rather than
+        a chat LLM.
+        """
+        embed_dir = tmp_path / "jina-code-embeddings-1.5b"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_qwen2_causal_lm_without_embedding_name_is_llm(self, tmp_path):
+        """Qwen2ForCausalLM without an embedding-named dir stays an LLM (#686).
+
+        Regression guard: adding Qwen2ForCausalLM to the embedding-arch set must
+        not reclassify ordinary Qwen2/Qwen2.5 chat models, which is gated by the
+        _is_causal_lm_embedding directory-name heuristic.
+        """
+        llm_dir = tmp_path / "Qwen2.5-7B-Instruct"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_lfm2_text_model_is_llm(self, tmp_path):
         """LFM2 text checkpoints share model_type with non-text variants."""
         llm_dir = tmp_path / "LFM2-1.2B"

@@ -1,57 +1,58 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2 ``glm_moe_dsa`` monkey-patch for mlx-lm.
 
-Brings ml-explore/mlx-lm#1410 into oMLX without modifying the pinned
-mlx-lm package. The upstream change turns the stock bare DeepSeek-V3.2
-subclass into a GLM-5.2-aware model with native DSA indexer sharing:
-full layers compute top-k indices, shared layers reuse the previous full
-layer's top-k, and shared layers carry no indexer KV cache.
+Vendors the oMLX GLM-5.2 optimized mlx-lm model code without modifying the
+pinned mlx-lm package. The public module name stays
+``mlx_lm.models.glm_moe_dsa`` so mlx-lm's normal model loader can find it, but
+the optimized helper modules remain private to ``omlx.patches.glm_moe_dsa`` and
+do not replace ``mlx_lm.models.deepseek_v32`` or the shared MoE layers used by
+other model families.
 """
 
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import logging
 import sys
-from pathlib import Path
+
+from .kernels import fast as glm_fast
 
 logger = logging.getLogger(__name__)
 
-PR_HEAD_SHA = "3cb18b51892a7800678923116f5b4920a7666208"
-PR_URL = "https://github.com/ml-explore/mlx-lm/pull/1410"
+PATCH_SOURCE = "mlxlm-glm optimized-final mlx-lm snapshot"
+NATIVE_KERNELS_PACKAGE = "omlx.custom_kernels.glm_moe_dsa"
 
 _APPLIED = False
 
 
-def _upstream_has_glm_moe_dsa_support() -> bool:
-    """Return True when the installed mlx-lm already has PR #1410 support."""
-    try:
-        module = importlib.import_module("mlx_lm.models.glm_moe_dsa")
-    except Exception:
-        return False
-
-    fields = getattr(getattr(module, "ModelArgs", None), "__dataclass_fields__", {})
-    return "indexer_types" in fields and hasattr(module, "GlmMoeDsaModel")
+def _missing_fast_symbols() -> list[str]:
+    """Return expected fast symbols missing from native or patched MLX runtime."""
+    required = (
+        "dsa_indexer_scores",
+        "dsa_topk_indices",
+        "glm_dsa_sparse_mla_attention",
+        "glm_dsa_exact_block_attention",
+        "glm_dsa_q8_vup_flat",
+        "glm_moe_weighted_sum",
+    )
+    return glm_fast.missing(required)
 
 
 def _register_module() -> None:
     qualname = "mlx_lm.models.glm_moe_dsa"
-    here = Path(__file__).parent
-    file_path = here / "glm_moe_dsa_model.py"
-    spec = importlib.util.spec_from_file_location(qualname, str(file_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not create spec for {qualname} from {file_path}")
+    existing = sys.modules.get(qualname)
+    if getattr(existing, "_OMLX_GLM_DSA_OPTIMIZED", False):
+        module = existing
+    else:
+        module = importlib.import_module(f"{__name__}.glm_moe_dsa_model")
+        module._OMLX_GLM_DSA_OPTIMIZED = True
 
-    module = importlib.util.module_from_spec(spec)
-    module.__package__ = "mlx_lm.models"
     sys.modules[qualname] = module
-    spec.loader.exec_module(module)
 
     import mlx_lm.models as models_pkg
 
     models_pkg.glm_moe_dsa = module
-    logger.info("Registered %s from %s", qualname, file_path.name)
+    logger.info("Registered %s from oMLX optimized vendored module", qualname)
 
 
 def apply_glm_moe_dsa_patch() -> bool:
@@ -59,9 +60,8 @@ def apply_glm_moe_dsa_patch() -> bool:
 
     Must run before ``mlx_lm.load()`` imports ``mlx_lm.models.glm_moe_dsa``.
 
-    Returns True when oMLX registered its vendored module, False when the
-    patch was already applied, mlx-lm is unavailable, or upstream already
-    ships equivalent support.
+    Returns True when oMLX registered its optimized vendored module, False when
+    the patch was already applied or mlx-lm is unavailable.
     """
     global _APPLIED
     if _APPLIED:
@@ -73,14 +73,26 @@ def apply_glm_moe_dsa_patch() -> bool:
         logger.debug("mlx_lm not importable - glm_moe_dsa patch skipped")
         return False
 
-    if _upstream_has_glm_moe_dsa_support():
-        _APPLIED = True
-        logger.debug("mlx_lm.models.glm_moe_dsa already supports GLM-5.2 sharing")
-        return False
-
     _register_module()
+    from .generate_patch import apply_glm_moe_dsa_generate_patch
+
+    apply_glm_moe_dsa_generate_patch()
     _APPLIED = True
-    logger.info("GLM MoE DSA mlx-lm patch applied (PR 1410 head %s)", PR_HEAD_SHA[:8])
+    missing = _missing_fast_symbols()
+    if missing:
+        logger.warning(
+            "GLM MoE DSA optimized patch applied, but fast kernel symbols are "
+            "missing from %s and mx.fast: %s. Build the native extension for "
+            "the accelerated path.",
+            NATIVE_KERNELS_PACKAGE,
+            ", ".join(missing),
+        )
+    elif glm_fast.native_available():
+        logger.info(
+            "GLM MoE DSA native kernels available from %s",
+            NATIVE_KERNELS_PACKAGE,
+        )
+    logger.info("GLM MoE DSA optimized mlx-lm patch applied")
     return True
 
 
@@ -88,4 +100,9 @@ def is_applied() -> bool:
     return _APPLIED
 
 
-__all__ = ["apply_glm_moe_dsa_patch", "is_applied", "PR_HEAD_SHA", "PR_URL"]
+__all__ = [
+    "apply_glm_moe_dsa_patch",
+    "is_applied",
+    "PATCH_SOURCE",
+    "NATIVE_KERNELS_PACKAGE",
+]

@@ -173,6 +173,16 @@ def maybe_apply_pre_load_patches(
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
     ):
+        from ..patches.mlx_vlm_minimax_m3_compat import (
+            apply_mlx_vlm_minimax_m3_compat_patch,
+        )
+
+        if apply_mlx_vlm_minimax_m3_compat_patch():
+            logger.info(
+                "MiniMax M3 mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
         from ..patches.minimax_m3_sparse_attention import (
             apply_minimax_m3_sparse_attention_patch,
         )

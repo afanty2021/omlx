@@ -17,6 +17,7 @@ struct ListModelsResponse: Codable, Sendable {
 
 struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let id: String
+    let displayName: String?
     let modelPath: String?
     let loaded: Bool
     let isLoading: Bool

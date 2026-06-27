@@ -362,6 +362,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks 강제 재빌드 (그 외에는 fingerprint 로 캐시됨)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# 선택 GLM 네이티브 커스텀 커널을 포함해 스테이징
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 첫 cold 빌드는 10–20분 소요됩니다 (venvstacks Python 레이어 어셈블리). 이후 빌드는 `packaging/_export/` 캐시를 재사용해 약 4분에 끝납니다. 레이어 구성은 [packaging/README.md](packaging/README.md), Swift 소스는 [apps/omlx-mac/](apps/omlx-mac/) 를 참조하세요.

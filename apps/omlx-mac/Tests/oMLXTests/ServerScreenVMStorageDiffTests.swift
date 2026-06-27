@@ -189,4 +189,22 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         XCTAssertEqual(vm.appliedBindAddress, "0.0.0.0")
         XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
     }
+
+    func testApplyConfigSeedsAutoStartWhenServerIsOffline() {
+        let cfg = AppConfig(
+            bindAddress: "127.0.0.1",
+            port: 8080,
+            autoStartOnLaunch: false,
+            apiKey: nil,
+            basePath: "/Users/Fido/.omlx",
+            modelDir: "/Users/Fido/.omlx/models",
+            modelDirs: ["/Users/Fido/.omlx/models"],
+            hfEndpoint: ""
+        )
+        let vm = ServerScreenVM()
+
+        vm.applyConfig(cfg)
+
+        XCTAssertFalse(vm.autoStartOnLaunch)
+    }
 }

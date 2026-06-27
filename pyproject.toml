@@ -1,5 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "cmake>=3.27",
+    "nanobind",
+    "mlx==0.31.2",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,7 +34,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.2",
+    # Vanilla MLX v0.31.2; optional GLM-5.2 kernels live under
+    # omlx.custom_kernels.glm_moe_dsa when built for release.
+    "mlx==0.31.2",
     # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
     # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
@@ -79,13 +87,13 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from PR #1374 commit (086ab9d, minimax-m3-support)
-    # includes MiniMax M3 plus prior DiffusionGemma/Gemma4/Qwen VLM fixes.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@086ab9d5d575fec64d8d8ad907ce000007c25c1a",
+    # mlx-vlm from commit e390667. MiniMax M3 support is vendored under
+    # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e3906673d54df42cf573b837a76e65d58a2b865c",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
-    # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@5d70faebe3d0af0a3dae76fcc15cc731f7ba46da",
+    # dflash-mlx v0.1.10 (9ca0028) - bstnxbt repo. Apple G17 NAX verify,
+    # prefix snapshot metrics, CopySpec mode, and full-context draft-layer cache checks.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@9ca002898b48e14c9727dec17299f497e8467870",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
@@ -95,7 +103,7 @@ grammar = [
     "xgrammar>=0.1.32",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
 ]
 modelscope = [
     "modelscope>=1.10.0",
@@ -127,7 +135,7 @@ paroquant = [
 # git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
 # separately via --no-deps post-resolution.
 bundle = [
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "modelscope>=1.10.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
@@ -151,7 +159,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "venvstacks>=0.7.0",
     # The torch-stub smoke test (tests/test_torch_stub.py) gates
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
@@ -170,7 +178,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.0",
     "apache-tvm-ffi==0.1.11",
@@ -195,11 +203,13 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# mlx and mlx-lm are git-pinned; override transitive pins
+# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
+    "mlx==0.31.2",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
 ]
 
