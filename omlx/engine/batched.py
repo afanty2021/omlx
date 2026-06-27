@@ -343,10 +343,11 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
+            # mlx-lm 0.31.2 的 load() 已移除 trust_remote_code 参数（远程代码现通过 repo 路径原生处理）；
+            # 保留该 kwarg 会导致 TypeError: load() got an unexpected keyword argument 'trust_remote_code'。
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
-                trust_remote_code=self._trust_remote_code,
             )
 
         loop = asyncio.get_running_loop()
@@ -445,10 +446,10 @@ class BatchedEngine(BaseEngine):
                                 specprefill_draft,
                                 trust_remote_code=self._trust_remote_code,
                             )
+                            # mlx-lm 0.31.2 的 load() 已移除 trust_remote_code 参数（同主模型加载处）。
                             draft_model, _ = load(
                                 specprefill_draft,
                                 tokenizer_config=draft_tokenizer_config,
-                                trust_remote_code=self._trust_remote_code,
                             )
                             # Materialize frozen buffers (RoPE freqs, etc.)
                             # on the loader thread. mlx_lm.load only does
