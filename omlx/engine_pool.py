@@ -547,6 +547,28 @@ class EnginePool:
         if self._entry_is_busy(entry):
             raise ModelBusyError(entry.model_id, operation)
 
+    @staticmethod
+    def _engine_has_usable_tokenizer(engine: object) -> bool:
+        tokenizer = getattr(engine, "tokenizer", None)
+        return tokenizer is not None and callable(getattr(tokenizer, "encode", None))
+
+    def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
+        if engine is None:
+            raise ModelLoadingError(
+                model_id,
+                f"Model '{model_id}' did not return a loaded engine.",
+            )
+        llm_engine_types = [BaseEngine]
+        if isinstance(VLMBatchedEngine, type):
+            llm_engine_types.append(VLMBatchedEngine)
+        if isinstance(engine, tuple(llm_engine_types)) and not (
+            self._engine_has_usable_tokenizer(engine)
+        ):
+            raise ModelLoadingError(
+                model_id,
+                f"Model '{model_id}' loaded without a usable tokenizer.",
+            )
+
     def _mark_pending_unload_locked(
         self,
         model_id: str,
@@ -703,6 +725,7 @@ class EnginePool:
                     )
                     await self._unload_engine(model_id)
                 elif entry.engine is not None:
+                    self._validate_llm_engine_ready(model_id, entry.engine)
                     if entry.runtime_settings_signature is None:
                         entry.runtime_settings_signature = expected_signature
                     entry.last_access = time.time()
@@ -775,6 +798,7 @@ class EnginePool:
             )
 
             loaded = self._entries[model_id]
+            self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
                 loaded.in_use += 1
             return loaded.engine
@@ -1509,9 +1533,11 @@ class EnginePool:
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
                 raise ModelLoadingError(
-                    f"Model {model_id} load aborted: " f"process memory limit exceeded"
+                    model_id,
+                    f"Model '{model_id}' load aborted: process memory limit exceeded",
                 )
 
+            self._validate_llm_engine_ready(model_id, engine)
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size

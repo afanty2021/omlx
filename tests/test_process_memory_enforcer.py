@@ -1282,7 +1282,7 @@ class TestSingleModelMemoryPressure:
 
     Hard pressure must reduce resident model memory quickly. Idle models are
     evicted immediately, including the final non-pinned model. Busy models are
-    aborted and marked pending-unload until request leases/activity drain.
+    aborted first and kept loaded unless pressure reaches the emergency tier.
     """
 
     @pytest.mark.asyncio
@@ -1315,8 +1315,10 @@ class TestSingleModelMemoryPressure:
         assert entry.engine is None
 
     @pytest.mark.asyncio
-    async def test_single_busy_model_aborts_and_marks_pending_unload(self, enforcer):
-        """A leased/active final model is aborted, then unloaded after it drains."""
+    async def test_single_busy_model_aborts_and_keeps_model_at_hard_pressure(
+        self, enforcer
+    ):
+        """Hard pressure aborts the request first; the final busy model stays loaded."""
         engine = MagicMock()
         engine.has_active_requests.return_value = False
         engine.abort_all_requests = AsyncMock(return_value=3)
@@ -1328,8 +1330,36 @@ class TestSingleModelMemoryPressure:
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = _cycling(
                 [
-                    15 * 1024**3,
-                    15 * 1024**3,
+                    11 * 1024**3,
+                    11 * 1024**3,
+                ]
+            )
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+        assert entry.engine is not None
+        assert entry.pending_unload_reason is None
+        assert entry.abort_requested is False
+
+    @pytest.mark.asyncio
+    async def test_single_busy_model_pending_unload_at_emergency_pressure(
+        self, enforcer
+    ):
+        """Emergency pressure can still unload the final busy model after drain."""
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    13 * 1024**3,
+                    13 * 1024**3,
                 ]
             )
             await enforcer._check_and_enforce()
@@ -1340,8 +1370,6 @@ class TestSingleModelMemoryPressure:
         assert entry.pending_unload_reason == "hard memory pressure"
         assert entry.abort_requested is True
 
-        # Once the endpoint lease drains, release_engine will call the same
-        # pending-unload helper and remove the model.
         entry.in_use = 0
         await enforcer._engine_pool._unload_pending_if_idle_locked("big-model")
         enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
@@ -1385,8 +1413,10 @@ class TestSingleModelMemoryPressure:
         assert entry_active.engine is not None
 
     @pytest.mark.asyncio
-    async def test_two_busy_models_aborts_lru_and_marks_pending(self, enforcer):
-        """Busy models are not directly unloaded; LRU busy gets pending unload."""
+    async def test_two_busy_models_abort_lru_without_pending_at_hard_pressure(
+        self, enforcer
+    ):
+        """Hard pressure aborts the LRU busy model without scheduling unload."""
         engine_a = MagicMock()
         engine_a.has_active_requests.return_value = False
         engine_a.abort_all_requests = AsyncMock(return_value=2)
@@ -1408,14 +1438,14 @@ class TestSingleModelMemoryPressure:
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             # Memory stays over limit throughout
-            mock_mx.get_active_memory.return_value = 15 * 1024**3
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
             await enforcer._check_and_enforce()
 
         engine_b.abort_all_requests.assert_awaited_once()
         engine_a.abort_all_requests.assert_not_awaited()
         enforcer._engine_pool._unload_engine.assert_not_awaited()
-        assert entry_b.pending_unload_reason == "hard memory pressure"
-        assert entry_b.abort_requested is True
+        assert entry_b.pending_unload_reason is None
+        assert entry_b.abort_requested is False
         assert entry_a.pending_unload_reason is None
 
 

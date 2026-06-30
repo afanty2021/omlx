@@ -1490,6 +1490,12 @@ class VLMBatchedEngine(BaseEngine):
             self._tokenizer = copy.deepcopy(self._processor.tokenizer)
         else:
             self._tokenizer = copy.deepcopy(self._processor)
+        if self._tokenizer is None or not callable(
+            getattr(self._tokenizer, "encode", None)
+        ):
+            raise RuntimeError(
+                f"VLM processor for {self._model_name} did not provide a usable tokenizer"
+            )
 
         if self.is_diffusion_model:
             self._inject_tool_calling(self._tokenizer)

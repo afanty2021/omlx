@@ -2315,6 +2315,23 @@ class TestEnginePoolInUseLease:
                 raise RuntimeError("boom")
         assert entry.in_use == 0  # no leaked lease
 
+    @pytest.mark.asyncio
+    async def test_get_engine_rejects_loaded_llm_without_tokenizer(self):
+        """A stale/half-loaded LLM engine must not reach chat tokenization."""
+        from omlx.engine.batched import BatchedEngine
+
+        pool = _make_pool(ceiling=0)
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._tokenizer = None
+        entry = self._loaded_entry("model-a")
+        entry.engine = engine
+        entry.model_type = "llm"
+        entry.engine_type = "batched"
+        pool._entries = {"model-a": entry}
+
+        with pytest.raises(ModelLoadingError, match="usable tokenizer"):
+            await pool.get_engine("model-a")
+
 
 class TestResetActivityTracking:
     """Tests for BaseNonStreamingEngine._reset_activity_tracking (#1595)."""

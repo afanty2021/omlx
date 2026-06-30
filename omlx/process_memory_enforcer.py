@@ -1334,6 +1334,14 @@ class ProcessMemoryEnforcer:
                             and hasattr(entry.engine, "abort_all_requests")
                         ):
                             aborted = await entry.engine.abort_all_requests()
+                        if not emergency:
+                            logger.warning(
+                                "Hard memory pressure: aborted %d request(s) on "
+                                "'%s' and kept model loaded",
+                                aborted,
+                                busy_victim,
+                            )
+                            break
                         if entry is not None:
                             self._engine_pool._mark_pending_unload_locked(
                                 busy_victim,
