@@ -72,6 +72,24 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
     "aggressive": 0.8,
 }
 
+# Default soft watermark per tier. A saved 0.85 from older configs is treated
+# as the legacy default so balanced / aggressive can move to their tier defaults.
+_LEGACY_SOFT_THRESHOLD = 0.85
+_SOFT_THRESHOLD_BY_TIER: dict[str, float] = {
+    "safe": 0.85,
+    "balanced": 0.90,
+    "aggressive": 0.925,
+    "custom": 0.85,
+}
+
+# Fraction of the hard ceiling used by the adaptive prefill chunk sizer.
+_PREFILL_HEADROOM_SAFETY: dict[str, float] = {
+    "safe": 0.90,
+    "balanced": 0.90,
+    "aggressive": 0.925,
+    "custom": 0.90,
+}
+
 # Fraction of the effective physical cap used by the pre-chunk prediction
 # guard. Aggressive/custom are user-directed and can run closer to the
 # configured ceiling.
@@ -250,7 +268,7 @@ class ProcessMemoryEnforcer:
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
-        soft_threshold: float = 0.90,
+        soft_threshold: float | None = None,
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
@@ -273,8 +291,9 @@ class ProcessMemoryEnforcer:
             prefill_memory_guard: When False, returns a ceiling of 0 so
                 callers treat the limit as disabled.
             global_settings: Optional global settings for idle timeout.
-            soft_threshold: Fraction of ceiling that triggers soft action
-                (LRU non-pinned eviction + admission pause; in-flight allowed).
+            soft_threshold: Optional explicit fraction of ceiling that triggers
+                soft action. None, or the legacy 0.85 default, uses the tier
+                default instead.
             hard_threshold: Fraction of ceiling that triggers hard action
                 (LRU/non-pinned aborts, loading aborts, and idle reclaim).
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
@@ -293,8 +312,12 @@ class ProcessMemoryEnforcer:
         self._settings_manager = settings_manager
         self._prefill_memory_guard = prefill_memory_guard
         self._global_settings = global_settings
-        self._soft_threshold = soft_threshold
+        self._soft_threshold_override = self._normalize_soft_threshold_override(
+            soft_threshold
+        )
+        self._soft_threshold = self._get_soft_threshold()
         self._hard_threshold = hard_threshold
+        self._prefill_headroom_safety = self._get_prefill_headroom_safety()
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
         self._task: asyncio.Task | None = None
@@ -327,6 +350,29 @@ class ProcessMemoryEnforcer:
             return "balanced"
         return t
 
+    @staticmethod
+    def _normalize_soft_threshold_override(value: float | None) -> float | None:
+        if value is None:
+            return None
+        threshold = float(value)
+        if threshold <= 0:
+            return None
+        if abs(threshold - _LEGACY_SOFT_THRESHOLD) < 1e-9:
+            return None
+        return threshold
+
+    def _refresh_tier_thresholds(self) -> None:
+        self._soft_threshold = self._get_soft_threshold()
+        self._prefill_headroom_safety = self._get_prefill_headroom_safety()
+
+    def _get_soft_threshold(self) -> float:
+        if self._soft_threshold_override is not None:
+            return self._soft_threshold_override
+        return _SOFT_THRESHOLD_BY_TIER[self._memory_guard_tier]
+
+    def _get_prefill_headroom_safety(self) -> float:
+        return _PREFILL_HEADROOM_SAFETY[self._memory_guard_tier]
+
     @property
     def memory_guard_tier(self) -> str:
         return self._memory_guard_tier
@@ -338,6 +384,7 @@ class ProcessMemoryEnforcer:
             return
         old = self._memory_guard_tier
         self._memory_guard_tier = new_tier
+        self._refresh_tier_thresholds()
         if self._running:
             if self._prefill_memory_guard:
                 self._refresh_effective_metal_cap_bytes()
@@ -979,6 +1026,7 @@ class ProcessMemoryEnforcer:
             scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
+            scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
             scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
             bg = getattr(scheduler, "batch_generator", None)

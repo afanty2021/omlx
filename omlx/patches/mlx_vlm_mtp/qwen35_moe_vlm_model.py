@@ -3,8 +3,8 @@
 
 Same fix as ``qwen35_vlm_model.py`` but for the MoE variant in
 ``mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py``. The expert weight repacking
-(``gate_up_proj`` split into ``gate_proj`` / ``up_proj``) is preserved
-verbatim from the upstream body.
+(``gate_up_proj`` split into ``gate_proj`` / ``up_proj``) follows the pinned
+upstream sanitize body.
 """
 
 from __future__ import annotations
@@ -50,14 +50,16 @@ def apply() -> bool:
             if gate_up_key not in weights:
                 return
             gate_up_weight = weights.pop(gate_up_key)
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+            mid = gate_up_weight.shape[-2] // 2
+            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
+                ..., :mid, :
+            ]
+            weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
+                ..., mid:, :
+            ]
             down_key = f"{prefix}.experts.down_proj"
             if down_key in weights:
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    down_key
-                )
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(down_key)
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             _unfuse_layer_experts(f"model.language_model.layers.{layer_idx}.mlp")
@@ -125,10 +127,7 @@ def apply() -> bool:
         # for full-precision Qwen3.6 sources where MTP norm conventions are
         # mixed.
         def _is_oq_tracked_tensor(_w):
-            return (
-                _w.__class__.__name__ == "_TrackedTensor"
-                and hasattr(_w, "_clone")
-            )
+            return _w.__class__.__name__ == "_TrackedTensor" and hasattr(_w, "_clone")
 
         def _mark_mtp_norm_conditional_add(_w):
             return _w._clone(transform="add_if_mean_lt_0_5")
@@ -143,9 +142,7 @@ def apply() -> bool:
         for key, value in weights.items():
             if "model" in key:
                 if "model.language_model" in key:
-                    key = key.replace(
-                        "model.language_model", "language_model.model"
-                    )
+                    key = key.replace("model.language_model", "language_model.model")
                 elif "model.visual" in key:
                     key = key.replace("model.visual", "vision_tower")
             elif "lm_head" in key:
@@ -156,7 +153,7 @@ def apply() -> bool:
                 key = "language_model." + key
 
             if key.startswith("language_model.model.visual."):
-                key = "vision_tower." + key[len("language_model.model.visual."):]
+                key = "vision_tower." + key[len("language_model.model.visual.") :]
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 # mx.moveaxis goes through the streaming-discovery

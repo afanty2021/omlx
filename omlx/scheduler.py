@@ -210,6 +210,43 @@ def _safe_sync_stream(stream=None):
             raise
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env %s=%r", name, value)
+        return default
+
+
+def _collect_mx_arrays(value, out: list[mx.array]) -> None:
+    if isinstance(value, mx.array):
+        out.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_mx_arrays(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_mx_arrays(item, out)
+
+
+def _eval_generation_batch_cache(batch_generator) -> int:
+    generation_batch = getattr(batch_generator, "_generation_batch", None)
+    prompt_cache = getattr(generation_batch, "prompt_cache", None)
+    if not prompt_cache:
+        return 0
+    arrays: list[mx.array] = []
+    for cache in prompt_cache:
+        state = getattr(cache, "state", None)
+        if state is not None:
+            _collect_mx_arrays(state, arrays)
+    if arrays:
+        mx.eval(*arrays)
+    return len(arrays)
+
+
 class _StoreCacheGate:
     """Non-blocking counter that bounds in-flight store-cache submissions.
 
@@ -1477,6 +1514,29 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        self._minimax_m3_adaptive_prefill = None
+        try:
+            from .patches.minimax_m3.generate_patch import (
+                _minimax_m3_adaptive_prefill_config,
+            )
+
+            self._minimax_m3_adaptive_prefill = _minimax_m3_adaptive_prefill_config(
+                model,
+                self.config.prefill_step_size,
+                getattr(self.config, "model_name", None),
+            )
+        except Exception:
+            logger.debug(
+                "MiniMax M3 adaptive prefill config unavailable", exc_info=True
+            )
+        if self._minimax_m3_adaptive_prefill is not None:
+            logger.info(
+                "MiniMax M3 adaptive scheduler prefill enabled: step=%d after=%d "
+                "min_remaining=%d",
+                self._minimax_m3_adaptive_prefill.step_size,
+                self._minimax_m3_adaptive_prefill.after,
+                self._minimax_m3_adaptive_prefill.min_remaining,
+            )
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1542,6 +1602,7 @@ class Scheduler:
         self._admission_paused: bool = False
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
+        self._prefill_headroom_safety: float = self._PREFILL_HEADROOM_SAFETY
         self._prefill_safe_zone_ratio: float = 0.80
         self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
@@ -1569,6 +1630,22 @@ class Scheduler:
         # token where the new prompt diverges from what was cached.
         # Populated only when debug logging is enabled — zero cost otherwise.
         self._cache_probe_seqs: deque[tuple[str, list[int]]] = deque(maxlen=4)
+
+        model_name_lower = (self.config.model_name or "").lower()
+        default_kv_eval_interval = 256 if "minimax" in model_name_lower else 0
+        self._decode_eval_kv_cache_interval: int = max(
+            0,
+            _env_int(
+                "OMLX_DECODE_EVAL_KV_CACHE_INTERVAL",
+                default_kv_eval_interval,
+            ),
+        )
+        self._tokens_since_kv_cache_eval: int = 0
+        if self._decode_eval_kv_cache_interval > 0:
+            logger.info(
+                "Decode KV cache materialization interval set to %d tokens",
+                self._decode_eval_kv_cache_interval,
+            )
 
         # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
         # When set, eligible requests bypass mlx-lm BatchGenerator for decode
@@ -3401,7 +3478,10 @@ class Scheduler:
         # Keep each chunk's predicted peak under the LOWER of the dynamic
         # throttle target and the prefill safety cap, so the peak can never
         # reach the Metal wall (the uncatchable async OOM).
-        safe_target = int(hard_cap * self._PREFILL_HEADROOM_SAFETY)
+        headroom_safety = getattr(
+            self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
+        )
+        safe_target = int(hard_cap * headroom_safety)
         abort_cap = self._prefill_abort_cap()
         target = min(safe_target, abort_cap) if abort_cap > 0 else safe_target
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
@@ -3781,13 +3861,26 @@ class Scheduler:
     ) -> int:
         """Return the scheduler prefill chunk size for the current progress."""
         adaptive_prefill = self._glm_dsa_adaptive_prefill
+        if adaptive_prefill is not None:
+            from .patches.glm_moe_dsa.generate_patch import (
+                _prefill_step_size_for_progress,
+            )
+
+            return _prefill_step_size_for_progress(
+                self.config.prefill_step_size,
+                processed_tokens,
+                remaining_tokens,
+                adaptive_prefill,
+            )
+
+        adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
             return self.config.prefill_step_size
-        from .patches.glm_moe_dsa.generate_patch import (
-            _prefill_step_size_for_progress,
+        from .patches.minimax_m3.generate_patch import (
+            _prefill_step_size_for_progress as _minimax_prefill_step_size,
         )
 
-        return _prefill_step_size_for_progress(
+        return _minimax_prefill_step_size(
             self.config.prefill_step_size,
             processed_tokens,
             remaining_tokens,
@@ -9189,6 +9282,30 @@ class Scheduler:
                     outputs, finished_ids = self._process_batch_responses(responses)
                     output.outputs.extend(outputs)
                     output.finished_request_ids.update(finished_ids)
+
+                    # Periodic decode cache materialization for models whose
+                    # KV cache update graph can otherwise grow for thousands of
+                    # tokens. MiniMax-M3 has one lazy cache-update chain per
+                    # layer; evaluating the cache state periodically cuts those
+                    # references before Metal's resource-count limit is hit.
+                    self._tokens_since_kv_cache_eval = getattr(
+                        self, "_tokens_since_kv_cache_eval", 0
+                    ) + len(responses)
+                    kv_eval_interval = self._decode_eval_kv_cache_interval
+                    if (
+                        kv_eval_interval > 0
+                        and self._tokens_since_kv_cache_eval >= kv_eval_interval
+                    ):
+                        with mx.stream(self._stream):
+                            evaluated = _eval_generation_batch_cache(
+                                self.batch_generator
+                            )
+                        logger.debug(
+                            "Materialized decode KV cache state: %d arrays",
+                            evaluated,
+                        )
+                        self._tokens_since_kv_cache_eval = 0
+
                     self._cleanup_finished(finished_ids)
 
                     # Periodic Metal allocator cleanup during long decodes.

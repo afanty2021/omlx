@@ -72,6 +72,12 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### From Source
 
 ```bash
@@ -79,6 +85,9 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
+
+# Optional: GLM-5.2 / MiniMax M3 native custom kernels
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
 Requires macOS 15.0+ (Sequoia), Python 3.10+, and Apple Silicon (M1/M2/M3/M4).
@@ -387,7 +396,7 @@ open apps/omlx-mac/build/Stage/oMLX.app
 # Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# Stage with optional GLM native custom kernels
+# Stage with optional GLM-5.2 / MiniMax M3 native custom kernels
 apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 

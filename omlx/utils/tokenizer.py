@@ -266,6 +266,36 @@ def _detokenizer_factory_from_tokenizer_json(
     return None
 
 
+def _is_unsafe_mlx_vlm_bpe_detokenizer(detokenizer: Any) -> bool:
+    detokenizer_type = type(detokenizer)
+    return (
+        detokenizer_type.__module__ == "mlx_vlm.tokenizer_utils"
+        and detokenizer_type.__name__ == "BPEStreamingDetokenizer"
+    )
+
+
+def _create_decoder_aware_detokenizer(
+    tokenizer: Any,
+    tokenizer_file: Path | None,
+) -> Any | None:
+    if tokenizer_file is None:
+        return None
+
+    factory = _detokenizer_factory_from_tokenizer_json(str(tokenizer_file))
+    if factory is None:
+        return None
+
+    try:
+        return factory(tokenizer)
+    except Exception as exc:
+        logger.debug(
+            "Failed to create decoder-aware detokenizer from %s: %s",
+            tokenizer_file,
+            exc,
+        )
+        return None
+
+
 class _CompatNaiveStreamingDetokenizer:
     """Naive fallback for raw tokenizers that lack mlx-lm's probe APIs."""
 
@@ -336,20 +366,27 @@ def create_streaming_detokenizer(
         logger.debug("Failed to read tokenizer.detokenizer: %s", exc)
 
     if detokenizer is not None:
+        if _is_unsafe_mlx_vlm_bpe_detokenizer(detokenizer):
+            tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
+            decoder_aware_detokenizer = _create_decoder_aware_detokenizer(
+                tokenizer,
+                tokenizer_file,
+            )
+            if decoder_aware_detokenizer is not None:
+                return decoder_aware_detokenizer
+            logger.debug(
+                "Using existing mlx-vlm BPE detokenizer because no "
+                "decoder-aware replacement is available"
+            )
         return detokenizer
 
     tokenizer_file = _find_tokenizer_json(tokenizer, model_path)
-    if tokenizer_file is not None:
-        factory = _detokenizer_factory_from_tokenizer_json(str(tokenizer_file))
-        if factory is not None:
-            try:
-                return factory(tokenizer)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to create decoder-aware detokenizer from %s: %s",
-                    tokenizer_file,
-                    exc,
-                )
+    decoder_aware_detokenizer = _create_decoder_aware_detokenizer(
+        tokenizer,
+        tokenizer_file,
+    )
+    if decoder_aware_detokenizer is not None:
+        return decoder_aware_detokenizer
 
     if has_existing_attr:
         return None

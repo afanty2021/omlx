@@ -107,6 +107,7 @@ def _throttle_ctx(
         _prefill_safe_zone_ratio=soft_ratio,
         _prefill_min_chunk_tokens=min_chunk,
         _prefill_abort_margin=abort_margin,
+        _prefill_headroom_safety=Scheduler._PREFILL_HEADROOM_SAFETY,
         _prefill_transient_tracker=tracker,
         memory_monitor=monitor,
         _PREFILL_STEP_TIERS=Scheduler._PREFILL_STEP_TIERS,

@@ -7,6 +7,8 @@ class Omlx < Formula
 
   head "https://github.com/jundot/omlx.git", branch: "main"
 
+  option "with-custom-kernel",
+         "Build native custom kernels for GLM-5.2 and MiniMax M3 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
@@ -19,6 +21,15 @@ class Omlx < Formula
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
       revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+  end
+
+  # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
+  # language model so the first TTS request does not download into the
+  # Homebrew venv at runtime.
+  resource "en-core-web-sm" do
+    url "https://github.com/explosion/spacy-models/releases/download/" \
+        "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
   end
 
   service do
@@ -40,6 +51,17 @@ class Omlx < Formula
     # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
+    if build.with?("custom-kernel")
+      kernel_sources = [
+        buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
+        buildpath/"omlx/custom_kernels/minimax_m3/csrc",
+      ]
+      unless kernel_sources.all?(&:directory?)
+        odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
+      end
+
+      ENV["OMLX_WITH_CUSTOM_KERNEL"] = "1"
+    end
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
@@ -47,11 +69,30 @@ class Omlx < Formula
            "--no-binary", "cohere_melody,pydantic-core,rpds-py,tiktoken",
            install_spec
 
+    if build.with?("custom-kernel")
+      system libexec/"bin/python", "-c", <<~PYTHON
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+        assert glm_fast.is_native_available(), glm_fast.import_error()
+        assert minimax_fast.is_native_available(), minimax_fast.import_error()
+      PYTHON
+    end
+
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system libexec/"bin/pip", "install", ".[all]"
     end
+
+    # Install the spaCy English model required by misaki for Kokoro TTS.
+    # Homebrew's cached resource path is hash-prefixed, which pip rejects
+    # as an invalid wheel filename. Copy it back to the canonical basename.
+    spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
+    cp resource("en-core-web-sm").cached_download, spacy_model_wheel
+    system libexec/"bin/pip", "install", "--no-deps",
+           spacy_model_wheel
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
@@ -125,5 +166,7 @@ class Omlx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
   end
 end

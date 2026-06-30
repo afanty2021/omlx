@@ -109,7 +109,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
-CUSTOM_KERNEL_DIR="$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
+CUSTOM_KERNEL_DIRS=(
+    "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
+    "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
+)
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
 # copy with platform-specific mlx-metal wheels swapped in.
@@ -224,18 +227,26 @@ _custom_kernel_pythonpath() {
 }
 
 _clean_custom_kernel_build_artifacts() {
-    find "$CUSTOM_KERNEL_DIR" -maxdepth 1 -type f \( \
-        -name "*.so" -o \
-        -name "*.dylib" -o \
-        -name "*.metallib" \
-    \) -delete
+    local dir
+    for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        find "$dir" -maxdepth 1 -type f \( \
+            -name "*.so" -o \
+            -name "*.dylib" -o \
+            -name "*.metallib" \
+        \) -delete
+    done
 
     if [ -d "$REPO_ROOT/build" ]; then
-        find "$REPO_ROOT/build" \
-            -type d \
-            -name "omlx.custom_kernels.glm_moe_dsa._ext" \
-            -prune \
-            -exec rm -rf {} +
+        for ext_name in \
+            "omlx.custom_kernels.glm_moe_dsa._ext" \
+            "omlx.custom_kernels.minimax_m3._ext"; do
+            find "$REPO_ROOT/build" \
+                -type d \
+                -name "$ext_name" \
+                -prune \
+                -exec rm -rf {} +
+        done
     fi
 }
 
@@ -253,12 +264,15 @@ _validate_custom_kernel_deployment_target() {
 
     command -v otool >/dev/null 2>&1 || return 0
 
-    for path in "$CUSTOM_KERNEL_DIR"/_ext*.so "$CUSTOM_KERNEL_DIR"/lib*.dylib; do
-        [ -e "$path" ] || continue
-        minos="$(_custom_kernel_minos "$path")"
-        [ -n "$minos" ] || die "could not read deployment target from $path."
-        [ "$minos" = "$expected" ] \
-            || die "custom kernel $path has macOS min $minos, expected $expected."
+    local dir
+    for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
+        for path in "$dir"/_ext*.so "$dir"/lib*.dylib; do
+            [ -e "$path" ] || continue
+            minos="$(_custom_kernel_minos "$path")"
+            [ -n "$minos" ] || die "could not read deployment target from $path."
+            [ "$minos" = "$expected" ] \
+                || die "custom kernel $path has macOS min $minos, expected $expected."
+        done
     done
 }
 
@@ -283,8 +297,10 @@ _build_custom_kernels() {
         fi
         "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
     ) || die "custom kernel build failed; see output above."
-    [ -f "$CUSTOM_KERNEL_DIR/omlx_glm_kernels.metallib" ] \
+    [ -f "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa/omlx_glm_kernels.metallib" ] \
         || die "custom kernel build finished but GLM metallib is missing."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
+        || die "custom kernel build finished but MiniMax M3 metallib is missing."
     _validate_custom_kernel_deployment_target "$deployment_target"
     ok "  + custom kernels ($deployment_target)"
 }

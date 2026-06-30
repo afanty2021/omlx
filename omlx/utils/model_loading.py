@@ -49,6 +49,50 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
+    """Add quantization specs for GLM DSA fused MoE gate/up layers.
+
+    The oMLX GLM DSA patch fuses ``switch_mlp.gate_proj`` and
+    ``switch_mlp.up_proj`` into ``switch_mlp.gate_up_proj``.  mlx-lm's loader
+    chooses a module's quantizer from ``config["quantization"][path]`` before
+    falling back to the global quantization settings.  GLM-5.1-MXFP4-Q8 ships
+    per-layer MXFP4 specs for the split gate/up modules, but no fused path
+    entry, so the fallback incorrectly quantizes ``gate_up_proj`` as affine and
+    strict loading asks for missing ``gate_up_proj.biases`` tensors.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") != "glm_moe_dsa":
+        return cfg
+
+    for config_key in ("quantization", "quantization_config"):
+        quant = cfg.get(config_key)
+        if not isinstance(quant, dict):
+            continue
+
+        extras: dict[str, dict] = {}
+        for gate_path, gate_spec in list(quant.items()):
+            if not gate_path.endswith(".mlp.switch_mlp.gate_proj"):
+                continue
+            if not isinstance(gate_spec, dict):
+                continue
+
+            base_path = gate_path[: -len(".gate_proj")]
+            up_path = f"{base_path}.up_proj"
+            fused_path = f"{base_path}.gate_up_proj"
+            if fused_path in quant:
+                continue
+
+            up_spec = quant.get(up_path)
+            if isinstance(up_spec, dict) and up_spec == gate_spec:
+                extras[fused_path] = dict(gate_spec)
+
+        if extras:
+            quant.update(extras)
+
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -65,6 +109,7 @@ def _patch_mlx_lm_load_config() -> None:
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
         expand_per_layer_quant_keys(cfg)
+        expand_glm_moe_dsa_fused_quant_keys(cfg)
         return cfg
 
     _lu.load_config = _patched
@@ -106,9 +151,6 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    - mlx-vlm diffusion mxfp4 embedding patch when ``for_vlm`` is True and
-      the checkpoint declares ``model_type == "diffusion_gemma"``.
-
     Both patches inject modules into ``sys.modules`` and replace mlx-lm
     internals; gating keeps non-affected models at zero cost.
 
@@ -162,12 +204,6 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-
-    if for_vlm and model_type == "diffusion_gemma":
-        from ..patches.mlx_vlm_diffusion import apply_mlx_vlm_diffusion_patch
-
-        if apply_mlx_vlm_diffusion_patch():
-            logger.info("mlx-vlm diffusion patch applied for %s", model_name)
 
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if for_vlm and (

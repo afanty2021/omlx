@@ -3,7 +3,12 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    "nanobind",
+    # Pin nanobind to match the ABI version MLX 0.31.2 was built with
+    # (MLX pins nanobind v2.12.0 / ABI v19 via FetchContent in its CMakeLists.txt).
+    # A newer nanobind (e.g. 2.13.0 / ABI v20) isolates the `mlx` NB_DOMAIN, so
+    # custom kernel extensions (omlx.custom_kernels.*) reject every mlx.core.array
+    # at the type caster with `incompatible function arguments`.
+    "nanobind==2.12.0",
     "mlx==0.31.2",
 ]
 build-backend = "setuptools.build_meta"
@@ -34,12 +39,13 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.31.2; optional GLM-5.2 kernels live under
-    # omlx.custom_kernels.glm_moe_dsa when built for release.
+    # Vanilla MLX v0.31.2; optional custom kernels live under
+    # omlx.custom_kernels.* when built for release.
     "mlx==0.31.2",
-    # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
-    # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
+    # mlx-lm from commit (2ed2231, v0.31.3) - DeepSeek/GLM DSA indexer
+    # RoPE fix, trust_remote_code load gate, transformers 5.7.0 compatibility,
+    # and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -87,9 +93,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit e390667. MiniMax M3 support is vendored under
+    # mlx-vlm from commit 78b96eb. MiniMax M3 support is vendored under
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e3906673d54df42cf573b837a76e65d58a2b865c",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.10 (9ca0028) - bstnxbt repo. Apple G17 NAX verify,
     # prefix snapshot metrics, CopySpec mode, and full-context draft-layer cache checks.
@@ -204,13 +210,14 @@ include = ["omlx*"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
     "mlx==0.31.2",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
 ]
 
 [tool.black]

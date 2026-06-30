@@ -143,6 +143,39 @@ class TestVLMStreamingCleanup:
 
         assert fake_engine.aborted_request_id == "vlm-request-1"
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_preserves_generation_timestamps(self):
+        """VLM benchmark timing needs producer-side token timestamps."""
+
+        class TimestampCore(FakeStreamingCore):
+            async def stream_outputs(self, request_id):
+                yield SimpleNamespace(
+                    output_text="done",
+                    new_text="done",
+                    prompt_tokens=8,
+                    completion_tokens=4,
+                    finished=True,
+                    finish_reason="length",
+                    tool_calls=None,
+                    cached_tokens=0,
+                    generated_at=10.0,
+                    generated_until=12.0,
+                )
+
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = TimestampCore()
+
+        outputs = []
+        async for output in engine.stream_generate("hello"):
+            outputs.append(output)
+
+        assert len(outputs) == 1
+        assert outputs[0].generated_at == 10.0
+        assert outputs[0].generated_until == 12.0
+
 
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
@@ -1866,6 +1899,61 @@ class TestStopSafety:
         await engine.stop()
 
         mock_inner_engine.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_drops_vlm_refs_and_cache_before_inner_close(self):
+        """VLM wrapper refs and feature cache are released before final reclaim."""
+        engine = _make_loaded_engine()
+        events = []
+        vision_cache = MagicMock()
+        vision_cache.close.side_effect = lambda: events.append("vision_cache")
+        engine._vision_cache = vision_cache
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+
+        mock_inner_engine = MagicMock()
+
+        def close_side_effect():
+            events.append("inner_close")
+            assert engine._engine is None
+            assert engine._vlm_model is None
+            assert engine._processor is None
+            assert engine._adapter is None
+            assert engine._tokenizer is None
+            assert engine._vision_cache is None
+
+        mock_inner_engine.close.side_effect = close_side_effect
+        engine._engine.engine = mock_inner_engine
+
+        await engine.stop()
+
+        assert events == ["stop", "vision_cache", "inner_close"]
+
+    @pytest.mark.asyncio
+    async def test_stop_sets_diffusion_cancel_before_dropping_model_refs(self):
+        """Diffusion workers see cancellation before model refs are cleared."""
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._engine = None
+        engine._processor = MagicMock()
+        events = []
+
+        class RecordingCancelEvent:
+            def set(self):
+                events.append(
+                    (
+                        "cancel",
+                        engine._vlm_model is not None,
+                        engine._processor is not None,
+                    )
+                )
+
+        engine._diffusion_cancel_events = {RecordingCancelEvent()}
+
+        await engine.stop()
+
+        assert events == [("cancel", True, True)]
+        assert engine._vlm_model is None
+        assert engine._processor is None
 
 
 # ---------------------------------------------------------------------------

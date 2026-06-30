@@ -25,6 +25,11 @@ import pytest
 _TOUCHED = (
     "torch",
     "torch.cuda",
+    "torch.cuda.amp",
+    "torch.cuda.amp.common",
+    "torch.backends",
+    "torch.backends.mps",
+    "torch.backends.cudnn",
     "torch.version",
     "torch.nn",
     "torch.nn.functional",
@@ -81,6 +86,12 @@ def test_install_returns_true_and_populates_sys_modules(stub_module):
         assert hasattr(torch, alias)
     # Submodules tvm_ffi reaches into.
     assert sys.modules["torch.cuda"].is_available() is False
+    assert sys.modules["torch.cuda"].device_count() == 0
+    assert (
+        sys.modules["torch.cuda.amp.common"].amp_definitely_not_available() is True
+    )
+    assert sys.modules["torch.backends.mps"].is_available() is False
+    assert sys.modules["torch.backends.mps"].is_built() is False
     assert sys.modules["torch.version"].cuda is None
 
 
@@ -357,6 +368,11 @@ def test_stub_modules_have_real_spec_and_loader(stub_module):
     for name in (
         "torch",
         "torch.cuda",
+        "torch.cuda.amp",
+        "torch.cuda.amp.common",
+        "torch.backends",
+        "torch.backends.mps",
+        "torch.backends.cudnn",
         "torch.version",
         "torch.nn",
         "torch.nn.functional",

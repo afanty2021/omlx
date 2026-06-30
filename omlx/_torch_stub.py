@@ -114,6 +114,14 @@ def _false(*args, **kwargs) -> bool:
     return False
 
 
+def _true(*args, **kwargs) -> bool:
+    return True
+
+
+def _zero(*args, **kwargs) -> int:
+    return 0
+
+
 def _unsupported(qualname: str):
     def _fn(*args, **kwargs):
         raise RuntimeError(
@@ -229,12 +237,30 @@ def _build_modules() -> dict[str, types.ModuleType]:
 
     cuda = types.ModuleType("torch.cuda")
     cuda.is_available = _false
+    cuda.device_count = _zero
+
+    cuda_amp_common = types.ModuleType("torch.cuda.amp.common")
+    cuda_amp_common.amp_definitely_not_available = _true
+    cuda_amp = types.ModuleType("torch.cuda.amp")
+    cuda_amp.common = cuda_amp_common
+    cuda.amp = cuda_amp
 
     class _Stream:
         pass
 
     cuda.Stream = _Stream
     torch.cuda = cuda
+
+    backends_mps = types.ModuleType("torch.backends.mps")
+    backends_mps.is_available = _false
+    backends_mps.is_built = _false
+    backends_cudnn = types.ModuleType("torch.backends.cudnn")
+    backends_cudnn.deterministic = False
+    backends_cudnn.benchmark = False
+    backends = types.ModuleType("torch.backends")
+    backends.mps = backends_mps
+    backends.cudnn = backends_cudnn
+    torch.backends = backends
 
     version = types.ModuleType("torch.version")
     version.cuda = None
@@ -262,6 +288,11 @@ def _build_modules() -> dict[str, types.ModuleType]:
     return {
         "torch": torch,
         "torch.cuda": cuda,
+        "torch.cuda.amp": cuda_amp,
+        "torch.cuda.amp.common": cuda_amp_common,
+        "torch.backends": backends,
+        "torch.backends.mps": backends_mps,
+        "torch.backends.cudnn": backends_cudnn,
         "torch.version": version,
         "torch.nn": nn,
         "torch.nn.functional": nn_functional,

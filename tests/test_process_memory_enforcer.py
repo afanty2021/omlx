@@ -44,6 +44,7 @@ def _make_enforcer(
         hard_threshold=hard_threshold,
         **kwargs,
     )
+    enforcer._soft_threshold = soft_threshold
     enforcer._get_hard_limit_bytes = lambda: int(ceiling)
     if breakdown is None:
         breakdown = {
@@ -663,6 +664,7 @@ class TestDisabledWhenCeilingZero:
         scheduler._memory_dynamic_ceiling_bytes = 0
         scheduler._memory_metal_cap_bytes = 0
         scheduler._memory_guard_tier = "balanced"
+        scheduler._prefill_headroom_safety = 0.0
         scheduler.batch_generator = None
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -680,6 +682,7 @@ class TestDisabledWhenCeilingZero:
             "distinguish dynamic-on-custom (raise custom_ceiling_bytes) "
             "from dynamic-on-reclaim-tier (close other apps)"
         )
+        assert scheduler._prefill_headroom_safety == 0.90
         assert (
             scheduler._memory_hard_limit_bytes == dynamic_b
         ), "hard limit must be min of the three components"
@@ -2006,6 +2009,44 @@ class TestTwoWatermarkPressureLevels:
         assert balanced._get_prefill_abort_margin() == 0.90
         assert aggressive._get_prefill_abort_margin() == 0.95
         assert custom._get_prefill_abort_margin() == 0.95
+
+    @pytest.mark.parametrize(
+        "tier,expected",
+        [("safe", 0.85), ("balanced", 0.90), ("aggressive", 0.925)],
+    )
+    def test_legacy_default_soft_threshold_is_tier_specific(self, pool, tier, expected):
+        enforcer = ProcessMemoryEnforcer(
+            pool,
+            memory_guard_tier=tier,
+            soft_threshold=0.85,
+        )
+        assert enforcer._soft_threshold == expected
+
+    def test_explicit_soft_threshold_override_is_preserved(self, pool):
+        enforcer = ProcessMemoryEnforcer(
+            pool,
+            memory_guard_tier="aggressive",
+            soft_threshold=0.92,
+        )
+        assert enforcer._soft_threshold == 0.92
+
+    def test_tier_change_refreshes_soft_threshold_and_prefill_headroom(self, pool):
+        enforcer = ProcessMemoryEnforcer(pool, memory_guard_tier="safe")
+
+        assert enforcer._soft_threshold == 0.85
+        assert enforcer._get_prefill_headroom_safety() == 0.90
+
+        enforcer.memory_guard_tier = "aggressive"
+
+        assert enforcer._soft_threshold == 0.925
+        assert enforcer._get_prefill_headroom_safety() == 0.925
+
+    def test_prefill_headroom_safety_is_tier_specific(self, pool):
+        balanced = ProcessMemoryEnforcer(pool, memory_guard_tier="balanced")
+        aggressive = ProcessMemoryEnforcer(pool, memory_guard_tier="aggressive")
+
+        assert balanced._get_prefill_headroom_safety() == 0.90
+        assert aggressive._get_prefill_headroom_safety() == 0.925
 
     def test_get_pressure_level_when_not_running(self, enforcer_2wm):
         # _running=False → always ok regardless of cached level

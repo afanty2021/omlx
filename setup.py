@@ -40,7 +40,11 @@ def _custom_kernel_build_kwargs() -> dict:
             extension.CMakeExtension(
                 "omlx.custom_kernels.glm_moe_dsa._ext",
                 sourcedir="omlx/custom_kernels/glm_moe_dsa/csrc",
-            )
+            ),
+            extension.CMakeExtension(
+                "omlx.custom_kernels.minimax_m3._ext",
+                sourcedir="omlx/custom_kernels/minimax_m3/csrc",
+            ),
         ],
         "cmdclass": {"build_ext": extension.CMakeBuild},
     }
