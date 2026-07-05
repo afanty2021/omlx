@@ -427,6 +427,14 @@ class ModelLoadingError(EnginePoolError):
         super().__init__(message or f"Model '{model_id}' is already being loaded")
 
 
+class ModelUnavailableError(EnginePoolError):
+    """Raised when a previous load failure makes a model temporarily unavailable."""
+
+    def __init__(self, model_id: str, message: str | None = None):
+        self.model_id = model_id
+        super().__init__(message or f"Model '{model_id}' is unavailable")
+
+
 class ModelBusyError(EnginePoolError):
     """Raised when an operation would unload a model that is currently in use."""
 

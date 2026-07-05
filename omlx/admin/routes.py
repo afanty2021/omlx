@@ -340,6 +340,12 @@ class OQStartRequest(BaseModel):
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
+    enhanced: bool = False
+    imatrix_cache_path: str = ""
+    imatrix_reuse_cache: bool = True
+    imatrix_strict: bool = False
+    imatrix_num_samples: int = 128
+    imatrix_seq_length: int = 512
 
 
 class HFUploadRequest(BaseModel):
@@ -6201,6 +6207,17 @@ async def start_oq_quantization(
             status_code=400,
             detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
         )
+    if request.enhanced:
+        if not 1 <= request.imatrix_num_samples <= 4096:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid imatrix_num_samples. Must be between 1 and 4096.",
+            )
+        if not 64 <= request.imatrix_seq_length <= 8192:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid imatrix_seq_length. Must be between 64 and 8192.",
+            )
     is_paro, _ = _paroquant_compat_for_model({"model_path": request.model_path})
     if is_paro:
         raise HTTPException(
@@ -6220,6 +6237,12 @@ async def start_oq_quantization(
             dtype=request.dtype,
             preserve_mtp=request.preserve_mtp,
             auto_proxy_sensitivity=request.auto_proxy_sensitivity,
+            enhanced=request.enhanced,
+            imatrix_cache_path=request.imatrix_cache_path,
+            imatrix_reuse_cache=request.imatrix_reuse_cache,
+            imatrix_strict=request.imatrix_strict,
+            imatrix_num_samples=request.imatrix_num_samples,
+            imatrix_seq_length=request.imatrix_seq_length,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

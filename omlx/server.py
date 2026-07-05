@@ -185,6 +185,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
@@ -954,6 +955,8 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ModelBusyError as e:
@@ -2648,8 +2651,22 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 
     try:
         await _server_state.engine_pool.get_engine(model_id)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ModelTooLargeError as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelLoadingError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except EnginePoolError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
@@ -4183,6 +4200,71 @@ async def stream_completion(
     yield "data: [DONE]\n\n"
 
 
+def _copy_chat_template_messages(messages: list) -> list:
+    return [
+        dict(message) if isinstance(message, dict) else message for message in messages
+    ]
+
+
+def _render_chat_prompt_for_thinking_detection(
+    engine: BaseEngine,
+    messages: list,
+    kwargs: dict,
+) -> tuple[str, list[int] | None]:
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return "", None
+
+    template_messages = _copy_chat_template_messages(messages)
+    tools = kwargs.get("tools")
+    chat_template_kwargs = kwargs.get("chat_template_kwargs")
+    is_partial = kwargs.get("is_partial")
+    engine_renderer = getattr(engine, "_apply_chat_template", None)
+
+    if is_partial is not None:
+        for message in template_messages:
+            if isinstance(message, dict):
+                message.pop("partial", None)
+
+    if callable(engine_renderer):
+        prompt = engine_renderer(
+            template_messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+    else:
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": not bool(is_partial),
+        }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+
+        try:
+            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    template_kwargs.pop(key, None)
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
+
+    if isinstance(prompt, str):
+        return prompt, None
+    if isinstance(prompt, list):
+        try:
+            return "", [int(token_id) for token_id in prompt]
+        except (TypeError, ValueError):
+            return str(prompt), None
+    return str(prompt), None
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4203,7 +4285,19 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        logger.debug("Could not detect chat stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.

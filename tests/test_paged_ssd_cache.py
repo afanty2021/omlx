@@ -720,6 +720,39 @@ class TestPagedSSDCacheManagerWithMLX:
         assert loaded_meta["cache_signature"]
         assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
 
+    def test_save_canonicalizes_buffered_rotating_metadata(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Transient MTP rotating wrappers should not persist in new metadata."""
+        mx = mock_mlx
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+
+        block_hash = b"buffered_rotating_hash"
+        cache_data = [
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))),
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))),
+        ]
+
+        manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache", "BufferedRotatingKVCache"],
+            layer_meta_states=[(64,), ("0", "1024", "2048", "64", "1984", "64")],
+        )
+
+        _, loaded_meta = manager.load_block_with_metadata(block_hash)
+
+        assert loaded_meta is not None
+        assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
+        signature = json.loads(loaded_meta["cache_signature"])
+        assert signature["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
+
     def test_get_block_metadata(self, tmp_path: Path, mock_mlx):
         """Test getting block metadata without loading data."""
         mx = mock_mlx
@@ -3405,6 +3438,24 @@ class TestLayerSignatureSweep:
 
         assert dropped == 0
         assert mgr._index.get(b"ac" * 10) is not None
+
+    def test_sweep_drops_legacy_buffered_rotating_cache(self, tmp_path: Path):
+        expected = ["KVCache", "RotatingKVCache", "KVCache"]
+        stored = ["KVCache", "BufferedRotatingKVCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"af" * 10,
+                model_name="test-model",
+                layer_cache_types=stored,
+                num_layers=3,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 1
+        assert mgr._index.get(b"af" * 10) is None
 
     def test_startup_compat_canonicalizes_sized_arrays_cache(self, tmp_path: Path):
         expected = ["ArraysCache", "ArraysCache", "KVCache"]

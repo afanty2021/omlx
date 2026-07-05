@@ -14,18 +14,49 @@ from mlx.utils import tree_flatten
 logger = logging.getLogger(__name__)
 
 _VLM_TEXT_PREFIX = "language_model."
+# HF/checkpoint order vs runtime module-tree order for the VLM text stack.
+# ``sanitize`` swaps the former to the latter; class_predicate matches the latter.
+_CKPT_TEXT_PREFIX = "model.language_model."
+_RUNTIME_TEXT_PREFIX = "language_model.model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
+# mlx_lm.load dropped trust_remote_code in some releases. Check once at
+# import time so call sites can pass it safely across versions.
+def _mlx_lm_load_accepts_trust_remote_code() -> bool:
+    try:
+        import inspect
+        from mlx_lm import load as _lm_load
+        return "trust_remote_code" in inspect.signature(_lm_load).parameters
+    except Exception:
+        return False
+
+_LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
+
+
+def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
+    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    from mlx_lm import load
+    if _LM_LOAD_ACCEPTS_TRC:
+        kwargs["trust_remote_code"] = trust_remote_code
+    return load(path_or_repo, **kwargs)
+
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
-    """Add ``language_model.``-prefixed variants of per-layer quantization keys.
+    """Add module-tree-path variants of per-layer quantization keys.
 
-    oQ writes per-layer overrides keyed by safetensors tensor base name
-    (e.g. ``"lm_head"``), but ``nn.quantize``'s class_predicate receives
-    model-tree paths (``"language_model.lm_head"``).  Without the prefixed
-    variant the lookup misses and the global bits are used, causing a
-    shape mismatch at ``load_weights``.
+    mlx-lm's ``nn.quantize`` class_predicate matches the runtime module-tree
+    path directly (``if p in config["quantization"]``), but oQ / HF
+    checkpoints key per-layer overrides by other conventions:
+
+    - bare safetensors tensor base name (``"lm_head"``), which the VLM text
+      tree nests under ``language_model.`` (``"language_model.lm_head"``).
+    - HF checkpoint order ``model.language_model.layers.N.*``, which
+      ``sanitize`` swaps to module-tree order
+      ``language_model.model.layers.N.*``.
+
+    Without the matching variant the lookup misses, the global bits are used,
+    and the layer is built at the wrong bit-width.
 
     Mutates *cfg* in place and returns it for convenience.
     """
@@ -37,13 +68,17 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         for key, val in quant.items():
             if not isinstance(val, dict):
                 continue
-            prefixed = _VLM_TEXT_PREFIX + key
-            if not key.startswith(_VLM_TEXT_PREFIX) and prefixed not in quant:
-                extras[prefixed] = val
+            if key.startswith(_CKPT_TEXT_PREFIX):
+                # model.language_model.X -> language_model.model.X
+                variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
             elif key.startswith(_VLM_TEXT_PREFIX):
-                short = key[len(_VLM_TEXT_PREFIX) :]
-                if short not in quant:
-                    extras[short] = val
+                # language_model.X -> X
+                variant = key[len(_VLM_TEXT_PREFIX) :]
+            else:
+                # X -> language_model.X
+                variant = _VLM_TEXT_PREFIX + key
+            if variant not in quant and variant not in extras:
+                extras[variant] = val
         if extras:
             quant.update(extras)
     return cfg
@@ -500,14 +535,12 @@ def load_text_model(
 ):
     """Load an LLM model/tokenizer pair via mlx-lm."""
     maybe_apply_pre_load_patches(model_name, model_settings=model_settings)
-    from mlx_lm import load
-
     trust_remote_code = (
         bool(getattr(model_settings, "trust_remote_code", False))
         if model_settings is not None
         else False
     )
-    return load(
+    return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,
         trust_remote_code=trust_remote_code,

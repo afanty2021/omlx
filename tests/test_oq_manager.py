@@ -179,3 +179,30 @@ class TestOQManagerDtypeSupport:
 
         assert manager._tasks == {}
         assert not (root / "DeepSeek-V4-Flash-oQ4-fp16").exists()
+
+
+class TestOQManagerEnhanced:
+    @pytest.mark.asyncio
+    async def test_start_quantization_uses_enhanced_name_and_cache_path(
+        self, fp_model_dir, monkeypatch
+    ):
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        task = await manager.start_quantization(
+            str(fp_model_dir / "Llama-3B"),
+            4,
+            enhanced=True,
+            imatrix_num_samples=8,
+            imatrix_seq_length=128,
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.enhanced is True
+        assert task.output_name == "Llama-3B-oQ4e"
+        assert ".oqe_imatrix" in task.imatrix_cache_path
+        assert task.imatrix_cache_path.endswith("-s8-l128.npz")

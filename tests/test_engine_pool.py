@@ -4,7 +4,7 @@
 import asyncio
 import json
 import logging
-from pathlib import Path
+import shutil
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +16,7 @@ from omlx.exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
 )
 from omlx.scheduler import PrefillEvictionRequest
 
@@ -294,6 +295,19 @@ class TestEnginePoolErrors:
         assert exc_info.value.model_id == "model-a"
         assert exc_info.value.ceiling == 100
 
+    def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
+        """A deleted model directory is removed and reported as not found."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        shutil.rmtree(small_mock_model_dir / "model-a")
+
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            asyncio.run(pool.get_engine("model-a"))
+
+        assert exc_info.value.model_id == "model-a"
+        assert pool.get_entry("model-a") is None
+
 
 class TestEnginePoolStatus:
     """Tests for EnginePool status reporting."""
@@ -533,8 +547,8 @@ class TestVLMFallback:
         self, small_mock_model_dir
     ):
         """When VLM start fails AND the LLM fallback also fails, the raised
-        RuntimeError should embed both messages and chain ``__cause__`` to the
-        original VLM error (PR #1283)."""
+        unavailable error should embed both messages and preserve the original
+        fallback RuntimeError in the cause chain (PR #1283)."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -556,7 +570,7 @@ class TestVLMFallback:
         with (
             patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
             patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
-            pytest.raises(RuntimeError) as excinfo,
+            pytest.raises(ModelUnavailableError) as excinfo,
         ):
             await pool._load_engine("model-a")
 
@@ -565,17 +579,20 @@ class TestVLMFallback:
         assert "Missing vision_tower parameters" in msg
         assert "LLM fallback also failed" in msg
         assert "Model type lfm2_vl not supported" in msg
-        # __cause__ chain preserves the original VLM error
         assert excinfo.value.__cause__ is not None
-        assert "Missing vision_tower parameters" in str(excinfo.value.__cause__)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert excinfo.value.__cause__.__cause__ is not None
+        assert "Missing vision_tower parameters" in str(
+            excinfo.value.__cause__.__cause__
+        )
 
     @pytest.mark.asyncio
     async def test_force_lm_fallback_to_vlm_both_fail_surfaces_both_errors(
         self, small_mock_model_dir
     ):
         """force_lm path: LM start fails AND VLM fallback also fails. Both
-        error messages should land in the raised RuntimeError, with the LM
-        error as ``__cause__`` (PR #1283)."""
+        error messages should land in the unavailable error, with the LM
+        error preserved in the cause chain (PR #1283)."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -600,7 +617,7 @@ class TestVLMFallback:
         with (
             patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
             patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
-            pytest.raises(RuntimeError) as excinfo,
+            pytest.raises(ModelUnavailableError) as excinfo,
         ):
             await pool._load_engine("model-a", force_lm=True)
 
@@ -610,7 +627,8 @@ class TestVLMFallback:
         assert "tie_word_embeddings" in msg
         assert "VLM fallback also failed" in msg
         assert "vision encoder weights missing" in msg
-        assert isinstance(excinfo.value.__cause__, TypeError)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert isinstance(excinfo.value.__cause__.__cause__, TypeError)
 
 
 class TestEnginePoolLRU:
@@ -804,6 +822,34 @@ class TestEnginePoolAsync:
         assert pool.current_model_memory > 0
 
     @pytest.mark.asyncio
+    async def test_load_failure_is_cached_until_discovery_refresh(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        """A failed model load is not retried until the model list is refreshed."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=RuntimeError("broken weights"))
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            with pytest.raises(ModelUnavailableError):
+                await pool.get_engine("model-a")
+            with pytest.raises(ModelUnavailableError):
+                await pool.get_engine("model-a")
+
+        assert mock_engine.start.await_count == 1
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+        assert entry.load_failed is True
+        assert "broken weights" in (entry.load_failure_message or "")
+
+        pool.discover_models(str(small_mock_model_dir))
+        refreshed = pool.get_entry("model-a")
+        assert refreshed is not None
+        assert refreshed.load_failed is False
+
+    @pytest.mark.asyncio
     async def test_runtime_settings_signature_reload(self, pool_with_mock_engines):
         """A profile runtime variant with engine fields reloads the base engine."""
         from omlx.model_settings import ModelSettings
@@ -975,6 +1021,7 @@ class TestEnginePoolAsync:
 
         model_path = tmp_path / "embed-model"
         model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
         scheduler_config = SchedulerConfig(
             completion_batch_size=6,
             embedding_batch_size=4,
@@ -1012,6 +1059,7 @@ class TestEnginePoolAsync:
         """A bare EnginePool should pass its fallback scheduler config consistently."""
         model_path = tmp_path / "embed-model"
         model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
         pool = _make_pool(ceiling=10 * 1024**3)
         pool._entries["embed-model"] = EngineEntry(
             model_id="embed-model",

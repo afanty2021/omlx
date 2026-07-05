@@ -1882,6 +1882,11 @@ class Scheduler:
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
 
+        # Drop transient aliases after ownership moves to scheduler fields;
+        # close()/deep_reset() clear those fields during teardown.
+        model = None
+        tokenizer = None
+
     @contextmanager
     def _phase_timer(self, phase: str):
         """Lightweight wall-time accumulator for cache-on overhead diagnostics.
@@ -2176,7 +2181,12 @@ class Scheduler:
                 self._collect_rotating_window_sizes(sub_cache, window_sizes)
 
         class_name = type(cache_obj).__name__
-        if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
+        is_rotating_cache = class_name in ("RotatingKVCache", "BatchRotatingKVCache")
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+            is_rotating_cache = (
+                is_rotating_cache or CacheTypeRegistry.is_rotating_family(class_name)
+            )
+        if is_rotating_cache:
             max_size = getattr(cache_obj, "max_size", 0)
             if isinstance(max_size, int) and max_size > 0:
                 window_sizes.add(max_size)
@@ -2758,6 +2768,7 @@ class Scheduler:
                 "RotatingKVCache",
                 "BatchRotatingKVCache",
                 "PrefillReadyRotatingKVCache",
+                "BufferedRotatingKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
             ):
@@ -4809,12 +4820,16 @@ class Scheduler:
             return False
 
         # Stateful non-sliceable caches require boundary-safe snapshots.
-        if class_name in (
+        is_rotating_cache = class_name in (
             "RotatingKVCache",
             "BatchRotatingKVCache",
-            "ArraysCache",
-            "SizedArraysCache",
-        ):
+        )
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+            is_rotating_cache = (
+                is_rotating_cache or CacheTypeRegistry.is_rotating_family(class_name)
+            )
+
+        if is_rotating_cache or class_name in ("ArraysCache", "SizedArraysCache"):
             return True
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
@@ -5507,7 +5522,16 @@ class Scheduler:
                         state = layer_cache.state
                         meta = getattr(layer_cache, "meta_state", ())
 
-                    if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
+                    is_rotating_cache = class_name in (
+                        "RotatingKVCache",
+                        "BatchRotatingKVCache",
+                    )
+                    if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+                        is_rotating_cache = (
+                            is_rotating_cache
+                            or CacheTypeRegistry.is_rotating_family(class_name)
+                        )
+                    if is_rotating_cache:
                         state, meta = self._normalize_rotating_snapshot_state(
                             layer_cache,
                             state,
@@ -5532,8 +5556,12 @@ class Scheduler:
                         # null guard for non-KV cache classes.
                         if (
                             class_name in ("KVCache", "RotatingKVCache", "BatchKVCache")
-                            and len(state) >= 2
-                        ):
+                            or (
+                                HAS_CACHE_TYPE_HANDLERS
+                                and CacheTypeRegistry is not None
+                                and CacheTypeRegistry.is_rotating_family(class_name)
+                            )
+                        ) and len(state) >= 2:
                             if state[0] is None or state[1] is None:
                                 logger.debug(
                                     f"Layer {layer_idx} ({class_name}) has None keys/values, "

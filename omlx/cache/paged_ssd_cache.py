@@ -163,7 +163,30 @@ _READABLE_CACHE_FORMAT_VERSIONS = frozenset({"2", "3"})
 # rotating buffer's _idx never exceeds the actual buffer length. Restoring a
 # cache where _idx > keys.shape[2] makes BatchRotatingKVCache.merge() either
 # overshoot the RHS or (when omlx pads) leak zero positions into attention.
-_ROTATING_CACHE_TYPES = ("RotatingKVCache", "BatchRotatingKVCache")
+_ROTATING_CACHE_TYPES = (
+    "RotatingKVCache",
+    "BatchRotatingKVCache",
+    "BufferedRotatingKVCache",
+)
+
+_STORAGE_CLASS_NAME_ALIASES = {
+    # mlx-vlm MTP uses this transient target-cache wrapper for rollback
+    # slack. Persist the canonical rotating-cache type so blocks remain
+    # compatible with the model.make_cache() signature.
+    "BufferedRotatingKVCache": "RotatingKVCache",
+}
+
+
+def _storage_layer_cache_types(
+    layer_cache_types: list[str] | tuple[str, ...] | None,
+) -> list[str] | None:
+    """Return type names to persist in new cache block metadata."""
+    if layer_cache_types is None:
+        return None
+    return [
+        _STORAGE_CLASS_NAME_ALIASES.get(cache_type, cache_type)
+        for cache_type in layer_cache_types
+    ]
 
 
 def _canonicalize_layer_cache_types(
@@ -1716,6 +1739,8 @@ class PagedSSDCacheManager(CacheManager):
         if not HAS_MLX:
             logger.error("MLX not available, cannot save block")
             return False
+
+        layer_cache_types = _storage_layer_cache_types(layer_cache_types)
 
         # First save call after a model load is the canonical source for
         # the live layer-cache signature (post-TurboQuant / post-MTP). If

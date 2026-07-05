@@ -13,8 +13,13 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
-from ..utils.tokenizer import get_tokenizer_config, is_translate_gemma_model
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from ..utils.tokenizer import get_tokenizer_config
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _clear_teardown_references,
+    _warn_scheduler_unreachable_once,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,86 +207,6 @@ class BatchedEngine(BaseEngine):
         except AttributeError:
             return False
 
-    def _preprocess_translate_gemma_messages(
-        self, messages: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """
-        Preprocess messages for translate-gemma models.
-
-        translate-gemma models require content to be an array with specific fields:
-        - type: "text" or "image"
-        - source_lang_code: source language code
-        - target_lang_code: target language code
-        - text: text content
-        - image: image content (optional)
-
-        This method converts standard OpenAI format (string content) to translate-gemma format.
-
-        Args:
-            messages: List of chat messages
-
-        Returns:
-            Preprocessed messages with translate-gemma format
-        """
-        processed = []
-        for msg in messages:
-            role = msg.get('role', 'user')
-            content = msg.get('content', '')
-
-            # Skip system messages and non-user messages
-            if role != 'user':
-                processed.append(msg)
-                continue
-
-            # Convert string content to array format
-            if isinstance(content, str):
-                # Use ISO 639-1 language codes
-                # en = English, zh = Chinese (Simplified), zh-TW = Chinese (Traditional)
-                source_lang = "en"  # Default to English
-                target_lang = "zh"  # Default to Chinese
-
-                # Simple language detection based on content
-                # This is a basic implementation - could be enhanced with better detection
-                if any(c in content for c in ['中文', '翻译', 'Chinese', '汉']):
-                    source_lang = "en"
-                    target_lang = "zh"
-                elif any(c in content for c in ['English', 'translate to', '英文']):
-                    source_lang = "zh"
-                    target_lang = "en"
-
-                processed.append({
-                    'role': role,
-                    'content': [
-                        {
-                            'type': 'text',
-                            'source_lang_code': source_lang,
-                            'target_lang_code': target_lang,
-                            'text': content
-                        }
-                    ]
-                })
-            elif isinstance(content, list):
-                # Content is already an array, ensure it has the required fields
-                new_content = []
-                for item in content:
-                    if isinstance(item, dict) and item.get('type') == 'text':
-                        new_content.append({
-                            'type': 'text',
-                            'source_lang_code': item.get('source_lang_code', 'en'),
-                            'target_lang_code': item.get('target_lang_code', 'zh'),
-                            'text': item.get('text', '')
-                        })
-                    else:
-                        new_content.append(item)
-                processed.append({
-                    'role': role,
-                    'content': new_content
-                })
-            else:
-                processed.append(msg)
-
-        return processed
-
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -307,11 +232,10 @@ class BatchedEngine(BaseEngine):
 
         import asyncio
 
-        from mlx_lm import load
-
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
+            lm_load_compat,
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
         )
@@ -343,11 +267,10 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
-            # mlx-lm 0.31.2 的 load() 已移除 trust_remote_code 参数（远程代码现通过 repo 路径原生处理）；
-            # 保留该 kwarg 会导致 TypeError: load() got an unexpected keyword argument 'trust_remote_code'。
-            return load(
+            return lm_load_compat(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self._trust_remote_code,
             )
 
         loop = asyncio.get_running_loop()
@@ -464,10 +387,10 @@ class BatchedEngine(BaseEngine):
                                 specprefill_draft,
                                 trust_remote_code=self._trust_remote_code,
                             )
-                            # mlx-lm 0.31.2 的 load() 已移除 trust_remote_code 参数（同主模型加载处）。
-                            draft_model, _ = load(
+                            draft_model, _ = lm_load_compat(
                                 specprefill_draft,
                                 tokenizer_config=draft_tokenizer_config,
+                                trust_remote_code=self._trust_remote_code,
                             )
                             # Materialize frozen buffers (RoPE freqs, etc.)
                             # on the loader thread. mlx_lm.load only does
@@ -507,9 +430,16 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
-        self._engine = None
-        self._model = None
-        self._tokenizer = None
+        _clear_teardown_references(
+            self,
+            none_attrs=(
+                "_engine",
+                "_model",
+                "_tokenizer",
+                "_grammar_compiler",
+            ),
+            false_attrs=("_grammar_compiler_init_attempted",),
+        )
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
@@ -533,11 +463,6 @@ class BatchedEngine(BaseEngine):
                 ``None`` (default) — auto-detect from messages for backward
                 compatibility with direct engine callers.
         """
-        # Preprocess messages for translate-gemma models
-        # translate-gemma requires content to be an array with specific fields
-        if is_translate_gemma_model(self._model_name):
-            messages = self._preprocess_translate_gemma_messages(messages)
-
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
                 is_partial = detect_and_strip_partial(messages)
@@ -573,24 +498,7 @@ class BatchedEngine(BaseEngine):
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
             except Exception as e:
                 # Template rendering failed (e.g. Jinja2 TemplateError from
-                # unsupported roles, invalid message format, OR missing chat_template)
-                err_msg = str(e)
-                if "chat_template" in err_msg.lower():
-                    # Chat template is not set in tokenizer (e.g., some Gemma 4 models)
-                    # Fall back to simple concatenation format
-                    logger.warning(f"Chat template not set, using simple format: {e}")
-                    parts = []
-                    for m in messages:
-                        role = m.get('role', 'user')
-                        content = m.get('content', '')
-                        if isinstance(content, list):
-                            # Handle content arrays (e.g., with images)
-                            text_parts = [c.get('text', '') if isinstance(c, dict) else str(c)
-                                        for c in content if isinstance(c, dict) and c.get('type') == 'text']
-                            content = ''.join(text_parts)
-                        parts.append(f"{role}: {content}")
-                    return '\n'.join(parts) + '\nassistant:'
-                # Other template errors
+                # unsupported roles, invalid message format, etc.)
                 logger.error(f"Chat template rendering failed: {e}")
                 raise
         else:

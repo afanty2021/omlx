@@ -2682,6 +2682,52 @@ class TestExtractCacheStatesRotatingNormalization:
         assert bool(mx.all(normalized_values == expected_values).item())
         assert normalized_meta == ("0", "128", "1280", "128")
 
+    def test_extract_cache_states_normalizes_buffered_rotating_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """mlx-vlm MTP BufferedRotatingKVCache should use rotating semantics."""
+        mx = pytest.importorskip("mlx.core")
+
+        class BufferedRotatingKVCache:
+            def __init__(self):
+                self.keys = mx.arange(255).reshape(1, 1, 255, 1)
+                self.values = mx.arange(1000, 1255).reshape(1, 1, 255, 1)
+                self.keep = 0
+                self.max_size = 128
+                self.offset = 1280
+                self._idx = 255
+
+            @property
+            def state(self):
+                return self.keys, self.values
+
+            @property
+            def meta_state(self):
+                return ("0", "128", "1280", "255", "1025", "64")
+
+            def _temporal_order(self, tensor):
+                return tensor
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        buffered = BufferedRotatingKVCache()
+
+        expected_keys = buffered.keys[..., -128:, :]
+        expected_values = buffered.values[..., -128:, :]
+
+        extracted, _ = scheduler._extract_cache_states([buffered])
+
+        assert len(extracted) == 1
+        assert extracted[0]["class_name"] == "BufferedRotatingKVCache"
+        assert extracted[0]["cache_type"] == "RotatingKVCache"
+        normalized_keys, normalized_values = extracted[0]["state"]
+        normalized_meta = tuple(extracted[0]["meta_state"])
+
+        assert normalized_keys.shape == (1, 1, 128, 1)
+        assert normalized_values.shape == (1, 1, 128, 1)
+        assert bool(mx.all(normalized_keys == expected_keys).item())
+        assert bool(mx.all(normalized_values == expected_values).item())
+        assert normalized_meta == ("0", "128", "1280", "128")
+
 
 class TestSchedulerSSDLayerSignature:
     """Tests for pre-lookup SSD layer signature refresh."""

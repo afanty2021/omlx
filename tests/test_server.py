@@ -8,7 +8,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from omlx.engine_pool import EngineEntry
-from omlx.exceptions import InvalidRequestError, ModelNotFoundError
+from omlx.exceptions import (
+    InvalidRequestError,
+    ModelNotFoundError,
+    ModelUnavailableError,
+)
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.server import (
     EngineType,
@@ -16,14 +20,14 @@ from omlx.server import (
     ServerState,
     _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
-    _resolve_metric_durations,
     _reset_boundary_snapshots_for_server,
+    _resolve_metric_durations,
     app,
     get_engine,
     get_max_context_window,
     get_sampling_params,
 )
-from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+from omlx.settings import GlobalSettings
 
 
 class TestBoundarySnapshotLifecycle:
@@ -557,6 +561,25 @@ class TestModelFallback:
         with pytest.raises(HTTPException) as exc_info:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_model_unavailable_returns_409(self):
+        """Cached model load failures return 409 instead of an unhandled 500."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = False
+        self._state.default_model = "default-model"
+
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_engine = AsyncMock(
+            side_effect=ModelUnavailableError("broken-model", "cached failure")
+        )
+        self._state.engine_pool = pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("broken-model", EngineType.LLM)
+
+        assert exc_info.value.status_code == 409
 
 
 class TestGetEngineLLMTypeValidation:

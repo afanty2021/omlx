@@ -9,11 +9,20 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
+
+def _detach_import_error(exc: Exception) -> Exception:
+    """Keep the diagnostic message without retaining import caller frames."""
+    exc.__traceback__ = None
+    exc.__cause__ = None
+    exc.__context__ = None
+    return exc
+
+
 try:
     from . import _ext
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
-    _IMPORT_ERROR = exc
+    _IMPORT_ERROR = _detach_import_error(exc)
 else:
     _IMPORT_ERROR = None
 

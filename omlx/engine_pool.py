@@ -19,7 +19,8 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -30,20 +31,20 @@ import mlx.core as mx
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
-from .engine.stt import STTEngine
 from .engine.sts import STSEngine
+from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
+from .engine_core import get_mlx_executor
 from .exceptions import (
-    EnginePoolError,
     InsufficientMemoryError,
     ModelBusyError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
 )
-from .model_discovery import DiscoveredModel, discover_models, format_size
-from .engine_core import get_mlx_executor
+from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -103,6 +104,9 @@ class EngineEntry:
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
+    load_failed: bool = False  # Sticky until the next discovery refresh
+    load_failure_message: str | None = None
+    load_failure_at: float | None = None
 
 
 class EnginePool:
@@ -452,6 +456,44 @@ class EnginePool:
         """Get entry for a specific model, or None if not found."""
         return self._entries.get(model_id)
 
+    def _clear_load_failure(self, entry: EngineEntry) -> None:
+        entry.load_failed = False
+        entry.load_failure_message = None
+        entry.load_failure_at = None
+
+    def _mark_load_failure(self, entry: EngineEntry, exc: BaseException) -> None:
+        entry.load_failed = True
+        entry.load_failure_message = str(exc) or type(exc).__name__
+        entry.load_failure_at = time.time()
+
+    def _raise_if_model_path_missing_locked(
+        self, model_id: str, entry: EngineEntry
+    ) -> None:
+        """Drop stale unloaded entries whose backing model directory vanished."""
+        model_path = Path(entry.model_path)
+        if model_path.exists() and (model_path / "config.json").exists():
+            return
+
+        if entry.engine is None:
+            self._entries.pop(model_id, None)
+        available = [mid for mid in self._entries if mid != model_id]
+        raise ModelNotFoundError(model_id, available)
+
+    def _raise_if_load_failed(self, model_id: str, entry: EngineEntry) -> None:
+        if not entry.load_failed:
+            return
+        detail = entry.load_failure_message or "previous load attempt failed"
+        logger.warning(
+            "Skipping load retry for '%s' after cached failure: %s",
+            model_id,
+            detail,
+        )
+        raise ModelUnavailableError(
+            model_id,
+            f"Model '{model_id}' is unavailable after a previous load failure: {detail}. "
+            "Reload models after fixing the files to retry.",
+        )
+
     def set_pinned(self, model_id: str, pinned: bool) -> bool:
         """
         Set the pinned status for a model.
@@ -732,6 +774,9 @@ class EnginePool:
                     if _lease:
                         entry.in_use += 1
                     return entry.engine
+
+            self._raise_if_model_path_missing_locked(model_id, entry)
+            self._raise_if_load_failed(model_id, entry)
 
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
@@ -1542,6 +1587,7 @@ class EnginePool:
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
             load_completed = True
+            self._clear_load_failure(entry)
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
@@ -1612,6 +1658,19 @@ class EnginePool:
                 f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
+        except Exception as exc:
+            if not entry.abort_loading:
+                self._mark_load_failure(entry, exc)
+                logger.exception(
+                    "Model load failed for '%s'; caching failure until next discovery refresh",
+                    model_id,
+                )
+                raise ModelUnavailableError(
+                    model_id,
+                    f"Model '{model_id}' failed to load: {entry.load_failure_message}. "
+                    "Reload models after fixing the files to retry.",
+                ) from exc
+            raise
         finally:
             if (
                 load_completed

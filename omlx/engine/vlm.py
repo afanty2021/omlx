@@ -51,7 +51,12 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _clear_teardown_references,
+    _warn_scheduler_unreachable_once,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1574,9 +1579,10 @@ class VLMBatchedEngine(BaseEngine):
             )
             if specprefill_enabled and specprefill_draft:
                 try:
-                    from mlx_lm import load as mlx_lm_load
-
-                    from ..utils.model_loading import maybe_load_custom_quantization
+                    from ..utils.model_loading import (
+                        lm_load_compat as mlx_lm_load,
+                        maybe_load_custom_quantization,
+                    )
                     from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():
@@ -1688,13 +1694,20 @@ class VLMBatchedEngine(BaseEngine):
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
         # pass has already run.
-        self._engine = None
-        self._vlm_model = None
-        self._processor = None
-        self._adapter = None
-        self._tokenizer = None
-        self._vlm_mtp_drafter = None
-        self._diffusion_family = None
+        _clear_teardown_references(
+            self,
+            none_attrs=(
+                "_engine",
+                "_vlm_model",
+                "_processor",
+                "_adapter",
+                "_tokenizer",
+                "_grammar_compiler",
+                "_vlm_mtp_drafter",
+                "_diffusion_family",
+            ),
+            false_attrs=("_grammar_compiler_init_attempted",),
+        )
 
         if engine:
             if hasattr(engine, "engine") and engine.engine is not None:
