@@ -197,6 +197,21 @@ class TestTTSEndpointBasic:
         )
         assert response.status_code == 200
 
+    def test_post_speech_rejects_unsupported_format(self, server_tts_client):
+        """Unsupported response_format gets 400, not silently-WAV bytes."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello", "response_format": "aac"},
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get(
+            "message", ""
+        )
+        # The error must name both the rejected format and the supported ones.
+        assert "aac" in detail
+        assert "wav" in detail.lower()
+
     def test_response_is_audio_bytes(self, server_tts_client):
         """Response body is non-empty bytes."""
         client, _ = server_tts_client
@@ -268,6 +283,79 @@ class TestTTSEndpointBasic:
             json={"model": "qwen3-tts", "input": "Test", "response_format": "wav"},
         )
         assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# TestTTSResponseFormatTranscoding
+# ---------------------------------------------------------------------------
+
+
+class TestTTSResponseFormatTranscoding:
+    """Non-streaming transcoding of the native WAV output (#753, #1013).
+
+    The encoder tests need soundfile (ships with the audio extra via
+    mlx-audio -> librosa) and skip when it isn't installed; pcm and wav
+    passthrough only use the stdlib.
+    """
+
+    def _post_speech(self, client, response_format):
+        return client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "Hello",
+                "response_format": response_format,
+            },
+        )
+
+    def test_wav_stays_untranscoded(self, server_tts_client):
+        """Explicit wav returns the engine bytes as-is."""
+        client, _ = server_tts_client
+        response = self._post_speech(client, "wav")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        assert response.content == DUMMY_WAV
+
+    def test_pcm_returns_raw_frames(self, server_tts_client):
+        """pcm strips the RIFF header and returns the raw sample frames."""
+        client, _ = server_tts_client
+        response = self._post_speech(client, "pcm")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/pcm"
+        with wave.open(io.BytesIO(DUMMY_WAV), "rb") as wf:
+            expected = wf.readframes(wf.getnframes())
+        assert response.content == expected
+
+    def test_mp3_returns_decodable_mpeg(self, server_tts_client):
+        """mp3 output is not WAV and decodes back to audio samples."""
+        sf = pytest.importorskip("soundfile")
+        client, _ = server_tts_client
+        response = self._post_speech(client, "mp3")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/mpeg"
+        assert not response.content.startswith(RIFF_MAGIC)
+        data, _ = sf.read(io.BytesIO(response.content))
+        assert len(data) > 0
+
+    def test_opus_returns_ogg_container(self, server_tts_client):
+        """opus output is an Ogg container (needs a 24 kHz source)."""
+        pytest.importorskip("soundfile")
+        client, mock_pool = server_tts_client
+        engine = mock_pool.get_engine.return_value
+        engine.synthesize = AsyncMock(return_value=_make_wav_bytes(sample_rate=24000))
+        response = self._post_speech(client, "opus")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/ogg"
+        assert response.content.startswith(b"OggS")
+
+    def test_flac_returns_flac_header(self, server_tts_client):
+        """flac output carries the fLaC stream marker."""
+        pytest.importorskip("soundfile")
+        client, _ = server_tts_client
+        response = self._post_speech(client, "flac")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/flac"
+        assert response.content.startswith(b"fLaC")
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +541,7 @@ class TestTTSStreaming:
             assert call.kwargs.get("max_tokens") == 512
 
     def test_streaming_rejects_non_wav_response_format(self, server_tts_client):
-        """stream=true only supports response_format=wav in phase 1."""
+        """The response_format guard covers the streaming path too."""
         client, _ = server_tts_client
         response = client.post(
             "/v1/audio/speech",

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 
 def _detach_import_error(exc: Exception) -> Exception:
@@ -20,8 +24,49 @@ try:
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
     _IMPORT_ERROR = _detach_import_error(exc)
+    # Default installs ship no extension; warn only when a built _ext fails
+    # to load (e.g. unresolved @rpath/libmlx.dylib, issue #2233) so the
+    # silent-slow-path fallback leaves a trace in the server log.
+    if any(Path(__file__).parent.glob("_ext*.so")):
+        logger.warning(
+            "%s: native extension is present but failed to load; falling "
+            "back to the slow path: %s",
+            __name__,
+            _IMPORT_ERROR,
+        )
 else:
     _IMPORT_ERROR = None
+
+
+def _verify_abi(ext, import_error):
+    """Disable the native symbols when the extension rejects mlx arrays.
+
+    An extension built with a nanobind whose ABI tag differs from the mlx
+    wheel's imports cleanly and lists every symbol, but its type casters
+    live in an isolated NB_DOMAIN, so every call raises ``TypeError:
+    incompatible function arguments`` (issue #2139). Probe once at import
+    and degrade with a single warning instead of failing per call; builds
+    predating the ``abi_probe`` binding are assumed compatible.
+    """
+    if ext is None:
+        return ext, import_error
+    probe = getattr(ext, "abi_probe", None)
+    if probe is None:
+        return ext, import_error
+    try:
+        probe(mx.zeros((1,)))
+    except TypeError as exc:
+        logger.warning(
+            "%s: native kernels disabled — the extension was built with a "
+            "nanobind ABI that does not match this mlx wheel; rebuild it "
+            "against the installed mlx (see pyproject build-system pins).",
+            __name__,
+        )
+        return None, _detach_import_error(exc)
+    return ext, import_error
+
+
+_ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
 NATIVE_SYMBOLS = ("minimax_msa_topk",)

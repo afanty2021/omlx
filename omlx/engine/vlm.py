@@ -46,6 +46,7 @@ from ..api.utils import (
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
+from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -539,11 +540,47 @@ _AUDIO_CONFIG_KEYS = (
 )
 
 
+def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
+    """Resolve the OptiQ multimodal sidecar declared by ``config.json``."""
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return None
+
+    optiq_vision = config.get("optiq_vision")
+    if not isinstance(optiq_vision, dict):
+        return None
+    relative_path = optiq_vision.get("sidecar")
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+
+    model_root = model_dir.resolve()
+    sidecar = (model_root / relative_path).resolve()
+    try:
+        sidecar.relative_to(model_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"OptiQ vision sidecar must stay inside the model directory: "
+            f"{relative_path}"
+        ) from exc
+    if sidecar.suffix != ".safetensors":
+        raise ValueError(f"OptiQ vision sidecar must be a safetensors file: {sidecar}")
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"OptiQ vision sidecar not found: {sidecar}")
+    return sidecar
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
     """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
     import safetensors
 
-    for sf in model_dir.glob("*.safetensors"):
+    weight_files = list(model_dir.glob("*.safetensors"))
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
+        weight_files.append(sidecar)
+
+    for sf in weight_files:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 for k in f.keys():
@@ -615,6 +652,70 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+@contextlib.contextmanager
+def _load_optiq_vision_sidecar_on_load(model_dir: Path):
+    """Include a config-declared OptiQ sidecar in mlx-vlm strict loading.
+
+    Pinned mlx-vlm only globs ``*.safetensors`` in the model root, while
+    current OptiQ VLM checkpoints keep their unquantized multimodal weights
+    under ``optiq/``. Root-level legacy sidecars remain a no-op because the
+    native glob already loads them.
+    """
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is None or sidecar.parent == model_dir.resolve():
+        yield
+        return
+
+    sidecar_weights = mx.load(str(sidecar))
+    if not isinstance(sidecar_weights, dict):
+        raise ValueError(f"OptiQ vision sidecar must contain named tensors: {sidecar}")
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    injected = False
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal injected
+        if injected or isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        model_weights = list(weights_items)
+        model_keys = {
+            item[0]
+            for item in model_weights
+            if isinstance(item, (tuple, list))
+            and len(item) >= 2
+            and isinstance(item[0], str)
+        }
+        duplicates = model_keys.intersection(sidecar_weights)
+        if duplicates:
+            sample = ", ".join(sorted(duplicates)[:3])
+            raise ValueError(
+                f"OptiQ vision sidecar duplicates model weights: {sample}"
+            )
+
+        injected = True
+        result = original_load_weights(
+            self,
+            [*model_weights, *sidecar_weights.items()],
+            *args,
+            **kwargs,
+        )
+        logger.info(
+            "Loaded %d OptiQ multimodal sidecar weights from %s",
+            len(sidecar_weights),
+            sidecar,
+        )
+        return result
+
+    _nn.Module.load_weights = _patched_load_weights
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original_load_weights
 
 
 def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
@@ -1072,10 +1173,9 @@ def _smart_resize_tokens(
 def _read_image_dims(part: dict) -> Optional[tuple]:
     """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
 
-    Handles ``data:`` base64 URIs, raw base64, and local file paths via a lazy
-    ``PIL.Image.open`` (reads the header only, not pixels). Returns ``None`` for
-    anything that would need a network fetch or that fails to parse, so callers
-    fall back to the conservative per-image upper bound."""
+    Handles only ``data:`` base64 URIs. Returns ``None`` for anything else so
+    callers fall back to the conservative per-image upper bound without opening
+    request-supplied paths or fetching remote URLs."""
     import base64 as _b64
     import binascii
     import io as _io
@@ -1085,32 +1185,34 @@ def _read_image_dims(part: dict) -> Optional[tuple]:
     obj = part.get("image_url")
     if obj is None:
         obj = part.get("input_image") or part.get("image")
-    url = obj if isinstance(obj, str) else (obj.get("url") if isinstance(obj, dict) else None)
+    url = (
+        obj
+        if isinstance(obj, str)
+        else (obj.get("url") if isinstance(obj, dict) else None)
+    )
     if not isinstance(url, str) or not url:
         return None
 
     raw = None
     s = url.strip()
     if s.startswith("data:"):
-        _, sep, encoded = s.partition(",")
-        if sep == ",":
-            try:
-                raw = _b64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError):
-                return None
-    elif s.startswith(("http://", "https://")):
-        return None  # no network in preflight
-    else:
+        prefix, sep, encoded = s.partition(",")
+        prefix_lower = prefix.lower()
+        if (
+            sep != ","
+            or not prefix_lower.startswith("data:image/")
+            or ";base64" not in prefix_lower
+        ):
+            return None
         try:
-            raw = _b64.b64decode(s, validate=True)
+            raw = _b64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
-            raw = None  # not base64 -> treat as path below
+            return None
+    else:
+        return None
 
     try:
-        if raw is not None:
-            with _Image.open(_io.BytesIO(raw)) as im:
-                return im.size  # (width, height)
-        with _Image.open(s) as im:
+        with _Image.open(_io.BytesIO(raw)) as im:
             return im.size
     except Exception:
         return None
@@ -1416,6 +1518,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_gemma4_tokenizer_config(self._model_name)
 
             _patch_torch_free_image_processor()
+            apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
@@ -1436,11 +1539,14 @@ class VLMBatchedEngine(BaseEngine):
                         trust_remote_code=self._trust_remote_code,
                     )
 
-                return vlm_load(
-                    self._model_name,
-                    tokenizer_config=tokenizer_config,
-                    trust_remote_code=self._trust_remote_code,
-                )
+                with _load_optiq_vision_sidecar_on_load(
+                    Path(self._model_name)
+                ):
+                    return vlm_load(
+                        self._model_name,
+                        tokenizer_config=tokenizer_config,
+                        trust_remote_code=self._trust_remote_code,
+                    )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
@@ -1454,6 +1560,44 @@ class VLMBatchedEngine(BaseEngine):
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
+
+        # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
+        # The repacked safetensors carries 2-bit biases for format compat;
+        # the t5 symmetric kernel (scale*(q-1)) never reads them.
+        try:
+            from ..patches.bonsai_t5_load import free_t5_biases
+
+            freed = await loop.run_in_executor(
+                get_mlx_executor(), free_t5_biases, self._vlm_model
+            )
+            if freed > 0:
+                logger.info(
+                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
+                )
+        except Exception:
+            logger.debug("t5 bias free skipped", exc_info=True)
+
+        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # gate and up projections so decode runs 2 gather_qmm launches per
+        # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
+        # mlx-vlm target-verify helper for a fused-aware version. Runs on
+        # the MLX executor because it rewrites weights in place.
+        if (
+            getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_gate_up import (
+                    apply_qwen35_moe_gate_up_fusion,
+                )
+
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    apply_qwen35_moe_gate_up_fusion,
+                    self._vlm_model,
+                )
+            except Exception:
+                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
@@ -1519,7 +1663,6 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
-        scheduler_config.model_name = self._model_name
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -1567,6 +1710,86 @@ class VLMBatchedEngine(BaseEngine):
                 apply_sdpa256_attention_patch()
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
+        # Installed after sdpa256 so matched Qwen dense attention takes the
+        # simdgroup-MMA path, while unsupported cases fall through unchanged.
+        if (
+            getattr(self._model_settings, "fa256_steel_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_fa256_attention import (
+                    apply_qwen35_fa256_attention_patch,
+                )
+
+                apply_qwen35_fa256_attention_patch()
+            except Exception:
+                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
+        # Decode and masked paths keep the original mlx-vlm kernel.
+        gdn_prefill_enabled = getattr(
+            self._model_settings,
+            "gdn_prefill_enabled",
+            getattr(self._model_settings, "gdn_chunked_prefill_enabled", True),
+        )
+        if gdn_prefill_enabled is not False:
+            try:
+                from ..patches.qwen35_gdn_chunked import (
+                    apply_qwen35_gdn_prefill_patch,
+                )
+
+                apply_qwen35_gdn_prefill_patch()
+            except Exception:
+                logger.debug("GDN prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 q4 MLP prefill -> native qmm tile tuned for long batches.
+        # Decode and target-verify paths keep the original QuantizedLinear.
+        if (
+            getattr(self._model_settings, "qwen35_q4_mlp_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_q4_mlp import (
+                    apply_qwen35_q4_mlp_patch,
+                    apply_qwen35_q4_prefill_linear_patch,
+                )
+
+                apply_qwen35_q4_mlp_patch()
+                apply_qwen35_q4_prefill_linear_patch()
+            except Exception:
+                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
+        # SwitchGLU. Decode and target-verify keep the original path.
+        if (
+            getattr(self._model_settings, "qwen35_moe_weighted_sum_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_weighted_sum import (
+                    apply_qwen35_moe_weighted_sum_patch,
+                )
+
+                apply_qwen35_moe_weighted_sum_patch()
+            except Exception:
+                logger.debug(
+                    "Qwen MoE weighted-sum patch not applied", exc_info=True
+                )
+
+        if (
+            getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_ragged_decode import (
+                    apply_qwen35_ragged_decode_patch,
+                )
+
+                apply_qwen35_ragged_decode_patch()
+            except Exception:
+                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -2241,7 +2464,7 @@ class VLMBatchedEngine(BaseEngine):
         Args:
             messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
-            audio: List of audio data (BytesIO, file paths, or numpy arrays)
+            audio: List of audio data (BytesIO buffers, tuples, or numpy arrays)
 
         Returns:
             Tuple of (
@@ -2276,9 +2499,8 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         # Normalize audio to numpy float32 arrays expected by processor.
-        # extract_images_from_messages produces BytesIO / file-path strings, but
-        # the processor's __call__ expects numpy arrays or (array, sample_rate)
-        # tuples. load_audio handles all three source types.
+        # Request-facing string paths are rejected before this point; remaining
+        # sources are inline buffers, arrays, or (array, sample_rate) tuples.
         if audio:
             if any(not isinstance(a, tuple) for a in audio):
                 from ..patches.mlx_audio_compat import (
@@ -2777,6 +2999,7 @@ class VLMBatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            first_token_at=output.first_token_at,
         )
 
     async def stream_generate(

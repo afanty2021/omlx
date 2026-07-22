@@ -8,7 +8,6 @@ with directory-size-based progress polling.
 import asyncio
 import enum
 import logging
-import os
 import shutil
 import time
 import uuid
@@ -17,7 +16,6 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-import huggingface_hub.constants as _hf_constants
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     EntryNotFoundError,
@@ -26,13 +24,9 @@ from huggingface_hub.utils import (
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
-# Force the xet download path off. hf_xet's Rust ``download_files`` invokes
-# the Python progress callback from a Rust frame and silently swallows any
-# Python exception raised inside it, so our tqdm-based cooperative cancel is
-# a no-op on xet-enabled repos. Falling back to ``http_get`` keeps cancel
-# working at chunk granularity. See issue #1322.
-_hf_constants.HF_HUB_DISABLE_XET = True
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+# Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
+# guarantees it exists. Re-verify the symbol when bumping the hub version.
+from huggingface_hub.utils._xet import abort_xet_session
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +120,11 @@ def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
     from the progress callback: raising here unwinds the download thread
     cleanly within one chunk, releasing its buffers and connection.
 
-    Note: this relies on the Python http_get path. If HF_HUB_ENABLE_HF_TRANSFER
-    is on, the Rust path ignores tqdm_class and this won't interrupt; oMLX does
-    not enable hf_transfer.
+    Note: this only interrupts the Python http_get path, which xet-less repos
+    and mirror endpoints still use. On the xet path the Rust side defers a
+    callback exception until the whole transfer finishes (issue #1322), so
+    cancellation there is driven by ``abort_xet_session()`` instead; this
+    class is kept as the raise-on-next-chunk backstop for http_get.
     """
 
     class _CancellableTqdm(_hf_tqdm):
@@ -647,9 +643,19 @@ class HFDownloader:
         if task.status not in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING):
             return False
 
+        was_downloading = task.status == DownloadStatus.DOWNLOADING
+
         # Mark as cancelled
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
+
+        # A task in DOWNLOADING owns the download semaphore, so the in-flight
+        # xet transfer is necessarily this one; aborting the (global) session
+        # makes its snapshot_download thread unwind immediately. Pending tasks
+        # must not abort, that would kill another task's transfer. The next
+        # download lazily creates a fresh session.
+        if was_downloading:
+            abort_xet_session()
 
         # Stop progress polling
         progress_task = self._progress_tasks.pop(task_id, None)
@@ -750,6 +756,9 @@ class HFDownloader:
                     task.status = DownloadStatus.CANCELLED
         self._active_tasks.clear()
 
+        # Reap any in-flight xet transfer thread (no-op without a session).
+        abort_xet_session()
+
         logger.info("HF Downloader shut down")
 
     async def _run_download(self, task_id: str, hf_token: str) -> None:
@@ -780,6 +789,7 @@ class HFDownloader:
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
+                st_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -798,6 +808,12 @@ class HFDownloader:
                             "original/**",
                             "consolidated.*.pth",
                         ]
+                        # Computed inside this try so malformed metadata
+                        # (non-int counts) degrades to no estimate instead
+                        # of failing the download from the dry-run handler.
+                        st_estimate = _calc_safetensors_disk_size(
+                            model_info.safetensors
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"
@@ -815,6 +831,7 @@ class HFDownloader:
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
+                size_estimated = False
                 try:
                     dry_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -826,9 +843,14 @@ class HFDownloader:
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
+                    if st_estimate:
+                        task.total_size = st_estimate
+                        size_estimated = True
+                        detail = "Estimated total size from safetensors metadata."
+                    else:
+                        detail = "Progress estimation will be unavailable."
                     logger.warning(
-                        f"Dry run failed for {task.repo_id}: {e}. "
-                        "Progress estimation will be unavailable."
+                        f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
                 # Start progress polling
@@ -836,10 +858,11 @@ class HFDownloader:
                     self._poll_progress(task_id, target_dir)
                 )
 
-                # Run snapshot_download in a thread (blocking call). The
-                # cancellable tqdm aborts the download from its per-chunk
-                # progress callback so cancel actually stops it (the thread
-                # itself can't be force-killed).
+                # Run snapshot_download in a thread (blocking call). Cancel
+                # reaches the thread two ways: the cancellable tqdm raises on
+                # the next chunk of the http_get path, and abort_xet_session()
+                # (called by cancel/stall/shutdown) unwinds the xet path with
+                # a RuntimeError (the thread itself can't be force-killed).
                 await asyncio.to_thread(
                     snapshot_download,
                     **dl_kwargs,
@@ -855,9 +878,12 @@ class HFDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
-                task.downloaded_size = task.total_size or self._get_dir_size(
-                    target_dir
-                )
+                if size_estimated or not task.total_size:
+                    # The estimate was only a progress denominator; report
+                    # the measured on-disk size once the download is done.
+                    task.downloaded_size = self._get_dir_size(target_dir)
+                else:
+                    task.downloaded_size = task.total_size
                 task.completed_at = time.time()
 
                 logger.info(
@@ -901,7 +927,13 @@ class HFDownloader:
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
         except Exception as e:
-            if task_id not in self._cancelled:
+            # Skip when already cancelled (the xet abort surfaces here as a
+            # RuntimeError) or already FAILED by the stall detector, whose
+            # error message would otherwise be clobbered by the abort error.
+            if (
+                task_id not in self._cancelled
+                and task.status != DownloadStatus.FAILED
+            ):
                 task.status = DownloadStatus.FAILED
                 task.error = str(e)
                 logger.error(f"Download failed for {task.repo_id}: {e}")
@@ -969,10 +1001,13 @@ class HFDownloader:
                         f"Download stalled for {task.repo_id} "
                         f"(task_id={task_id})"
                     )
-                    # Cancel the snapshot_download thread
+                    # Cancel the snapshot_download thread. The task cancel
+                    # only unblocks the awaiting coroutine; aborting the xet
+                    # session is what actually reaps a wedged transfer thread.
                     active_task = self._active_tasks.get(task_id)
                     if active_task and not active_task.done():
                         active_task.cancel()
+                    abort_xet_session()
                     break
         except asyncio.CancelledError:
             pass

@@ -106,6 +106,16 @@ class ModelArgs(BaseModelArgs):
     indexer_rope_interleave: bool = False
 
 
+# Decode-shaped multi-row forwards (MTP draft verify, L = depth clamp 8 + 1
+# rows at most) must not enter the prefill-shaped fused scores kernel: its
+# grid is sized for many query rows, runs ~5x slower than the plain matmul +
+# fused reduce at tiny L, and the gap grows with context length (~3 ms per
+# indexer layer at 128k). Below this floor the s > 1 scoring falls through to
+# the q @ k.T + fused_index_score_reduce path, whose causal fill uses the
+# same decode offsets. 16 mirrors the sdpa256/fa256 prefill-routing floors.
+_FUSED_SCORES_MIN_S = 16
+
+
 class Indexer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -263,7 +273,7 @@ class Indexer(nn.Module):
         causal_valid_prefix_topk = fuse_causal_mask
 
         scores = None
-        if s > 1 and (mask is None or fuse_causal_mask):
+        if s >= _FUSED_SCORES_MIN_S and (mask is None or fuse_causal_mask):
             scores_feed_exact_topk = causal_valid_prefix_topk and use_fast_topk
             candidate_prefix_rows = 0
             if use_fast_topk and scores_feed_exact_topk:

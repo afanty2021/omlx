@@ -468,6 +468,7 @@ def test_step_prefill_reclaims_before_first_guard():
             "_sync_and_clear_cache",
             side_effect=lambda stream=None: events.append("sync"),
         ),
+        patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
         patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
     ):

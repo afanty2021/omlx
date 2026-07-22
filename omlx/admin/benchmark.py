@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+from .external_api import ExternalAPIClient, ExternalEndpointConfig
+
 try:
     import mlx.core as mx
 
@@ -44,6 +46,10 @@ class BenchmarkRequest(BaseModel):
     generation_length: int = 128
     batch_sizes: list[int] = []
     force_lm_engine: bool = False
+    # When set, the benchmark runs against a remote OpenAI-compatible
+    # endpoint instead of a local engine and model_id is the remote
+    # model name (not validated against the local catalog).
+    external: Optional[ExternalEndpointConfig] = None
 
     @field_validator("prompt_lengths")
     @classmethod
@@ -197,6 +203,27 @@ def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
     # Truncate to exact target length
     tokens = tokens[:target_tokens]
     return tokenizer.decode(tokens)
+
+
+# The external path has no tokenizer, so prompt lengths are approximated by
+# repeating this filler (~30 tokens per repetition in common BPE vocabs).
+# Results report the endpoint's actual usage.prompt_tokens.
+_EXTERNAL_FILLER = (
+    "The quick brown fox jumps over the lazy dog. "
+    "In the realm of artificial intelligence, large language models "
+    "have demonstrated remarkable capabilities across diverse tasks. "
+)
+_EXTERNAL_FILLER_TOKENS = 30
+
+
+def _generate_external_prompt(target_tokens: int) -> str:
+    """Generate an approximately target_tokens-long prompt without a tokenizer.
+
+    Uses a unique UUID prefix so remote prefix caches cannot skew results.
+    """
+    unique_prefix = f"BENCH-{uuid.uuid4().hex} "
+    repeats = max(1, target_tokens // _EXTERNAL_FILLER_TOKENS)
+    return unique_prefix + _EXTERNAL_FILLER * repeats
 
 
 def _compute_single_metrics(
@@ -461,6 +488,87 @@ async def _run_batch_test(
     # Generation starts when the last request finishes prefill
     gen_wall_time = wall_end - max_first_token
     tg_tps = total_gen_tokens / max(gen_wall_time, 1e-9)
+
+    return {
+        "pp_tps": round(pp_tps, 1),
+        "tg_tps": round(tg_tps, 1),
+        "avg_ttft_ms": round(avg_ttft_ms, 1),
+        "e2e_latency_s": round(wall_time, 3),
+        "total_gen_tokens": total_gen_tokens,
+        "batch_size": batch_size,
+    }
+
+
+async def _run_external_single_test(
+    client: ExternalAPIClient,
+    prompt: str,
+    max_tokens: int,
+) -> dict:
+    """Run a single-request benchmark against an external endpoint.
+
+    Token counts come from the endpoint's streamed usage payload, never
+    from counting SSE chunks (providers batch multiple tokens per chunk).
+    Prefill duration is not observable remotely, so pp TPS falls back to
+    prompt_tokens / TTFT (network latency included). Peak memory is not
+    measurable for a remote host.
+    """
+    stats = await client.stream_chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+    gen_duration = stats.last_content_time - stats.first_content_time
+    metrics = _compute_single_metrics(
+        prompt_tokens=stats.prompt_tokens,
+        completion_tokens=stats.completion_tokens,
+        start_time=stats.start_time,
+        first_token_time=stats.first_content_time,
+        end_time=stats.end_time,
+        peak_memory=0,
+        cached_tokens=stats.cached_tokens,
+        prefill_duration_s=None,
+        generation_duration_s=gen_duration if gen_duration > 0 else None,
+        generation_measured=gen_duration > 0,
+    )
+    metrics["peak_memory_bytes"] = None
+    return metrics
+
+
+async def _run_external_batch_test(
+    client: ExternalAPIClient,
+    prompts: list[str],
+    max_tokens: int,
+    batch_size: int,
+) -> dict:
+    """Run a concurrent-requests benchmark against an external endpoint.
+
+    Mirrors _run_batch_test aggregation, with actual per-request token
+    counts taken from each stream's usage payload.
+    """
+    wall_start = time.perf_counter()
+    stats_list = await asyncio.gather(*[
+        client.stream_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+        for prompt in prompts
+    ])
+    wall_end = time.perf_counter()
+
+    total_gen_tokens = sum(s.completion_tokens for s in stats_list)
+    total_prompt_tokens = sum(s.prompt_tokens for s in stats_list)
+    wall_time = wall_end - wall_start
+    avg_ttft_ms = (
+        sum(s.first_content_time - s.start_time for s in stats_list) / batch_size
+    ) * 1000
+
+    # pp TPS: total prompt tokens / time until ALL requests emit content
+    max_first_token = max(s.first_content_time for s in stats_list)
+    pp_tps = total_prompt_tokens / max(max_first_token - wall_start, 1e-9)
+
+    # tg TPS: total generated tokens / generation wall time
+    tg_tps = total_gen_tokens / max(wall_end - max_first_token, 1e-9)
 
     return {
         "pp_tps": round(pp_tps, 1),
@@ -820,6 +928,9 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     5. Unload the benchmark model
     """
     request = run.request
+    if request.external is not None:
+        await _run_external_benchmark(run)
+        return
     total_tests = len(request.prompt_lengths) + len(request.batch_sizes)
     current_test = 0
     overall_start = time.perf_counter()
@@ -1055,3 +1166,127 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             await engine_pool._unload_engine(request.model_id)
         except Exception:
             pass
+
+
+async def _run_external_benchmark(run: BenchmarkRun) -> None:
+    """Execute a benchmark run against an external OpenAI-compatible endpoint.
+
+    No local model phases (unload/load/JIT warmup) and no community
+    upload — external numbers measure someone else's hardware.
+    """
+    request = run.request
+    total_tests = len(request.prompt_lengths) + len(request.batch_sizes)
+    current_test = 0
+    overall_start = time.perf_counter()
+    client = ExternalAPIClient(request.external)
+
+    try:
+        # Warmup doubles as preflight: fail fast on bad URL/key and on
+        # endpoints that do not return streamed usage (hard requirement
+        # for accurate token counts) before any long test runs.
+        await _send_event(run, {
+            "type": "progress",
+            "phase": "warmup",
+            "message": "Warming up external endpoint...",
+            "current": 0,
+            "total": total_tests,
+        })
+        await client.stream_chat_completion(
+            messages=[{"role": "user", "content": _generate_external_prompt(32)}],
+            max_tokens=8,
+            temperature=0.0,
+        )
+        logger.info("Benchmark: external endpoint warmup complete")
+
+        # Single request tests
+        for pp_len in request.prompt_lengths:
+            current_test += 1
+            await _send_event(run, {
+                "type": "progress",
+                "phase": "single",
+                "message": f"Single: pp{pp_len}/tg{request.generation_length}",
+                "current": current_test,
+                "total": total_tests,
+            })
+
+            metrics = await _run_external_single_test(
+                client=client,
+                prompt=_generate_external_prompt(pp_len),
+                max_tokens=request.generation_length,
+            )
+
+            result = {
+                "test_type": "single",
+                "pp": pp_len,
+                "tg": request.generation_length,
+                **metrics,
+            }
+            run.results.append(result)
+            await _send_event(run, {"type": "result", "data": result})
+
+        # Batch tests: concurrent requests with unique pp1024 prompts
+        for batch_size in request.batch_sizes:
+            current_test += 1
+            await _send_event(run, {
+                "type": "progress",
+                "phase": "batch",
+                "message": f"Batch {batch_size}x: pp1024/tg{request.generation_length}",
+                "current": current_test,
+                "total": total_tests,
+            })
+
+            batch_metrics = await _run_external_batch_test(
+                client=client,
+                prompts=[_generate_external_prompt(1024) for _ in range(batch_size)],
+                max_tokens=request.generation_length,
+                batch_size=batch_size,
+            )
+
+            result = {
+                "test_type": "batch",
+                "pp": 1024,
+                "tg": request.generation_length,
+                **batch_metrics,
+            }
+            run.results.append(result)
+            await _send_event(run, {"type": "result", "data": result})
+
+        # Done
+        overall_duration = time.perf_counter() - overall_start
+        run.status = "completed"
+        await _send_event(run, {
+            "type": "done",
+            "summary": {
+                "model_id": request.model_id,
+                "total_time": round(overall_duration, 1),
+                "total_tests": total_tests,
+            },
+        })
+
+        # External results measure remote hardware — never upload them to
+        # the omlx.ai community leaderboard. Mirrors the experimental-
+        # features skip so REST pollers see the same upload_state shape.
+        run.upload_state["phase"] = "skipped"
+        run.upload_state["skipped_reason"] = "external_endpoint"
+        await _send_event(run, {
+            "type": "upload_skipped",
+            "reason": "external_endpoint",
+            "features": [],
+        })
+
+    except asyncio.CancelledError:
+        run.status = "cancelled"
+        await _send_event(run, {
+            "type": "error",
+            "message": "Benchmark cancelled by user",
+        })
+    except Exception as e:
+        logger.error(f"External benchmark error: {e}", exc_info=True)
+        run.status = "error"
+        run.error_message = str(e)
+        await _send_event(run, {
+            "type": "error",
+            "message": str(e),
+        })
+    finally:
+        await client.aclose()

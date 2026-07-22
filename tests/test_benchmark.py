@@ -1065,3 +1065,214 @@ class TestSanitizeUploadError:
         from omlx.admin.benchmark import _sanitize_upload_error
         resp = self._resp(status=503, text="")
         assert _sanitize_upload_error(resp) == "HTTP 503"
+
+
+# =============================================================================
+# External endpoint benchmark tests
+# =============================================================================
+
+
+def _external_config():
+    from omlx.admin.external_api import ExternalEndpointConfig
+
+    return ExternalEndpointConfig(
+        base_url="http://localhost:8001/v1",
+        api_key="sk-test",
+        model="remote-model",
+    )
+
+
+def _stream_stats(prompt=1000, completion=128, cached=0):
+    from omlx.admin.external_api import StreamStats
+
+    return StreamStats(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        cached_tokens=cached,
+        start_time=0.0,
+        first_content_time=0.5,
+        last_content_time=1.5,
+        end_time=1.6,
+        text="x" * 16,
+    )
+
+
+class TestExternalBenchmarkRequest:
+    def test_external_accepted(self):
+        req = BenchmarkRequest(
+            model_id="remote-model",
+            prompt_lengths=[1024],
+            external=_external_config(),
+        )
+        assert req.external is not None
+        assert req.external.model == "remote-model"
+
+    def test_external_defaults_to_none(self):
+        req = BenchmarkRequest(model_id="m", prompt_lengths=[1024])
+        assert req.external is None
+
+    def test_external_invalid_base_url_rejected(self):
+        with pytest.raises(ValueError, match="http:// or https://"):
+            BenchmarkRequest(
+                model_id="m",
+                prompt_lengths=[1024],
+                external={"base_url": "localhost:8001", "model": "m"},
+            )
+
+
+class TestGenerateExternalPrompt:
+    def test_scales_with_target(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        short = _generate_external_prompt(1024)
+        long = _generate_external_prompt(4096)
+        assert len(long) > len(short) * 3
+
+    def test_unique_prefix(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        a = _generate_external_prompt(1024)
+        b = _generate_external_prompt(1024)
+        assert a.startswith("BENCH-")
+        assert a != b
+
+
+class TestRunExternalBenchmark:
+    def _make_run(self, prompt_lengths=None, batch_sizes=None):
+        return BenchmarkRun(
+            bench_id="bench-ext",
+            request=BenchmarkRequest(
+                model_id="remote-model",
+                prompt_lengths=prompt_lengths or [1024],
+                batch_sizes=batch_sizes or [],
+                external=_external_config(),
+            ),
+        )
+
+    def _mock_client(self, stats=None):
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(
+            return_value=stats or _stream_stats()
+        )
+        client.aclose = AsyncMock()
+        return client
+
+    async def test_never_touches_engine_pool(self):
+        run = self._make_run(batch_sizes=[2])
+        pool = MagicMock()
+        client = self._mock_client()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        pool.get_engine.assert_not_called()
+        pool.get_loaded_model_ids.assert_not_called()
+        pool._unload_engine.assert_not_called()
+
+    async def test_event_sequence_and_upload_skipped(self):
+        run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
+        client = self._mock_client()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        event_types = [e["type"] for e in run.events]
+        assert event_types == [
+            "progress",  # warmup
+            "progress",  # single
+            "result",
+            "progress",  # batch
+            "result",
+            "done",
+            "upload_skipped",
+        ]
+        skipped = run.events[-1]
+        assert skipped["reason"] == "external_endpoint"
+        assert run.upload_state["phase"] == "skipped"
+        assert run.upload_state["skipped_reason"] == "external_endpoint"
+        client.aclose.assert_awaited()
+
+    async def test_single_result_uses_usage_token_counts(self):
+        run = self._make_run(prompt_lengths=[4096])
+        client = self._mock_client(_stream_stats(prompt=3900, completion=128))
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["test_type"] == "single"
+        assert result["pp"] == 4096
+        # Actual usage counts, not the nominal pp target
+        assert result["prompt_tokens"] == 3900
+        assert result["completion_tokens"] == 128
+        assert result["peak_memory_bytes"] is None
+        # gen duration 1.0s (first 0.5 → last 1.5) with 128 tokens
+        assert result["gen_tps"] == 128.0
+        assert result["ttft_ms"] == 500.0
+
+    async def test_batch_result_aggregates_usage_counts(self):
+        run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
+        client = self._mock_client(_stream_stats(prompt=1000, completion=100))
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        batch = [r for r in run.results if r["test_type"] == "batch"][0]
+        assert batch["batch_size"] == 2
+        assert batch["total_gen_tokens"] == 200
+
+    async def test_missing_usage_fails_run(self):
+        from omlx.admin.external_api import ExternalEndpointError
+
+        run = self._make_run()
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(
+            side_effect=ExternalEndpointError(
+                "External endpoint does not support stream usage"
+            )
+        )
+        client.aclose = AsyncMock()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        assert run.status == "error"
+        assert "stream usage" in run.error_message
+        error_events = [e for e in run.events if e["type"] == "error"]
+        assert error_events and "stream usage" in error_events[0]["message"]
+
+    async def test_cancellation_mid_run(self):
+        run = self._make_run()
+        started = asyncio.Event()
+
+        async def hang(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(side_effect=hang)
+        client.aclose = AsyncMock()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            task = asyncio.create_task(run_benchmark(run, MagicMock()))
+            await started.wait()
+            task.cancel()
+            await task
+
+        assert run.status == "cancelled"
+        assert run.events[-1]["type"] == "error"
+        assert "cancelled" in run.events[-1]["message"].lower()
+        client.aclose.assert_awaited()

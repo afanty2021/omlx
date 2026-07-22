@@ -407,19 +407,71 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
         assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
 
-    def test_xet_disabled_for_cancel_compat(self):
-        """hf_xet's Rust ``download_files`` swallows the Python exception our
-        tqdm cancel raises, so on xet-enabled repos cancellation is a no-op.
-        Importing the downloader module must force the xet path off so all
-        downloads go through ``http_get`` where cooperative cancel works.
-        See #1322.
+    def test_xet_not_disabled_on_import(self):
+        """Importing the downloader must leave the xet fast path enabled.
+
+        The old #1322 force-off is gone: cancellation on the xet path is now
+        driven by ``abort_xet_session()`` instead of the tqdm raise, so the
+        module no longer flips ``HF_HUB_DISABLE_XET``.
         """
         import huggingface_hub.constants as hc
-        from huggingface_hub.file_download import is_xet_available
 
-        # Importing omlx.admin.hf_downloader (above) flips this.
-        assert hc.HF_HUB_DISABLE_XET is True
-        assert is_xet_available() is False
+        assert hc.HF_HUB_DISABLE_XET is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_download_aborts_xet_session(self, downloader):
+        """Cancelling the in-flight task must abort the global xet session.
+
+        The tqdm raise never interrupts the xet path (the Rust side defers
+        the exception until the transfer completes), so cancel has to reap
+        the thread via abort_xet_session().
+        """
+        task = DownloadTask(
+            task_id="t1", repo_id="owner/model", status=DownloadStatus.DOWNLOADING
+        )
+        downloader._tasks[task.task_id] = task
+        active = asyncio.create_task(asyncio.sleep(10))
+        downloader._active_tasks[task.task_id] = active
+
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            assert await downloader.cancel_download(task.task_id) is True
+
+        mock_abort.assert_called_once()
+        assert task.status == DownloadStatus.CANCELLED
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+    @pytest.mark.asyncio
+    async def test_cancel_pending_download_does_not_abort_xet(self, downloader):
+        """Cancelling a queued task must not kill another task's transfer.
+
+        Only the DOWNLOADING task owns the semaphore and the xet session;
+        aborting on a PENDING cancel would tear down the active download.
+        """
+        task = DownloadTask(
+            task_id="t1", repo_id="owner/model", status=DownloadStatus.PENDING
+        )
+        downloader._tasks[task.task_id] = task
+
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            assert await downloader.cancel_download(task.task_id) is True
+
+        mock_abort.assert_not_called()
+        assert task.status == DownloadStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_shutdown_aborts_xet_session(self, downloader):
+        """shutdown() must reap any in-flight xet transfer thread."""
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            await downloader.shutdown()
+
+        mock_abort.assert_called_once()
 
     def test_cancellable_tqdm_raises_only_after_cancel(self):
         """The injected tqdm aborts on update() once the cancel flag is set."""
@@ -728,6 +780,117 @@ class TestHFDownloader:
             )
 
             await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_falls_back_to_safetensors_size(self, model_dir):
+        """When dry_run raises, total_size is estimated from safetensors metadata."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-fallback", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        # 7B BF16 model: 7_000_000_000 params * 2 bytes = 14_000_000_000 bytes
+        mock_info = MagicMock()
+        mock_info.safetensors = {
+            "parameters": {"BF16": 7_000_000_000},
+            "total": 7_000_000_000,
+        }
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+            # actual download succeeds immediately (no-op)
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        # Fallback estimate: 7B BF16 params * 2 bytes/param = 14 GB
+        assert task.total_size == 14_000_000_000
+        assert task.status == DownloadStatus.COMPLETED
+        # On completion the estimate is dropped in favor of the measured
+        # dir size (nothing was written here, so 0), not the 14 GB guess.
+        assert task.downloaded_size == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_no_safetensors_leaves_total_size_zero(
+        self, model_dir
+    ):
+        """When dry_run raises and model_info has no safetensors, total_size stays 0."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-no-st", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = None
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        # The download itself must still proceed and complete; only the
+        # progress denominator is unavailable. Pinning status/error here
+        # keeps this test from passing vacuously if the fallback handler
+        # ever raised (which would set FAILED while total_size stays 0).
+        assert task.total_size == 0
+        assert task.status == DownloadStatus.COMPLETED
+        assert task.error == ""
+
+    @pytest.mark.asyncio
+    async def test_malformed_safetensors_metadata_does_not_fail_download(
+        self, model_dir
+    ):
+        """A non-int parameters count must not escalate to a FAILED task."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-malformed", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        # Malformed count: the size estimate raises TypeError internally
+        mock_info.safetensors = {"parameters": {"BF16": None}}
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        # The bad estimate degrades to no estimate; the download proceeds.
+        assert task.total_size == 0
+        assert task.status == DownloadStatus.COMPLETED
+        assert task.error == ""
 
 
 # =============================================================================
@@ -2193,7 +2356,9 @@ class TestStallDetection:
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
             side_effect=_slow_download,
-        ):
+        ), patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
             mock_api = MagicMock()
             mock_info = MagicMock()
             mock_info.safetensors = {"parameters": {"BF16": 5000}}
@@ -2207,6 +2372,8 @@ class TestStallDetection:
 
             assert task.status == DownloadStatus.FAILED
             assert "stalled" in task.error.lower()
+            # The stall handler must reap the wedged xet transfer thread.
+            mock_abort.assert_called()
 
             await downloader.shutdown()
 

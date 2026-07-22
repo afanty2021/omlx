@@ -561,7 +561,9 @@ class EngineCore:
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )
@@ -986,10 +988,13 @@ class EngineCore:
 
             # Drain all outputs and get the last one (using the captured reference)
             final_output = None
+            first_token_at = None
             while True:
                 output = collector.get_nowait()
                 if output is None:
                     break
+                if first_token_at is None and output.generated_at is not None:
+                    first_token_at = output.generated_at
                 final_output = output
 
             # Cleanup
@@ -1021,6 +1026,7 @@ class EngineCore:
                         continue
                 _raise_request_output_error(final_output)
 
+            final_output.first_token_at = first_token_at
             return final_output
 
         # If we exhausted retries, raise the last error

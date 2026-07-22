@@ -484,6 +484,36 @@ class TestCheckpointHasMtpWeights:
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
+    def test_returns_true_for_nextn_layout(self, tmp_path):
+        # DeepSeek-V3-style checkpoints (GLM-5.2) keep the MTP head as an
+        # extra decoder layer past num_hidden_layers, not under mtp.*.
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps({"num_hidden_layers": 78, "num_nextn_predict_layers": 1})
+        )
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.self_attn.q_a_proj.weight": "model.safetensors",
+                "model.layers.78.eh_proj.weight": "model.safetensors",
+            },
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
+    def test_returns_false_for_nextn_config_without_weights(self, tmp_path):
+        # Config declares nextn layers but the checkpoint stripped them.
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps({"num_hidden_layers": 78, "num_nextn_predict_layers": 1})
+        )
+        self._write_index(
+            tmp_path,
+            {"model.layers.0.self_attn.q_a_proj.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
     def test_returns_false_for_empty_dir(self, tmp_path):
         # No index, no shards — caller treats as "no MTP weights".
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
@@ -554,3 +584,59 @@ class TestExpandPerLayerQuantKeys:
         swapped = "language_model.model.layers.0.linear_attn.in_proj_qkv"
         assert swapped in cfg["quantization"]
         assert cfg["quantization"][swapped]["bits"] == 8
+
+
+class TestMaterializeLazyState:
+    def test_covers_arrays_in_plain_helper_objects(self):
+        """Lazy arrays hidden in non-Module helpers must be materialized.
+
+        Mirrors mlx-vlm's PixtralRotaryEmbedding: a plain class attribute on
+        a module holding a lazy array built on the loader thread. Without
+        the plain-object scan, evaluating that array from another thread
+        raises "There is no Stream(gpu, N) in current thread" (issue #2263
+        follow-up; same class as #1304).
+        """
+        import threading
+
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        from omlx.utils.model_loading import materialize_lazy_state
+
+        class _PlainRotary:
+            def __init__(self):
+                freqs = 1.0 / (10000.0 ** (mx.arange(0, 8, 2) / 8.0))
+                self.inv_freq = mx.concatenate([freqs, freqs], axis=-1)
+
+        class _Vision(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rotary = _PlainRotary()
+                self.rotary_list = [_PlainRotary()]
+                self._hidden = mx.arange(4) * 2.0
+
+        errors = []
+
+        def _build_and_materialize(box):
+            model = _Vision()
+            materialize_lazy_state(model)
+            box.append(model)
+
+        def _eval_elsewhere(model):
+            try:
+                mx.eval(model.rotary.inv_freq)
+                mx.eval(model.rotary_list[0].inv_freq)
+                mx.eval(model._hidden)
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        box: list = []
+        t0 = threading.Thread(target=_build_and_materialize, args=(box,))
+        t0.start()
+        t0.join()
+
+        t1 = threading.Thread(target=_eval_elsewhere, args=(box[0],))
+        t1.start()
+        t1.join()
+
+        assert not errors, f"cross-thread eval failed: {errors}"

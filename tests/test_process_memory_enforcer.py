@@ -10,6 +10,7 @@ import pytest
 
 import omlx.process_memory_enforcer as pme
 import omlx.utils.psutil_compat as psutil_compat
+from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
@@ -730,6 +731,53 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_metal_cap_bytes == metal_b
         assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
 
+    async def test_propagates_hot_cache_used_for_usage_side_exclusion(
+        self, mock_engine_pool
+    ):
+        """Targets whose usage read is raw phys_footprint (the DFlash primary
+        guard) need the used-bytes counterpart of the reservation, or the
+        hot cache is charged twice: once in the reserved ceiling, once in
+        phys. The enforcer propagates the exact used figure each tick."""
+        metal_b = 16 * 1024**3
+        hot_used_b = 3 * 1024**3
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: hot_used_b + 512 * 1024**2
+        enforcer._hot_cache_used_bytes = lambda: hot_used_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == hot_used_b
+
+    async def test_propagated_hot_cache_used_clamped_to_reservation(
+        self, mock_engine_pool
+    ):
+        """A transient overshoot (live hot-cache bytes past max_bytes) must not
+        exclude more usage than the reservation removed from the ceiling —
+        that would net-weaken the guard exactly under pressure."""
+        metal_b = 16 * 1024**3
+        reserved_b = 3 * 1024**3  # capped at max_bytes
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: reserved_b
+        enforcer._hot_cache_used_bytes = lambda: 5 * 1024**3  # overshoot
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == reserved_b
+
 
 class TestPrefillMemoryGuardToggle:
     """Tests for prefill_memory_guard setter and Metal limit management."""
@@ -1157,6 +1205,39 @@ class TestAbortLimitCalculation:
         assert enforcer.memory_guard_tier == "balanced"
 
 
+class TestAdmissionCeiling:
+    """#2290: the pre-load admission ceiling survives disabling the guard."""
+
+    def test_guard_on_matches_final_ceiling(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        assert enforcer.get_admission_ceiling() == enforcer.get_final_ceiling()
+        assert enforcer.get_admission_ceiling() == 10 * 1024**3
+
+    def test_guard_off_falls_back_to_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_final_ceiling() == 0
+            assert enforcer.get_admission_ceiling() == 122 * 1024**3
+
+    def test_guard_off_ignores_metal_cap(self, mock_engine_pool):
+        """Guard off leaves allocations pageable; the Metal cap must not
+        shrink the best-effort admission ceiling."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        enforcer._get_effective_metal_cap_bytes = lambda: 96 * 1024**3
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_admission_ceiling() == 122 * 1024**3
+
+
 class TestMetalWiredLimit:
     """enforcer.start() applies MLX wired limits only for explicit sysctl caps."""
 
@@ -1232,10 +1313,13 @@ class TestMetalWiredLimit:
                 patch.object(asyncio, "create_task", side_effect=_close_coro),
             ):
                 enforcer.start()
-        # balanced @ 512 GB static = 506 GB. The scheduler still clamps to the
-        # 128 GB effective cap, but MLX's wired limit is left untouched.
+        # balanced @ 512 GB static = 506 GB, clamped to the 5%-of-RAM
+        # recommendation reserve for the admin banner (#2184). The scheduler
+        # still clamps to the 128 GB effective cap, but MLX's wired limit is
+        # left untouched.
         mock_mx.set_wired_limit.assert_not_called()
-        assert enforcer._metal_wired_limit_request == 506 * 1024**3
+        total = 512 * 1024**3
+        assert enforcer._metal_wired_limit_request == total - total // 20
         assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
@@ -1771,6 +1855,28 @@ class TestUnresolvableSchedulerWarning:
             r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
         ]
         assert warnings == []
+
+    def test_non_streaming_engine_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """TTS/STT/STS/Embedding/Reranker engines have no Scheduler by
+        design (they run on the MLX executor), so the wrapper-break
+        warning must not fire for them — it misreads as a memory guard
+        regression (#2312)."""
+        engine = TTSEngine("dummy-tts-model")
+        entry = _make_entry("model-tts", engine=engine)
+        enforcer._engine_pool._entries = {"model-tts": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == [], (
+            "Non-streaming engines must not trigger the unresolvable-"
+            f"scheduler warning, got {[r.message for r in warnings]}"
+        )
 
     def test_unresolvable_does_not_block_other_engines(self, enforcer):
         """If engine A is unresolvable but engine B has a real scheduler,
@@ -2428,3 +2534,93 @@ class TestDFlashGuardPropagation:
         engine.scheduler = scheduler
         entry = _make_entry("model-a", engine=engine)
         assert enforcer._resolve_scheduler(entry) is scheduler
+
+
+class TestWiredLimitSuggestionClamp:
+    """The recommended iogpu.wired_limit_mb must leave the OS headroom (#2184)."""
+
+    def _with_total(self, total):
+        return patch("omlx.settings.get_system_memory", return_value=total)
+
+    def test_suggestion_below_reserve_unchanged(self):
+        total = 512 * 1024**3
+        desired = 400 * 1024**3
+        with self._with_total(total):
+            assert pme._wired_limit_suggestion_bytes(desired) == desired
+
+    def test_near_physical_suggestion_clamped(self):
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3  # safe-tier static ceiling: 504 GiB
+        with self._with_total(total):
+            clamped = pme._wired_limit_suggestion_bytes(desired)
+        # 5% of 512 GiB = 25.6 GiB reserve
+        assert clamped == total - total // 20
+        assert clamped < desired
+
+    def test_small_mac_recommendation_unchanged(self):
+        """Small-memory Macs keep the tier recommendation: 5% of RAM stays
+        below the tier static reserve there, so the clamp does not bite and
+        users can wire as much as before (#2184 targets large boxes)."""
+        total = 32 * 1024**3
+        desired = total - 2 * 1024**3  # custom tier ceiling: RAM - 2 GiB
+        with self._with_total(total):
+            assert pme._wired_limit_suggestion_bytes(desired) == desired
+
+    def test_desired_above_cap_clamps_to_cap(self):
+        total = 4 * 1024**3
+        with self._with_total(total):
+            clamped = pme._wired_limit_suggestion_bytes(8 * 1024**3)
+        assert clamped == total - total // 20
+
+    def test_log_hint_uses_clamped_value(self, caplog):
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3
+        with (
+            self._with_total(total),
+            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=0),
+            patch.object(
+                pme,
+                "_get_max_metal_working_set_bytes",
+                return_value=384 * 1024**3,
+            ),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(desired)
+        hints = [r for r in caplog.records if "iogpu.wired_limit_mb=" in r.message]
+        assert hints
+        suggested_mb = (total - total // 20) // (1024**2)
+        assert f"iogpu.wired_limit_mb={suggested_mb}" in hints[0].getMessage()
+
+    def test_reasonable_user_cap_not_nagged(self, caplog):
+        """A user cap at the recommended level must not trigger the raise hint
+        even when the static ceiling is higher (the #2184 report followed the
+        old hint into a jetsam crash-loop)."""
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3  # 504 GiB ceiling
+        user_cap = total - total // 20  # exactly the recommendation
+        with (
+            self._with_total(total),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
+            patch.object(pme.mx, "set_wired_limit", return_value=0),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(desired)
+        assert not [
+            r for r in caplog.records if "Raise it with" in r.message
+        ]
+
+    def test_near_physical_user_cap_warns_jetsam(self, caplog):
+        total = 512 * 1024**3
+        user_cap = total - 2 * 1024**3  # 510 GiB, the crash-loop setting
+        with (
+            self._with_total(total),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
+            patch.object(pme.mx, "set_wired_limit", return_value=0),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(400 * 1024**3)
+        assert [r for r in caplog.records if "jetsam" in r.message]

@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
+from . import settings as _settings
+from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
@@ -180,6 +182,33 @@ def get_effective_metal_cap_bytes() -> int:
     return _get_max_metal_working_set_bytes()
 
 
+def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
+    """Clamp a wired-limit recommendation to leave the OS 5% of RAM.
+
+    Wiring within a few GiB of physical RAM invites jetsam during a
+    large-model load burst, and a jetsammed/hard-killed process strands
+    its wired allocation at kernel level until reboot (#2184). 5% matches
+    the field-stable margin from that report (488 GiB stable on a 512 GiB
+    box, 510 GiB crash-looped). On small-memory machines 5% is below the
+    tier static reserve, so their recommendation is unchanged.
+
+    Only shapes the suggested sysctl value in logs and the admin banner;
+    the enforcement path still honors whatever the kernel sysctl allows,
+    including user-set values above this recommendation.
+
+    Resolved through the settings module at call time so tests that patch
+    omlx.settings.get_system_memory control this the same way they control
+    the static ceiling.
+    """
+    try:
+        total = int(_settings.get_system_memory())
+    except Exception:  # noqa: BLE001
+        return desired_bytes
+    if total <= 0:
+        return desired_bytes
+    return max(0, min(desired_bytes, total - total // 20))
+
+
 def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     """Try to raise Metal wired limit for this process to `desired_bytes`.
 
@@ -188,9 +217,11 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     is lower); `previous_bytes` is what MLX reports the prior limit was,
     or None on failure / older macOS where the call is unavailable.
 
-    Emits a WARNING when the kernel sysctl caps us below `desired_bytes`
-    so the user sees the hint in logs in addition to the admin UI red
-    banner.
+    Emits a WARNING when the kernel sysctl caps us below the recommended
+    wired limit so the user sees the hint in logs in addition to the admin
+    UI red banner. The recommended value is clamped below physical RAM
+    (_wired_limit_suggestion_bytes) so following it cannot push the OS
+    into jetsam during a large-model load (#2184).
 
     When iogpu.wired_limit_mb is unset (0), leave Apple's default Metal
     cap active instead of calling mx.set_wired_limit with the same default
@@ -201,10 +232,11 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     if desired_bytes <= 0:
         return 0, None
 
+    suggestion = _wired_limit_suggestion_bytes(desired_bytes)
     sysctl_cap = get_iogpu_wired_limit_bytes()
     if sysctl_cap <= 0:
         effective_cap = get_effective_metal_cap_bytes()
-        if effective_cap > 0 and effective_cap < desired_bytes:
+        if effective_cap > 0 and effective_cap < suggestion:
             logger.warning(
                 "Metal cap (%s, Apple max_recommended_working_set_size) is "
                 "below the oMLX static ceiling (%s); leaving Apple's default "
@@ -212,7 +244,7 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
                 "Raise it with: sudo sysctl iogpu.wired_limit_mb=%d",
                 _format_gb(effective_cap),
                 _format_gb(desired_bytes),
-                desired_bytes // (1024**2),
+                suggestion // (1024**2),
             )
         else:
             logger.debug(
@@ -223,12 +255,34 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
             )
         return 0, None
 
+    try:
+        _total = int(_settings.get_system_memory())
+    except Exception:  # noqa: BLE001
+        _total = 0
+    if _total > 0:
+        _reserve = _total // 20
+        if sysctl_cap > _total - _reserve:
+            # The kernel cap leaves the OS less headroom than the
+            # recommendation floor. A big-model load burst can jetsam the
+            # server at this setting, and the stranded wired memory then
+            # needs a reboot to reclaim (#2184).
+            logger.warning(
+                "iogpu.wired_limit_mb (%s) leaves the OS less than %s of "
+                "physical RAM (%s); a large model load can trigger jetsam "
+                "at this setting and strand the wired memory until reboot "
+                "(#2184). Recommended maximum: %d MB.",
+                _format_gb(sysctl_cap),
+                _format_gb(_reserve),
+                _format_gb(_total),
+                (_total - _reserve) // (1024**2),
+            )
+
     effective_cap = sysctl_cap
     capped = effective_cap > 0 and effective_cap < desired_bytes
     applied = effective_cap if capped else desired_bytes
     try:
         previous = mx.set_wired_limit(applied)
-        if capped:
+        if capped and effective_cap < suggestion:
             logger.warning(
                 "Metal cap (%s, %s) is below the oMLX static ceiling (%s); "
                 "Metal will clamp allocations to the cap and panic if a "
@@ -237,7 +291,7 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
                 _format_gb(effective_cap),
                 "kernel iogpu.wired_limit_mb",
                 _format_gb(desired_bytes),
-                desired_bytes // (1024**2),
+                suggestion // (1024**2),
             )
         return applied, int(previous)
     except Exception as exc:  # noqa: BLE001
@@ -436,11 +490,16 @@ class ProcessMemoryEnforcer:
         if self._prefill_memory_guard:
             static_ceiling = self._get_static_ceiling()
             applied, previous = _apply_metal_wired_limit(static_ceiling)
-            # Store the *desired* limit (= static ceiling) rather than the
-            # post-clamp applied value. The admin UI compares this against
-            # the live iogpu.wired_limit_mb so a kernel cap below the
-            # desired limit triggers the red sysctl-command banner.
-            self._metal_wired_limit_request = static_ceiling
+            # Store the *recommended* limit (static ceiling clamped below
+            # physical RAM, see _wired_limit_suggestion_bytes) rather than
+            # the post-clamp applied value. The admin UI compares this
+            # against the live iogpu.wired_limit_mb so a kernel cap below
+            # the recommendation triggers the red sysctl-command banner;
+            # clamping keeps the banner from telling users to wire nearly
+            # all of physical RAM (#2184).
+            self._metal_wired_limit_request = _wired_limit_suggestion_bytes(
+                static_ceiling
+            )
             if applied > 0:
                 logger.info(
                     "Metal wired limit raised: %s -> %s "
@@ -601,6 +660,29 @@ class ProcessMemoryEnforcer:
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
+
+    def get_admission_ceiling(self) -> int:
+        """Best-effort pre-load ceiling that survives disabling the guard.
+
+        ``get_final_ceiling()`` returns 0 when the prefill memory guard is
+        off, which used to disable engine-pool pre-load eviction entirely:
+        loading a second model would overcommit physical memory and thrash
+        the machine instead of evicting the LRU model (#2290). This
+        accessor keeps load-time eviction working independently of the
+        guard toggle by falling back to the static ceiling (total RAM
+        minus the tier reserve) when the guard is disabled.
+
+        The Metal cap and the dynamic (vm_stat) ceiling are deliberately
+        excluded from the fallback: with the guard off nothing is wired,
+        allocations beyond Apple's recommended working set stay pageable,
+        and workloads legitimately run above that cap. The engine pool
+        treats this fallback as best-effort — it evicts idle LRU models to
+        fit under it but never refuses a load, preserving the unguarded
+        "no hard limits" semantics.
+        """
+        if self._prefill_memory_guard:
+            return self._get_hard_limit_bytes()
+        return self._get_static_ceiling()
 
     def _get_abort_limit_bytes(self) -> int:
         """Stable physical cap used to ABORT an in-flight prefill.
@@ -951,6 +1033,14 @@ class ProcessMemoryEnforcer:
         hot_cache_reserved = (
             self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
         )
+        # Clamp to the reservation: the usage-side exclusion must never exceed
+        # what the ceiling actually gave up, or a transient hot-cache overshoot
+        # past max_bytes would net-weaken the guard exactly under pressure.
+        hot_cache_used = (
+            min(self._hot_cache_used_bytes(), hot_cache_reserved)
+            if hot_cache_reserved > 0
+            else 0
+        )
         scheduler_ceiling = self._scheduler_limit_bytes(
             ceiling, reserved=hot_cache_reserved
         )
@@ -987,6 +1077,12 @@ class ProcessMemoryEnforcer:
                     continue
                 if getattr(engine, "is_diffusion_model", False):
                     continue
+                if isinstance(engine, BaseNonStreamingEngine):
+                    # TTS/STT/STS/Embedding/Reranker engines run on the MLX
+                    # executor without a Scheduler, so an unresolvable
+                    # scheduler is their normal shape, not a wrapper break.
+                    # Warning here reads as a guard regression (#2312).
+                    continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
                 # ``_resolve_scheduler()`` return None on a loaded engine
@@ -1019,6 +1115,12 @@ class ProcessMemoryEnforcer:
             scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
             scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
+            # Usage-side counterpart of the reservation above: targets whose
+            # usage read is raw phys_footprint (the DFlash primary guard)
+            # subtract this so serialized hot-cache CPU bytes are not charged
+            # both here and in the reserved ceiling. The Scheduler reads its
+            # own live counter instead and ignores this attr.
+            scheduler._memory_hot_cache_used_bytes = hot_cache_used
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned
             # custom_ceiling_bytes (custom). The advice ladder needs

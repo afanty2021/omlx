@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from omlx.engine.base import BaseEngine
+
 
 @dataclass
 class MockGenerationOutput:
@@ -51,7 +53,7 @@ class MockTokenizer:
         return "\n".join(parts)
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Mock LLM engine with streaming support for testing."""
 
     def __init__(self, model_name: str = "test-model"):
@@ -76,6 +78,12 @@ class MockBaseEngine:
     @property
     def prefix_cache_enabled(self) -> bool:
         return False
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
 
     def set_stream_outputs(self, outputs: List[MockGenerationOutput]):
         """Set custom streaming outputs for testing."""
@@ -108,7 +116,9 @@ class MockBaseEngine:
                 finish_reason="stop",
             )
 
-    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None) -> int:
+    def count_chat_tokens(
+        self, messages: List[Dict], tools=None, chat_template_kwargs=None, **kwargs
+    ) -> int:
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 
@@ -139,6 +149,12 @@ class MockBaseEngine:
                 finish_reason="stop",
             )
 
+    def get_stats(self) -> Dict[str, Any]:
+        return {}
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        return None
+
 
 class MockEnginePool:
     """Mock engine pool for testing."""
@@ -148,6 +164,7 @@ class MockEnginePool:
         self._models = [
             {"id": "test-model", "loaded": True, "pinned": False, "size": 1000000}
         ]
+        self._entries: Dict[str, Any] = {}
 
     @property
     def model_count(self) -> int:
@@ -165,6 +182,9 @@ class MockEnginePool:
     def current_model_memory(self) -> int:
         return 1000000
 
+    def get_entry(self, model_id: str):
+        return self._entries.get(model_id)
+
     def resolve_model_id(self, model_id_or_alias, settings_manager=None):
         return model_id_or_alias
 
@@ -174,8 +194,11 @@ class MockEnginePool:
     def get_status(self) -> Dict[str, Any]:
         return {"models": self._models}
 
-    async def get_engine(self, model_id: str):
+    async def get_engine(self, model_id: str, _lease: bool = False):
         return self._engine
+
+    async def release_engine(self, model_id: str) -> None:
+        return None
 
 
 def parse_sse_events(response_text: str) -> List[Dict]:
@@ -1134,6 +1157,91 @@ class TestStreamingHelperFunctions:
         assert len(tool_use_blocks) == 1
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert "tool_use" in stop_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_starts_parser_when_prompt_opens_thinking(self):
+        """Prompt-opened thinking must stream as thinking, not public text."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        class PromptOpenedThinkingTokenizer(MockTokenizer):
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_id = 9001
+            think_end_id = 9002
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                if text.rstrip().endswith(self.think_start):
+                    return [101, self.think_start_id]
+                return [101]
+
+            def apply_chat_template(
+                self, messages: List[Dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                return "system: hidden\nuser: hi\nassistant:<think>"
+
+        engine = MockBaseEngine()
+        engine._tokenizer = PromptOpenedThinkingTokenizer()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="The user asked a simple informational question.</think>",
+                new_text="The user asked a simple informational question.</think>",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "The user asked a simple informational question.</think>"
+                    "Visible answer."
+                ),
+                new_text="Visible answer.",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+
+        events = []
+        async for event in stream_anthropic_messages(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+
+        thinking_deltas = []
+        text_deltas = []
+        for event in parsed_events:
+            if event.get("type") != "content_block_delta":
+                continue
+            delta = event.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_deltas.append(delta["thinking"])
+            elif delta.get("type") == "text_delta":
+                text_deltas.append(delta["text"])
+
+        streamed_thinking = "".join(thinking_deltas)
+        streamed_text = "".join(text_deltas)
+        assert "The user asked a simple informational question." in streamed_thinking
+        assert "The user asked a simple informational question." not in streamed_text
+        assert streamed_text == "Visible answer."
 
     @pytest.mark.asyncio
     async def test_anthropic_tool_only_stream_starts_with_tool_use_block(self):
