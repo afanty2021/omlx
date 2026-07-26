@@ -152,7 +152,12 @@ For large models (70B+), the streaming path processes tensors one at a time via 
 - No full model instantiation.
 - Shards flushed at 5 GB boundary.
 - Non-quantized float32 weights cast to bfloat16 for inference parity.
-- Sensitivity measurement requires temporary model load (peak memory ≈ model size).
+- Calibration uses the smaller of live system memory and the recommended Metal
+  working set. Checkpoints above 75% of that capacity use a temporary uniform
+  4-bit proxy; the remaining 25% is reserved proportionally on 16/32/64 GB
+  systems for model execution and imatrix capture.
+- The proxy is validated against the same live limit before calibration, and
+  oQe micro-batches shrink to one sample when headroom is limited.
 
 ## Calibration Data
 
@@ -190,6 +195,9 @@ Code samples include real-world patterns (class definitions, import chains, mult
 ### Streaming Path (oQ)
 
 All models supported by mlx-lm/mlx-vlm. No architecture restrictions.
+Source checkpoints may use BF16/FP16 or reconstructable floating-point block
+formats, including native FP8 and MXFP8. oQ restores FP8/MXFP8 weight semantics
+from the checkpoint scales before applying the selected oQ or oQe format.
 
 ## Acknowledgments
 

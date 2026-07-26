@@ -13,6 +13,7 @@ Covers (without needing the full Qwen3.6 model):
     fits, and falls back to always-tiled without headroom info.
 """
 
+import logging
 import math
 
 import mlx.core as mx
@@ -248,6 +249,7 @@ def _sdpa256_provider_reset(monkeypatch):
 
     monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
+    monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
     return sdpa256
 
 
@@ -324,16 +326,83 @@ def test_parse_force_tiled_env(monkeypatch):
     assert sdpa256._parse_force_tiled_env() is False
 
 
+# --- tiled-route engagement logging (issue #2283) --------------------------
+
+
+def _tiled_log_records(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "INFO" and "tiled" in r.getMessage()
+    ]
+
+
+def test_tiled_route_logs_once_when_no_provider(_sdpa256_provider_reset, caplog):
+    """Guard-off servers land on the tiled path silently (issue #2283); the
+    first engagement must say so at INFO, repeats must stay quiet."""
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+        records = _tiled_log_records(caplog)
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "no guard headroom provider" in msg
+        assert "OMLX_SDPA256_TILED" in msg
+        # Second engagement for the same reason: no new record.
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+        assert len(_tiled_log_records(caplog)) == 1
+
+
+def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1)  # 1 byte of headroom: unfused can't fit
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+    records = _tiled_log_records(caplog)
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "exceeds live guard headroom" in msg
+    assert "kv_len=16384" in msg
+    assert "MiB" in msg
+
+
+def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatch):
+    sdpa256 = _sdpa256_provider_reset
+    monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
+    q, k, _ = _qkv(2048, 16384)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+    records = _tiled_log_records(caplog)
+    assert len(records) == 1
+    assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
+
+
+def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1 << 40)  # ample headroom: fast path
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert _tiled_log_records(caplog) == []
+
+
 def test_scheduler_headroom_provider_math():
     """_sdpa256_unfused_headroom mirrors the adaptive throttle target:
     hard ceiling x headroom safety, clamped by the abort cap, minus usage."""
-    from omlx.scheduler import Scheduler
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
 
     gib = 1024**3
 
     class _Fake:
         _memory_hard_limit_bytes = 0
         _memory_abort_limit_bytes = 0
+        _memory_limits_propagated = False
+        _prefill_memory_guard = False
+        _sdpa256_unguarded_logged = False
         _prefill_headroom_safety = 0.90
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
@@ -343,7 +412,21 @@ def test_scheduler_headroom_provider_math():
             return 10 * gib
 
     fake = _Fake()
-    # No ceiling propagated yet -> negative sentinel (keep the tiled default).
+    # Nothing propagated yet: guard state is unknown, so the negative
+    # sentinel keeps the tiled default even though the flag reads False.
+    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
+
+    # Enforcer has spoken and the guard is explicitly off: the user opted
+    # out of memory management, so the route gets unbounded headroom and
+    # keeps the unfused fast path (#2283).
+    fake._memory_limits_propagated = True
+    assert (
+        Scheduler._sdpa256_unfused_headroom(fake) == _SDPA256_UNBOUNDED_HEADROOM
+    )
+
+    # Guard on but the ceiling has not landed yet (startup race): stay on
+    # the memory-safe default.
+    fake._prefill_memory_guard = True
     assert Scheduler._sdpa256_unfused_headroom(fake) == -1
 
     # Throttle target binds: abort cap (100 * 0.95) > target (100 * 0.90).
@@ -353,6 +436,36 @@ def test_scheduler_headroom_provider_math():
     # Abort cap binds when lower than the throttle target.
     fake._memory_abort_limit_bytes = 80 * gib
     assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.95) - 10 * gib
+
+
+def test_unguarded_fast_path_logs_once(caplog):
+    """Guard-off fast routing runs without a memory ceiling, which is the
+    one state worth a breadcrumb (#2283): exactly one INFO naming the OOM
+    trade and the recovery levers, then silence."""
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
+
+    class _Fake:
+        _memory_hard_limit_bytes = 0
+        _memory_limits_propagated = True
+        _prefill_memory_guard = False
+        _sdpa256_unguarded_logged = False
+
+    fake = _Fake()
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        assert (
+            Scheduler._sdpa256_unfused_headroom(fake)
+            == _SDPA256_UNBOUNDED_HEADROOM
+        )
+        assert (
+            Scheduler._sdpa256_unfused_headroom(fake)
+            == _SDPA256_UNBOUNDED_HEADROOM
+        )
+    records = [
+        r for r in caplog.records if "memory guard disabled" in r.getMessage()
+    ]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "OMLX_SDPA256_TILED=1" in msg
 
 
 def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):

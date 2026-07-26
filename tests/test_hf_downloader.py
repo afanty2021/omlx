@@ -4,11 +4,14 @@
 import asyncio
 import json
 import shutil
+import threading
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from huggingface_hub.utils import HfHubHTTPError
 
 from omlx.admin.hf_downloader import (
     DownloadStatus,
@@ -1842,6 +1845,138 @@ class TestSearchModels:
 
 
 # =============================================================================
+# Stale Token Fallback Tests
+# =============================================================================
+
+
+def _make_401_error() -> HfHubHTTPError:
+    """Build the 401 the Hub returns for a stale stored token (#2276, #2310)."""
+    request = httpx.Request("GET", "https://huggingface.co/api/models")
+    response = httpx.Response(401, request=request)
+    return HfHubHTTPError(
+        "Client error '401 Unauthorized' for url "
+        "'https://huggingface.co/api/models': OAuth token signature "
+        "verification failed",
+        response=response,
+    )
+
+
+def _stale_token_list_models(models):
+    """list_models double that rejects the implicit token but allows anonymous."""
+
+    def side_effect(**kwargs):
+        if kwargs.get("token") is not False:
+            raise _make_401_error()
+        return models
+
+    return side_effect
+
+
+class TestStaleTokenFallback:
+    """Browse calls must survive a stale stored HF token (#2276, #2310)."""
+
+    @pytest.mark.asyncio
+    async def test_search_retries_anonymously_on_401(self):
+        """A 401 from the stored token retries with token=False and flags it."""
+        models = [
+            _make_mock_model("org/model-a", disk_size_bytes=4_000_000_000, downloads=500),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = _stale_token_list_models(models)
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="model")
+
+        assert result["total"] == 1
+        assert result["hf_token_invalid"] is True
+        assert mock_api.list_models.call_count == 2
+        assert mock_api.list_models.call_args[1]["token"] is False
+
+    @pytest.mark.asyncio
+    async def test_search_valid_token_not_flagged(self):
+        """The flag stays False when the listing succeeds first try."""
+        models = [
+            _make_mock_model("org/model-a", disk_size_bytes=4_000_000_000, downloads=500),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = models
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="model")
+
+        assert result["hf_token_invalid"] is False
+        assert mock_api.list_models.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_search_non_401_propagates(self):
+        """Only 401 triggers the anonymous retry; other HTTP errors raise."""
+        request = httpx.Request("GET", "https://huggingface.co/api/models")
+        response = httpx.Response(503, request=request)
+        error = HfHubHTTPError("Service unavailable", response=response)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = error
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(HfHubHTTPError):
+                await HFDownloader.search_models(query="model")
+
+        assert mock_api.list_models.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_recommended_retries_anonymously_on_401(self):
+        """Recommended lists survive a stale token and set the flag."""
+        models = [
+            _make_mock_model(
+                "mlx-community/model-a",
+                disk_size_bytes=1_000_000_000,
+                downloads=500,
+                trending_score=5,
+            ),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = _stale_token_list_models(models)
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=16 * 1024**3
+            )
+
+        assert len(result["trending"]) == 1
+        assert len(result["popular"]) == 1
+        assert result["hf_token_invalid"] is True
+
+    @pytest.mark.asyncio
+    async def test_recommended_valid_token_not_flagged(self):
+        """The flag stays False when both recommended fetches succeed."""
+        models = [
+            _make_mock_model(
+                "mlx-community/model-a",
+                disk_size_bytes=1_000_000_000,
+                downloads=500,
+            ),
+        ]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = models
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=16 * 1024**3
+            )
+
+        assert result["hf_token_invalid"] is False
+
+
+# =============================================================================
 # Get Model Info Tests
 # =============================================================================
 
@@ -2086,6 +2221,79 @@ class TestHFAPITimeouts:
 
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.get_model_info("org/model")
+
+    @pytest.mark.asyncio
+    async def test_search_models_timeout_on_lazy_iteration(self):
+        """list_models returns a lazy generator; a hang during iteration
+        (not the call itself) must still hit the timeout instead of
+        blocking the event loop (issue #2325)."""
+
+        def lazy_hanging_list_models(**kwargs):
+            def gen():
+                time.sleep(5)
+                yield None
+
+            return gen()
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = lazy_hanging_list_models
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.search_models(query="test")
+
+    @pytest.mark.asyncio
+    async def test_get_recommended_models_timeout_on_lazy_iteration(self):
+        """Same lazy-iteration hang, via get_recommended_models."""
+
+        def lazy_hanging_list_models(**kwargs):
+            def gen():
+                time.sleep(5)
+                yield None
+
+            return gen()
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = lazy_hanging_list_models
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.get_recommended_models(
+                    max_memory_bytes=16 * 1024**3
+                )
+
+    @pytest.mark.asyncio
+    async def test_search_models_drains_generator_off_event_loop(self):
+        """The lazy generator must be consumed in a worker thread, never
+        on the event loop thread."""
+        seen_threads = []
+
+        def lazy_list_models(**kwargs):
+            def gen():
+                seen_threads.append(threading.current_thread())
+                yield _make_mock_model(
+                    "mlx-community/model-a",
+                    disk_size_bytes=1_000_000_000,
+                    downloads=500,
+                )
+
+            return gen()
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = lazy_list_models
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="test")
+
+        assert len(result["models"]) == 1
+        loop_thread = threading.current_thread()
+        assert seen_threads
+        assert all(t is not loop_thread for t in seen_threads)
 
 
 class TestHFEndpointPassthrough:

@@ -237,6 +237,13 @@
                         <!-- ===== HuggingFace Source ===== -->
                         <div x-show="downloaderSource === 'hf'">
 
+                        <!-- Stale HF token warning -->
+                        <div x-show="hfTokenInvalid" x-cloak
+                             class="mb-6 px-4 py-2.5 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-xl flex items-center gap-2">
+                            <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i>
+                            <span>{{ t('models.downloader.token_warning') }}</span>
+                        </div>
+
                         <!-- Download Form Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
                             <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -293,7 +300,8 @@
 
                         <!-- Search HuggingFace Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
-                            <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <!-- No overflow-hidden on this card (the suggestion dropdown must escape it), so the header rounds its own top corners -->
+                            <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                                 <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.search.section_label') }}</span>
                             </div>
@@ -913,7 +921,8 @@
 
                                     <!-- Search ModelScope Section -->
                                     <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
-                                        <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                        <!-- No overflow-hidden on this card (the suggestion dropdown must escape it), so the header rounds its own top corners -->
+                                        <div class="flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                                             <i data-lucide="search" class="w-4 h-4 text-neutral-500"></i>
                                             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600" x-text="window.t('models.search.ms_section_label')"></span>
                                         </div>

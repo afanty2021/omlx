@@ -12,14 +12,39 @@ linearly, so the discriminator is the scale dtype, not the key name.
 """
 
 import glob
+import json
 import os
+import struct
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from omlx.oq import _block_dequant_fp8, _LazyTensorIndex
 
 M3_DIR = "/Volumes/Scratch/models/MiniMax-M3-MXFP8"
+
+
+def _write_safetensors(path, tensors):
+    """Minimal safetensors writer for dtypes numpy cannot represent.
+
+    tensors: {name: (dtype_str, shape, raw_bytes)}
+    """
+    header = {}
+    offset = 0
+    for name, (dtype_str, shape, data) in tensors.items():
+        header[name] = {
+            "dtype": dtype_str,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(data)],
+        }
+        offset += len(data)
+    header_json = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        for _, (_, _, data) in tensors.items():
+            f.write(data)
 
 
 def test_u8_scale_decodes_as_e8m0_exponent():
@@ -67,6 +92,55 @@ def test_f32_scale_stays_linear():
     wf = mx.from_fp8(raw_fp8, dtype=mx.bfloat16).astype(mx.float32)
     expected = mx.concatenate([wf[:128] * 0.5, wf[128:] * 2.0], axis=0)
     assert mx.allclose(got.astype(mx.float32), expected, atol=1e-2, rtol=1e-2).item()
+
+
+def test_weight_scale_pair_discovery_and_dequant(tmp_path):
+    # compressed-tensors float-quantized (Laguna FP8): X.weight (F8_E4M3)
+    # + X.weight_scale (f32 block scales). The pair must be discovered,
+    # the scale key hidden, and _dequant_one must fold the [128, 128]
+    # blocks linearly. Attention k_scale/v_scale sidecars must not pair.
+    mx.random.seed(2)
+    w_true = mx.random.normal((128, 256)).astype(mx.float32)
+    scale = mx.array([[0.5, 2.0]], dtype=mx.float32)
+    scale_expand = mx.repeat(mx.repeat(scale, 128, axis=0), 128, axis=1)
+    codes = mx.to_fp8(w_true / scale_expand)
+
+    shard = str(tmp_path / "model.safetensors")
+    _write_safetensors(
+        shard,
+        {
+            "model.layers.0.mlp.down_proj.weight": (
+                "F8_E4M3",
+                codes.shape,
+                np.array(codes).tobytes(),
+            ),
+            "model.layers.0.mlp.down_proj.weight_scale": (
+                "F32",
+                scale.shape,
+                np.array(scale).tobytes(),
+            ),
+            "model.layers.0.self_attn.k_scale": (
+                "F32",
+                (1,),
+                np.ones(1, dtype=np.float32).tobytes(),
+            ),
+        },
+    )
+
+    idx = _LazyTensorIndex([shard])
+    wk = "model.layers.0.mlp.down_proj.weight"
+    assert idx._fp8_pairs.get(wk) == f"{wk}_scale"
+    assert idx.source_quant_info(wk) is None  # dequant path, not passthrough
+    assert not idx._is_visible(f"{wk}_scale")
+    assert idx._is_visible("model.layers.0.self_attn.k_scale")
+    assert "model.layers.0.self_attn.k_scale" not in idx._fp8_pairs
+
+    got = idx._dequant_one(wk)
+    expected = mx.from_fp8(codes, dtype=mx.bfloat16).astype(mx.float32) * scale_expand
+    assert got.shape == (128, 256)
+    assert mx.allclose(
+        got.astype(mx.float32), expected, atol=1e-2, rtol=1e-2
+    ).item()
 
 
 @pytest.mark.skipif(not os.path.isdir(M3_DIR), reason="M3 not present")

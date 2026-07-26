@@ -136,8 +136,11 @@ class EnginePool:
             the `_get_final_ceiling` callback set by `server.init_server()`.
             When that reads 0 (memory guard disabled), the pool falls back
             to `enforcer.get_admission_ceiling()` via `_get_admission_ceiling`
-            for best-effort LRU eviction (#2290). Until the callbacks are
-            wired up the pool admits unconditionally.
+            for best-effort LRU eviction (#2290). Idle-model eviction
+            starts at `enforcer.get_admission_soft_target()` via
+            `_get_admission_soft_target` so the old model is unloaded
+            before the new weights allocate (#2319). Until the callbacks
+            are wired up the pool admits unconditionally.
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
@@ -146,6 +149,7 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
         self._get_admission_ceiling: object | None = None  # Set by server
+        self._get_admission_soft_target: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
@@ -197,6 +201,23 @@ class EnginePool:
         pools admit unconditionally).
         """
         cb = self._get_admission_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _admission_soft_target(self) -> int:
+        """Soft watermark that pre-load eviction targets (#2319).
+
+        Wired to `enforcer.get_admission_soft_target`. Eviction of idle
+        LRU models starts once the projected total exceeds this, so an
+        old model is unloaded *before* the new weights allocate instead
+        of after the first request's prefill guard fires. Returns 0 when
+        no callback is wired up (callers fall back to the ceiling).
+        """
+        cb = self._get_admission_soft_target
         if cb is None:
             return 0
         try:
@@ -816,6 +837,15 @@ class EnginePool:
             # evicting LRU non-pinned models first; if the model still
             # cannot fit after evicting everything available, raise.
             #
+            # Eviction starts at the enforcer's *soft* watermark, not the
+            # ceiling (#2319): the soft..ceiling band is exactly the
+            # hard-pressure zone, and a second model admitted into it kept
+            # both models resident through the load (swapping for minutes)
+            # only to have the first request's prefill guard evict the old
+            # one anyway. Evicting down to the same soft target *before*
+            # the new weights allocate fixes the ordering; refusing a load
+            # still requires exceeding the ceiling.
+            #
             # ceiling == 0 means the guard is disabled or the enforcer is
             # not wired up. Eviction on model swap must not die with the
             # guard (#2290): fall back to the best-effort admission
@@ -828,6 +858,10 @@ class EnginePool:
                 ceiling = self._fallback_admission_ceiling()
                 best_effort = ceiling > 0
             if ceiling > 0:
+                soft_target = self._admission_soft_target()
+                evict_target = (
+                    min(soft_target, ceiling) if soft_target > 0 else ceiling
+                )
                 evicted_any = unloaded_for_admission
                 while True:
                     # Consult the tracked accumulator alongside live memory:
@@ -843,19 +877,35 @@ class EnginePool:
                         self._current_model_memory,
                     )
                     projected = current + entry.estimated_size
-                    if projected <= ceiling:
+                    if projected <= evict_target:
                         break
                     victim = self._find_lru_victim()
                     if victim is not None:
                         logger.info(
                             f"Evicting '{victim}' to fit '{model_id}' "
-                            f"under memory ceiling "
+                            f"under the admission soft target "
                             f"({format_size(projected)} > "
-                            f"{format_size(ceiling)})"
+                            f"{format_size(evict_target)})"
                         )
                         await self._unload_engine(victim)
                         evicted_any = True
                         continue
+                    if projected <= ceiling:
+                        # Above the soft target with nothing left to
+                        # evict, but still under the ceiling: admit. The
+                        # soft target only decides when eviction starts
+                        # (#2319); refusal keeps the ceiling-only
+                        # contract.
+                        if evict_target < ceiling:
+                            logger.info(
+                                f"Admitting '{model_id}' above the "
+                                f"admission soft target with no idle "
+                                f"model left to evict "
+                                f"({format_size(projected)} > "
+                                f"{format_size(evict_target)}, ceiling "
+                                f"{format_size(ceiling)})"
+                            )
+                        break
                     failure_current = current
                     failure_projected = projected
                     failure_label = "current"

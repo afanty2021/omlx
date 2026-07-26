@@ -127,6 +127,157 @@ class TestModelArgs:
         assert args.indexer_types == ["full", "shared"]
 
 
+class TestQuantOverrideRemap:
+    """Per-module quantization overrides must follow the weight remap.
+
+    mlx-lm's load-time class_predicate looks up config["quantization"]
+    by runtime module path (mtp.<i>.*), while dynamic-quant checkpoints
+    key their overrides by the checkpoint path (model.layers.<n>.*);
+    from_dict copies them over (issue #2326).
+    """
+
+    def test_nextn_overrides_copied_to_runtime_paths(self, glm):
+        three_bit = {"group_size": 32, "bits": 3}
+        cfg = dict(
+            TINY_CFG,
+            quantization={
+                "group_size": 32,
+                "bits": 4,
+                "model.layers.2.mlp.switch_mlp.down_proj": dict(three_bit),
+                "model.layers.2.eh_proj": dict(three_bit),
+                "model.layers.2.mlp.gate": False,
+                "model.layers.2.shared_head.head": {"group_size": 32, "bits": 4},
+                "model.layers.1.mlp.switch_mlp.down_proj": dict(three_bit),
+            },
+        )
+        glm.ModelArgs.from_dict(cfg)
+        q = cfg["quantization"]
+        assert q["mtp.0.block.mlp.switch_mlp.down_proj"] == three_bit
+        assert q["mtp.0.eh_proj"] == three_bit
+        assert q["mtp.0.block.mlp.gate"] is False
+        # Shared lm_head duplicate is dropped by sanitize; no runtime copy.
+        assert "mtp.0.block.shared_head.head" not in q
+        # Backbone overrides are not treated as nextn layers.
+        assert not any("layers.1" in k for k in q if k.startswith("mtp."))
+        # Original checkpoint-path keys stay (inert after the remap).
+        assert "model.layers.2.mlp.switch_mlp.down_proj" in q
+
+    def test_existing_runtime_key_not_overwritten(self, glm):
+        cfg = dict(
+            TINY_CFG,
+            quantization={
+                "group_size": 32,
+                "bits": 4,
+                "model.layers.2.mlp.gate": {"group_size": 32, "bits": 3},
+                "mtp.0.block.mlp.gate": {"group_size": 32, "bits": 8},
+            },
+        )
+        glm.ModelArgs.from_dict(cfg)
+        assert cfg["quantization"]["mtp.0.block.mlp.gate"] == {
+            "group_size": 32,
+            "bits": 8,
+        }
+
+    def test_no_nextn_leaves_quantization_untouched(self, glm):
+        quant = {
+            "group_size": 32,
+            "bits": 4,
+            "model.layers.1.mlp.gate": False,
+        }
+        cfg = dict(
+            TINY_CFG, num_nextn_predict_layers=0, quantization=dict(quant)
+        )
+        glm.ModelArgs.from_dict(cfg)
+        assert cfg["quantization"] == quant
+
+
+def _fake_triplet(out_shape, in_dim, bits, gs):
+    packed = mx.zeros((*out_shape, in_dim * bits // 32), dtype=mx.uint32)
+    scales = mx.zeros((*out_shape, in_dim // gs))
+    return packed, scales, mx.zeros((*out_shape, in_dim // gs))
+
+
+class TestQuantInference:
+    """Shape-inferred overrides for converters that record none (#2326).
+
+    The Alis 3.5bpw checkpoint packs the nextn layer at 3-bit but has no
+    config["quantization"] entry for layer 78 at all; the spec must be
+    recovered from the packed/scales shapes plus the module input dim.
+    """
+
+    DP = "mtp.0.block.mlp.switch_mlp.down_proj"
+
+    def _model_and_quant(self, glm):
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        return glm.Model(args), cfg["quantization"]
+
+    def test_inferred_override_published(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        model, quant = self._model_and_quant(glm)
+        # down_proj module weight is (experts, hidden, moe_int) = (4, 64, 32);
+        # fabricate a 3-bit gs=32 triplet (differs from the global 4-bit).
+        w, s, b = _fake_triplet((4, 64), 32, bits=3, gs=32)
+        weights = {f"{self.DP}.weight": w, f"{self.DP}.scales": s, f"{self.DP}.biases": b}
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == {"group_size": 32, "bits": 3, "mode": "affine"}
+
+    def test_global_matching_module_not_written(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        model, quant = self._model_and_quant(glm)
+        w, s, b = _fake_triplet((4, 64), 32, bits=4, gs=32)
+        weights = {f"{self.DP}.weight": w, f"{self.DP}.scales": s, f"{self.DP}.biases": b}
+        _infer_mtp_quant_overrides(model, weights)
+        assert self.DP not in quant
+
+    def test_existing_override_and_bogus_path_untouched(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        model, quant = self._model_and_quant(glm)
+        sentinel = {"group_size": 32, "bits": 8, "mode": "affine"}
+        quant[self.DP] = dict(sentinel)
+        w, s, b = _fake_triplet((4, 64), 32, bits=3, gs=32)
+        weights = {
+            f"{self.DP}.weight": w,
+            f"{self.DP}.scales": s,
+            f"{self.DP}.biases": b,
+            "mtp.0.block.bogus.scales": s,
+        }
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == sentinel
+        assert not any("bogus" in k for k in quant)
+
+    def test_sanitize_nextn_branch_publishes_override(self, glm, mtp_active):
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        model = glm.Model(args)
+        w, s, b = _fake_triplet((4, 64), 32, bits=3, gs=32)
+        raw = "model.layers.2.mlp.switch_mlp.down_proj"
+        out = model.sanitize(
+            {f"{raw}.weight": w, f"{raw}.scales": s, f"{raw}.biases": b}
+        )
+        assert f"{self.DP}.weight" in out
+        assert cfg["quantization"][self.DP] == {
+            "group_size": 32,
+            "bits": 3,
+            "mode": "affine",
+        }
+
+
 class TestModelInit:
     def test_mtp_attached_when_active(self, glm, mtp_active):
         args = glm.ModelArgs.from_dict(TINY_CFG)
@@ -221,6 +372,7 @@ class TestIndexerFusion:
             "mode": "affine",
             "model.layers.0.self_attn.indexer.wk": dict(q8),
             "model.layers.0.self_attn.indexer.weights_proj": dict(q8),
+            "model.layers.0.self_attn.indexer.wq_b": dict(q8),
         }
         args = glm.ModelArgs.from_dict(cfg)
         model = glm.Model(args)
@@ -250,6 +402,48 @@ class TestIndexerFusion:
             hd + nh,
             4,
         )
+
+    def test_mixed_q5_q8_indexers_fail_instead_of_silent_split(self, glm):
+        q5 = {"bits": 5, "group_size": 64, "mode": "affine"}
+        q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = dict(
+            TINY_CFG,
+            num_nextn_predict_layers=0,
+            indexer_types=["full", "full"],
+            quantization={
+                "group_size": 64,
+                "bits": 3,
+                "mode": "affine",
+                **{
+                    f"model.layers.0.self_attn.indexer.{name}": dict(q5)
+                    for name in ("wq_b", "wk", "weights_proj")
+                },
+                **{
+                    f"model.layers.1.self_attn.indexer.{name}": dict(q8)
+                    for name in ("wq_b", "wk", "weights_proj")
+                },
+            },
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        with pytest.raises(
+            ValueError,
+            match="Invalid GLM DSA indexer quantization.*5-bit",
+        ):
+            glm.Model(args)
+
+    def test_uniform_non_q8_indexers_keep_supported_split_path(self, glm):
+        cfg = dict(
+            TINY_CFG,
+            num_nextn_predict_layers=0,
+            indexer_types=["full", "full"],
+            quantization={"group_size": 64, "bits": 5, "mode": "affine"},
+        )
+        model = glm.Model(glm.ModelArgs.from_dict(cfg))
+        for layer in model.model.layers:
+            indexer = layer.self_attn.indexer
+            assert indexer.wk is not None
+            assert indexer.weights_proj is not None
+            assert indexer.wk_weights_proj is None
 
 
 class TestForward:

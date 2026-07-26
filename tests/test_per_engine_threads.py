@@ -375,3 +375,74 @@ class TestConcurrentStreamIsolation:
 
         from omlx.scheduler import _default_generation_stream as current
         assert id(current) == original_id
+
+
+class TestPrefixCacheReconstructStream:
+    """Prefix cache reconstruction must run on the per-engine stream.
+
+    Unwrapped, the reconstruct chain binds its lazy mx ops to the worker
+    thread's default stream (gpu,0) while the prefill forward consumes them
+    inside mx.stream(self._stream) — a cross-stream fence that can wedge
+    permanently under MLX_METAL_FAST_SYNCH=1 when the async store-cache
+    worker keeps gpu,0 busy (issue #2330).
+    """
+
+    def test_prepare_prefix_cache_runs_on_engine_stream(self):
+        observed_streams = []
+
+        model = MagicMock()
+        model.model_type = "test"
+        model.layers = []
+
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+
+        stream = mx.new_thread_local_stream(mx.default_device())
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                max_num_seqs=8,
+                prefill_step_size=2048,
+                paged_cache_block_size=0,
+            ),
+            stream=stream,
+        )
+        mock_bg = MagicMock()
+        mock_bg.insert.return_value = [42]
+        scheduler.batch_generator = mock_bg
+        scheduler._current_sampler_params = ()
+
+        class RecordingBlockAwareCache:
+            def fetch_cache(self, request_id, prompt_token_ids, **kwargs):
+                observed_streams.append(mx.default_stream(mx.gpu))
+                return None, list(prompt_token_ids)
+
+        scheduler.block_aware_cache = RecordingBlockAwareCache()
+
+        request = Request(
+            request_id="reconstruct-stream",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        scheduler.add_request(request)
+
+        def run_admission():
+            worker_default = mx.default_stream(mx.gpu)
+            with mx.stream(stream):
+                expected_engine_stream = mx.default_stream(mx.gpu)
+            with patch.object(
+                scheduler, "_do_external_prefill", return_value=([], [0])
+            ):
+                scheduler._schedule_waiting()
+            return worker_default, expected_engine_stream
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            worker_default, expected_engine_stream = executor.submit(
+                run_admission
+            ).result()
+
+        assert observed_streams == [expected_engine_stream]
+        assert expected_engine_stream != worker_default

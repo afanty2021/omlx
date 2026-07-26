@@ -20,6 +20,7 @@ from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     EntryNotFoundError,
     GatedRepoError,
+    HfHubHTTPError,
     RepositoryNotFoundError,
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
@@ -164,6 +165,27 @@ def _get_hf_api() -> tuple[HfApi, str | None]:
     return HfApi(), None
 
 
+def _list_models_stale_token_fallback(api: HfApi, kwargs: dict) -> tuple[list, bool]:
+    """Drain list_models, retrying anonymously when the stored token is rejected.
+
+    huggingface_hub attaches the locally stored credential (HF_TOKEN env var or
+    the hf auth login token file) to every request, so a stale token 401s even
+    the public model listing (#2276, #2310). Listing needs no auth, so retry
+    once with token=False and report the rejected token to the caller.
+    """
+    try:
+        return list(api.list_models(**kwargs)), False
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 401:
+            raise
+        logger.warning(
+            "HF model listing rejected the stored token (401): %s. "
+            "Retrying anonymously.",
+            e,
+        )
+        return list(api.list_models(token=False, **kwargs)), True
+
+
 class DownloadStatus(str, enum.Enum):
     """Status of a download task."""
 
@@ -302,11 +324,13 @@ class HFDownloader:
             mlx_only: If True, restrict to mlx-community author.
 
         Returns:
-            Dict with 'trending' and 'popular' lists.
+            Dict with 'trending' and 'popular' lists, plus 'hf_token_invalid'
+            set when the stored HF token was rejected and the listing was
+            fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
 
-        async def _fetch(sort: str) -> list[dict]:
+        async def _fetch(sort: str) -> tuple[list[dict], bool]:
             kwargs = {
                 "sort": sort,
                 "limit": limit,
@@ -314,8 +338,10 @@ class HFDownloader:
             }
             if mlx_only:
                 kwargs["author"] = "mlx-community"
-            models = await asyncio.wait_for(
-                asyncio.to_thread(api.list_models, **kwargs),
+            # list_models returns a lazy generator; drain it inside the worker
+            # thread so the paginated HTTP calls never block the event loop.
+            models, token_rejected = await asyncio.wait_for(
+                asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                 timeout=_HF_API_TIMEOUT,
             )
             results = []
@@ -344,16 +370,19 @@ class HFDownloader:
                         ),
                     }
                 )
-            return results
+            return results, token_rejected
 
-        trending, popular = await asyncio.gather(
-            _fetch("trendingScore"),
-            _fetch("downloads"),
+        (trending, trending_rejected), (popular, popular_rejected) = (
+            await asyncio.gather(
+                _fetch("trendingScore"),
+                _fetch("downloads"),
+            )
         )
 
         return {
             "trending": trending[:result_limit],
             "popular": popular[:result_limit],
+            "hf_token_invalid": trending_rejected or popular_rejected,
         }
 
     @staticmethod
@@ -389,7 +418,9 @@ class HFDownloader:
             sort_ascending: Sort in ascending order (for size/params sorting).
 
         Returns:
-            Dict with 'models' list and 'total' count.
+            Dict with 'models' list and 'total' count, plus 'hf_token_invalid'
+            set when the stored HF token was rejected and the listing was
+            fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
 
@@ -409,8 +440,10 @@ class HFDownloader:
         if mlx_only:
             kwargs["filter"] = "mlx"
 
-        models = await asyncio.wait_for(
-            asyncio.to_thread(api.list_models, **kwargs),
+        # list_models returns a lazy generator; drain it inside the worker
+        # thread so the paginated HTTP calls never block the event loop.
+        models, token_rejected = await asyncio.wait_for(
+            asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
             timeout=_HF_API_TIMEOUT,
         )
 
@@ -467,6 +500,7 @@ class HFDownloader:
         return {
             "models": results[:limit],
             "total": len(results),
+            "hf_token_invalid": token_rejected,
         }
 
     @staticmethod

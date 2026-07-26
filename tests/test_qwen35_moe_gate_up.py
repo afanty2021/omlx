@@ -90,6 +90,54 @@ def test_fused_output_bit_exact(quantize):
         assert mx.array_equal(ref, out).item()
 
 
+def test_laguna_family_fused_bit_exact():
+    """The vendored laguna model fuses its nvfp4 SwitchGLU experts."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        model_type="laguna",
+        vocab_size=256,
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        layer_types=["full_attention", "full_attention"],
+        mlp_only_layers=[],
+        num_experts=E,
+        num_experts_per_tok=TOPK,
+        moe_intermediate_size=INTER,
+        shared_expert_intermediate_size=INTER,
+    )
+    mx.random.seed(11)
+    model = laguna.Model(args)
+    for layer in model.model.layers:
+        sw = layer.mlp.switch_mlp
+        sw.gate_proj = sw.gate_proj.to_quantized(16, 4, mode="nvfp4")
+        sw.up_proj = sw.up_proj.to_quantized(16, 4, mode="nvfp4")
+        sw.down_proj = sw.down_proj.to_quantized(16, 4, mode="nvfp4")
+
+    x = mx.array([[3, 1, 4, 1, 5]])
+    ref = model(x)
+    mx.eval(ref)
+
+    fused = apply_qwen35_moe_gate_up_fusion(model)
+    assert fused == 2
+    for layer in model.model.layers:
+        assert hasattr(layer.mlp.switch_mlp, "gate_up_proj")
+        assert layer.mlp.switch_mlp.gate_up_proj.mode == "nvfp4"
+
+    out = model(x)
+    mx.eval(out)
+    assert mx.array_equal(ref, out).item()
+
+
 def test_env_kill_switch(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_MOE_GATE_UP", "0")
     model = _make_model()

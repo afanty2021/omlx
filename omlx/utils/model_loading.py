@@ -129,6 +129,45 @@ def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_laguna_compressed_quant(cfg: dict) -> dict:
+    """Map Laguna compressed-tensors metadata to mlx-lm quantization settings.
+
+    mlx-lm's legacy compressed-tensors handling assumes int4 affine
+    ``{group_size: 32, bits: 4}``, which is wrong for Laguna's float-quantized
+    (FP8) and nvfp4-pack-quantized checkpoints. Setting
+    ``config["quantization"]`` short-circuits that legacy branch; the vendored
+    Laguna ``sanitize`` converts the tensors to match these settings.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") != "laguna":
+        return cfg
+    if isinstance(cfg.get("quantization"), dict):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict) or qc.get("quant_method") != "compressed-tensors":
+        return cfg
+
+    group = qc.get("config_groups", {}).get("group_0", {})
+    fmt = qc.get("format") or group.get("format")
+    weights = group.get("weights") or {}
+    if fmt == "float-quantized":
+        # FP8 block weights are requantized to 8-bit affine by sanitize.
+        cfg["quantization"] = {"group_size": 64, "bits": 8}
+    elif fmt == "nvfp4-pack-quantized":
+        cfg["quantization"] = {
+            "group_size": weights.get("group_size", 16),
+            "bits": weights.get("num_bits", 4),
+            "mode": "nvfp4",
+        }
+    elif fmt == "pack-quantized":
+        cfg["quantization"] = {
+            "group_size": weights.get("group_size", 32),
+            "bits": weights.get("num_bits", 4),
+        }
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -146,6 +185,7 @@ def _patch_mlx_lm_load_config() -> None:
         cfg = _original(model_path, *args, **kwargs)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
+        normalize_laguna_compressed_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
@@ -272,6 +312,14 @@ def maybe_apply_pre_load_patches(
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
+    if model_type == "laguna":
+        # MLX-LM dynamically imports the architecture and tokenizer-configured
+        # parser during ``lm_load_compat``; register both before that load starts.
+        from ..patches.laguna import apply_laguna_patch
+
+        if apply_laguna_patch():
+            logger.info("Laguna pre-load patch applied for %s", model_name)
+
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
 
@@ -315,6 +363,17 @@ def maybe_apply_pre_load_patches(
         if apply_minimax_m3_sparse_attention_patch():
             logger.info(
                 "MiniMax M3 sparse attention patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "unlimited-ocr":
+        from ..patches.mlx_vlm_unlimited_ocr_compat import (
+            apply_mlx_vlm_unlimited_ocr_compat_patch,
+        )
+
+        if apply_mlx_vlm_unlimited_ocr_compat_patch():
+            logger.info(
+                "Unlimited-OCR mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
 

@@ -1478,6 +1478,117 @@ class TestEnginePoolEviction:
                 await pool.get_engine("model-b")
 
 
+class TestAdmissionSoftTargetEviction:
+    """#2319: idle-model eviction starts at the soft watermark, before load.
+
+    Admitting a second model into the soft..ceiling band kept both models
+    resident through the load (hard-pressure swap for minutes) only for
+    the first request's prefill guard to evict the old one anyway.
+    Eviction must fire once the projected total exceeds the soft target;
+    refusing a load still requires exceeding the ceiling.
+    """
+
+    @pytest.fixture
+    def soft_band_pool(self, small_mock_model_dir, monkeypatch):
+        """Pool where model-a + model-b land between soft target and ceiling.
+
+        Estimated sizes: model-a = 1075 (1024 * 1.05 overhead), model-b =
+        2150. With model-a resident, loading model-b projects 3225 bytes:
+        over the 2500 soft target, under the 4000 ceiling.
+        """
+        pool = _make_pool(ceiling=4000)
+        pool._get_admission_soft_target = lambda: 2500
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_soft_band_swap_evicts_idle_model_before_load(
+        self, soft_band_pool
+    ):
+        """Projected total in the soft..ceiling band must evict the idle
+        LRU model before the new one loads, not admit both."""
+        pool = soft_band_pool
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+        mock_engine_a.has_active_requests.return_value = False
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests.return_value = False
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return mock_engine_a if "model-a" in name else mock_engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            assert pool.loaded_model_count == 1
+
+            await pool.get_engine("model-b")
+
+        mock_engine_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert pool.loaded_model_count == 1
+
+    @pytest.mark.asyncio
+    async def test_over_soft_with_nothing_evictable_admits_under_ceiling(
+        self, soft_band_pool, caplog
+    ):
+        """The soft target only decides when eviction starts; with no idle
+        victim a load that fits the ceiling must still be admitted."""
+        pool = soft_band_pool
+        pool._entries["model-a"].is_pinned = True
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            with caplog.at_level(logging.INFO, logger="omlx.engine_pool"):
+                await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        assert any(
+            "above the admission soft target" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_pair_under_soft_target_keeps_both_loaded(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """No eviction when the projected total stays under the soft target."""
+        pool = _make_pool(ceiling=8000)
+        pool._get_admission_soft_target = lambda: 4000
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        assert pool.loaded_model_count == 2
+
+
 class TestGuardOffBestEffortAdmission:
     """#2290: model-swap eviction must survive disabling the memory guard.
 

@@ -69,6 +69,24 @@ _HEADROOM_PROVIDER: "weakref.WeakMethod | None" = None
 # OMLX_SDPA256_TILED override, parsed at apply time: True = always tiled,
 # False = never tiled, None = memory-aware auto.
 _FORCE_TILED: bool | None = None
+# Tiled-route reasons already logged. The tiled pass trades substantial
+# prefill throughput at long kv_len for O(L) memory, and nothing surfaced the
+# route decision before (issue #2283 took an A/B repro to diagnose), so the
+# first engagement per reason logs at INFO; repeats stay silent to keep the
+# hot path quiet.
+_TILED_ROUTE_LOGGED: "set[str]" = set()
+
+
+def _note_tiled_route(reason: str, detail: str) -> None:
+    if reason in _TILED_ROUTE_LOGGED:
+        return
+    _TILED_ROUTE_LOGGED.add(reason)
+    logger.info(
+        "sdpa256: head-dim-256 prefill taking the tiled (memory-safe, slower) "
+        "path: %s. The unfused fast path resumes when guard headroom allows; "
+        "OMLX_SDPA256_TILED=1/0 forces the route.",
+        detail,
+    )
 
 
 def set_unfused_headroom_provider(method) -> None:
@@ -96,13 +114,25 @@ def _tiled_route_required(queries, keys) -> bool:
     transient would not fit under the guard ceiling — or when no headroom
     info is available, keeping the memory-safe #2025 behavior."""
     if _FORCE_TILED is not None:
+        if _FORCE_TILED:
+            _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
         return _FORCE_TILED
     try:
         provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
         if provider is None:
+            _note_tiled_route(
+                "no-provider",
+                "no guard headroom provider registered "
+                "(engine without a scheduler, or scheduler gone)",
+            )
             return True
         headroom = provider()
         if headroom is None or headroom < 0:
+            _note_tiled_route(
+                "no-ceiling",
+                "memory ceiling not available (enforcer state not yet "
+                "propagated)",
+            )
             return True
         batch, n_q, q_len, _ = queries.shape
         transient = estimate_unfused_sdpa_call_bytes(
@@ -112,8 +142,18 @@ def _tiled_route_required(queries, keys) -> bool:
             HEAD_DIM,
             score_dtype_size=queries.dtype.size,
         )
-        return transient > headroom
+        if transient > headroom:
+            _note_tiled_route(
+                "insufficient-headroom",
+                f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
+                f"guard headroom ~{headroom / 2**20:.0f}MiB at "
+                f"kv_len={keys.shape[-2]}",
+            )
+            return True
+        return False
     except Exception:
+        _note_tiled_route("probe-error", "guard headroom probe failed")
+        logger.debug("sdpa256 headroom probe failed", exc_info=True)
         return True  # headroom info unavailable -> memory-safe default
 
 

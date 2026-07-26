@@ -438,6 +438,12 @@ def _is_lfm2_text_lm(model_name: str) -> bool:
     )
 
 
+def _is_laguna_model(model_name: str) -> bool:
+    """Return True only for a local checkpoint declaring ``model_type: laguna``."""
+    config = _read_json_file(Path(model_name) / "config.json")
+    return config is not None and config.get("model_type") == "laguna"
+
+
 def get_tokenizer_config(
     model_name: str,
     trust_remote_code: bool = False,
@@ -487,6 +493,18 @@ def get_tokenizer_config(
     if ("Qwen3.5" in model_name or "Qwen3.6" in model_name) and "A3B" in model_name:
         config["tokenizer_class"] = "Qwen2Tokenizer"
         logger.debug(f"{model_name}: overriding tokenizer_class to Qwen2Tokenizer")
+
+    if _is_laguna_model(model_name):
+        # Laguna's Mistral-derived tokenizer ships the legacy regex that
+        # Transformers identifies as tokenization-incorrect without this flag.
+        config["fix_mistral_regex"] = True
+        # mlx-lm's template sniffing sees Laguna's <arg_key> markers and picks
+        # the glm47 parser; pin the vendored Laguna parser instead.
+        config.setdefault("tool_parser_type", "laguna")
+        logger.debug(
+            "Laguna detected: enabling the Mistral tokenizer regex fix and "
+            "the laguna tool parser"
+        )
 
     return config
 

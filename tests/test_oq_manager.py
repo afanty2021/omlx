@@ -76,6 +76,47 @@ class TestOQManagerUpdateModelDirs:
         assert manager._output_dir == second_fp_model_dir
 
 
+class TestOQManagerMxfp8Discovery:
+    @pytest.mark.asyncio
+    async def test_mxfp8_source_is_available_for_quantization(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        model = root / "MiniMax-M3-MXFP8"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "minimax_m3_vl",
+                    "text_config": {
+                        "num_hidden_layers": 60,
+                        "num_local_experts": 128,
+                        "num_mtp_modules": 1,
+                    },
+                    "vision_config": {"num_hidden_layers": 32},
+                    "quantization_config": {
+                        "quant_method": "mxfp8",
+                        "activation_scheme": "dynamic",
+                        "weight_block_size": [1, 32],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+
+        manager = OQManager(model_dirs=[str(root)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert [entry["name"] for entry in source_models] == ["MiniMax-M3-MXFP8"]
+        assert source_models[0]["is_quantized"] is False
+        assert source_models[0]["is_vlm"] is True
+        # The published checkpoint advertises this training metadata but has
+        # no MTP/nextn tensors, so it must not offer fake MTP preservation.
+        assert source_models[0]["has_mtp_heads"] is False
+        assert source_models[0]["num_layers"] == 60
+        assert [entry["name"] for entry in all_models] == ["MiniMax-M3-MXFP8"]
+
+
 class TestOQManagerMtpDetection:
     def _write_model(self, root, name, *, index_weight_map=None):
         model = root / name
