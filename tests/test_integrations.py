@@ -1,16 +1,18 @@
 """Tests for the integrations module."""
 
 import json
+import plistlib
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.base import IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
-from omlx.integrations.codex_app import CodexAppIntegration
+from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
@@ -243,6 +245,23 @@ name = "old-omlx"
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
 
+def make_app_bundle(
+    root: Path, name: str, bundle_id: str, with_cli: bool = True
+) -> Path:
+    """Create a fake macOS app bundle with an Info.plist and optional CLI."""
+    contents = root / name / "Contents"
+    contents.mkdir(parents=True)
+    with (contents / "Info.plist").open("wb") as f:
+        plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+    if with_cli:
+        resources = contents / "Resources"
+        resources.mkdir()
+        cli = resources / "codex"
+        cli.write_text("#!/bin/sh\n")
+        cli.chmod(0o755)
+    return root / name
+
+
 class TestCodexAppIntegration:
     def test_get_command(self):
         codex_app = CodexAppIntegration()
@@ -282,6 +301,10 @@ class TestCodexAppIntegration:
             patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
             patch("omlx.integrations.codex_app.os.environ", base_env),
             patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
+            patch(
+                "omlx.integrations.codex_app.resolve_codex_binary",
+                return_value="/opt/homebrew/bin/codex",
+            ),
         ):
             codex_app.launch(
                 ctx(
@@ -293,11 +316,68 @@ class TestCodexAppIntegration:
             )
 
         # Codex App should launch with "app" subcommand, not "-m <model>"
-        assert captured["argv"] == ["codex", "app"]
+        assert captured["argv"] == ["/opt/homebrew/bin/codex", "app"]
         assert captured["env"]["OMLX_API_KEY"] == "key"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+    def test_is_installed_with_app_bundle_only(self, tmp_path):
+        # DMG-only install: no codex CLI on PATH, old bundle folder name
+        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert find_codex_app_bundle() == bundle
+            assert CodexAppIntegration().is_installed()
+
+    def test_is_installed_with_renamed_chatgpt_bundle(self, tmp_path):
+        # Post-rename fresh install: ChatGPT.app folder, codex bundle id
+        make_app_bundle(tmp_path, "ChatGPT.app", "com.openai.codex")
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert CodexAppIntegration().is_installed()
+
+    def test_legacy_chatgpt_chat_app_not_matched(self, tmp_path):
+        # The old ChatGPT chat app has a different bundle id and no codex CLI
+        make_app_bundle(tmp_path, "ChatGPT.app", "com.openai.chat")
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert find_codex_app_bundle() is None
+            assert not CodexAppIntegration().is_installed()
+
+    def test_not_installed_without_cli_or_bundle(self, tmp_path):
+        with (
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+        ):
+            assert not CodexAppIntegration().is_installed()
+
+    def test_launch_falls_back_to_bundled_cli(self, tmp_path):
+        bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
+        config_path = tmp_path / "codex" / "config.toml"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+
+        with (
+            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.codex_app.shutil.which", return_value=None),
+            patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
+            patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
+        ):
+            CodexAppIntegration().launch(ctx(port=8000, api_key="key", model="q"))
+
+        bundled = str(bundle / "Contents" / "Resources" / "codex")
+        assert captured["binary"] == bundled
+        assert captured["argv"] == [bundled, "app"]
 
     def test_type(self):
         codex_app = CodexAppIntegration()
@@ -1262,11 +1342,184 @@ class TestClaudeCodeIntegration:
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
         # Bundled-python vars must be stripped so claude code subprocess hooks
         # don't inherit our cpython-3.11 stack.
         assert "PYTHONHOME" not in env
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_model_disabled_reason_below_48k(self):
+        cc = ClaudeCodeIntegration()
+
+        reason = cc.model_disabled_reason(
+            {"id": "small-model", "max_context_window": 32768}
+        )
+
+        assert reason is not None
+        assert "at least 48K" in reason
+        assert "32,768" in reason
+
+    def test_model_disabled_reason_allows_48k(self):
+        cc = ClaudeCodeIntegration()
+
+        assert (
+            cc.model_disabled_reason(
+                {"id": "supported-model", "max_context_window": 49152}
+            )
+            is None
+        )
+
+    def test_select_model_rejects_disabled_choice(self, capsys):
+        cc = ClaudeCodeIntegration()
+
+        with (
+            patch("omlx.integrations.base.sys.stdout.isatty", return_value=False),
+            patch("builtins.input", side_effect=["1", "2"]),
+        ):
+            selected = cc.select_model(
+                [
+                    {"id": "small-model", "max_context_window": 32768},
+                    {"id": "supported-model", "max_context_window": 49152},
+                ]
+            )
+
+        assert selected == "supported-model"
+        output = capsys.readouterr().out
+        assert "small-model" in output
+        assert "unavailable" in output
+        assert "Cannot select small-model" in output
+
+    def test_launch_rejects_max_context_tokens_below_48k(self, capsys):
+        cc = ClaudeCodeIntegration()
+
+        with pytest.raises(SystemExit) as exc:
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5-32k",
+                    context_window=32768,
+                )
+            )
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert "Cannot launch Claude Code" in output
+        assert "at least 48K" in output
+
+    def test_launch_sets_max_context_tokens_48k(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                    sonnet_model="mlx-community/Qwen3-30B-A3B-4bit",
+                    context_window=49152,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "49152"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "49152"
+
+    def test_launch_sets_max_context_tokens_64k(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                    sonnet_model="mlx-community/Qwen3-30B-A3B-4bit",
+                    context_window=65536,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "65536"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
+
+    def test_launch_sets_max_context_tokens_for_canonical_claude_alias(self):
+        """oMLX always sets CLAUDE_CODE_MAX_CONTEXT_TOKENS the same way
+        regardless of the configured model name — whether Claude Code's own
+        CLI then honors it for a "claude-*"-canonicalized model name is that
+        binary's internal behavior (confirmed live: it does not, for names
+        that canonicalize to "claude-*"), not something this integration can
+        special-case. This only guards that oMLX's side of the contract is
+        unconditional."""
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="claude-3-5-sonnet-20241022",
+                    sonnet_model="claude-3-5-sonnet-20241022",
+                    context_window=131072,
+                )
+            )
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
+        assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+
+    def test_launch_omits_max_context_tokens_when_context_window_unset(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                )
+            )
+
+        env = captured["env"]
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
+        assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env
 
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()

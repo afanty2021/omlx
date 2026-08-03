@@ -268,6 +268,12 @@ class SchedulerSettings:
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
+    # What the prefill memory guard optimizes under pressure:
+    #   "context" (default) — shrink prefill steps down to the floor so the
+    #     largest possible prompt still completes (slower near the ceiling).
+    #   "speed" — never shrink; keep full-size steps and only admit prompts
+    #     that fit at full speed (smaller effective context limit).
+    prefill_priority: str = "context"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -285,10 +291,14 @@ class SchedulerSettings:
         if value is None:
             value = 8
         embedding_batch_size = data.get("embedding_batch_size", 32)
+        prefill_priority = data.get("prefill_priority", "context")
+        if prefill_priority not in ("context", "speed"):
+            prefill_priority = "context"
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            prefill_priority=prefill_priority,
         )
 
 
@@ -685,8 +695,6 @@ class UISettings:
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
-    context_scaling_enabled: bool = False
-    target_context_size: int = 200000  # Claude Code default (200k)
     # Mode: "cloud" = native claude.ai subscription, "local" = route through omlx.
     # Default is "cloud" so upgrades don't silently route traffic to omlx.
     mode: str = "cloud"
@@ -697,8 +705,6 @@ class ClaudeCodeSettings:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "context_scaling_enabled": self.context_scaling_enabled,
-            "target_context_size": self.target_context_size,
             "mode": self.mode,
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
@@ -709,8 +715,6 @@ class ClaudeCodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
         return cls(
-            context_scaling_enabled=data.get("context_scaling_enabled", False),
-            target_context_size=data.get("target_context_size", 200000),
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
@@ -1025,7 +1029,7 @@ class GlobalSettings:
                 markitdown_pdf_processing_engine.strip() or "markitdown"
             )
 
-    def _apply_cli_overrides(self, args: Any) -> None:
+    def _apply_cli_overrides(self, args: Any, *, include_api_key: bool = True) -> None:
         """
         Apply CLI argument overrides.
 
@@ -1059,28 +1063,54 @@ class GlobalSettings:
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
 
-        # Memory guard settings
+        # Memory guard settings. Naming a tier or a ceiling on the command
+        # line also turns the guard on. With a saved
+        # ``prefill_memory_guard: false`` these flags used to be a silent
+        # no-op — the enforcer reports a ceiling of 0 with the guard off, so
+        # the tier the user asked for governed nothing.
         if hasattr(args, "memory_guard") and args.memory_guard is not None:
-            self.memory.memory_guard_tier = args.memory_guard
+            if args.memory_guard == "off":
+                self.memory.prefill_memory_guard = False
+            else:
+                self.memory.memory_guard_tier = args.memory_guard
+                self.memory.prefill_memory_guard = True
         if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
             self.memory.memory_guard_tier = "custom"
             self.memory.memory_guard_custom_ceiling_gb = float(args.memory_guard_gb)
+            self.memory.prefill_memory_guard = True
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
             self.cache.enabled = args.cache_enabled
-        if hasattr(args, "ssd_cache_dir") and args.ssd_cache_dir is not None:
-            self.cache.ssd_cache_dir = args.ssd_cache_dir
-        if hasattr(args, "ssd_cache_max_size") and args.ssd_cache_max_size is not None:
-            self.cache.ssd_cache_max_size = args.ssd_cache_max_size
+
+        # ``paged_ssd_cache_*`` are the public CLI names. Keep the older
+        # internal names as fallbacks for callers that still build a namespace
+        # directly.
+        paged_cache_dir = getattr(args, "paged_ssd_cache_dir", None)
+        if paged_cache_dir is not None:
+            self.cache.ssd_cache_dir = paged_cache_dir
+            self.cache.enabled = True
+        elif (cache_dir := getattr(args, "ssd_cache_dir", None)) is not None:
+            self.cache.ssd_cache_dir = cache_dir
+
+        cache_max_size = getattr(args, "paged_ssd_cache_max_size", None)
+        if cache_max_size is None:
+            cache_max_size = getattr(args, "ssd_cache_max_size", None)
+        if cache_max_size is not None:
+            self.cache.ssd_cache_max_size = cache_max_size
+
+        if hasattr(args, "hot_cache_max_size") and args.hot_cache_max_size is not None:
+            self.cache.hot_cache_max_size = args.hot_cache_max_size
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
         ):
             self.cache.initial_cache_blocks = args.initial_cache_blocks
+        if getattr(args, "no_cache", False):
+            self.cache.enabled = False
 
         # Auth settings
-        if hasattr(args, "api_key") and args.api_key is not None:
+        if include_api_key and hasattr(args, "api_key") and args.api_key is not None:
             self.auth.api_key = args.api_key
 
         # MCP settings
@@ -1172,12 +1202,27 @@ class GlobalSettings:
         }
 
         try:
-            with open(settings_file, "w", encoding="utf-8") as f:
+            if os.name == "posix" and settings_file.exists():
+                settings_file.chmod(0o600)
+            with os.fdopen(
+                os.open(settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(data, f, indent=2)
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
             raise
+
+    def save_cli_overrides(self, args: Any) -> None:
+        """Persist explicit non-secret CLI configuration without freezing env state."""
+        persisted = type(self)(base_path=self.base_path)
+        settings_file = self.base_path / "settings.json"
+        if settings_file.exists():
+            persisted._load_from_file(settings_file)
+        persisted._apply_cli_overrides(args, include_api_key=False)
+        persisted.save()
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
@@ -1346,11 +1391,6 @@ class GlobalSettings:
             )
 
         # Claude Code validation
-        if self.claude_code.target_context_size <= 0:
-            errors.append(
-                f"Invalid target_context_size: "
-                f"{self.claude_code.target_context_size} (must be > 0)"
-            )
         valid_modes = {"local", "cloud"}
         if self.claude_code.mode not in valid_modes:
             errors.append(
@@ -1423,6 +1463,7 @@ class GlobalSettings:
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
+            prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

@@ -56,8 +56,11 @@ dependencies = [
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     # Keep <5.13 until the broader dependency set gets a dedicated resolver
     # smoke test with transformers 5.13+. The mlx-lm pin above includes the
-    # known NewlineTokenizer registration fix.
-    "transformers>=5.7.0,<5.13",
+    # known NewlineTokenizer registration fix. Floor 5.12.1: AutoTokenizer's
+    # fix_mistral_regex backend gate (used by get_tokenizer_config for
+    # mistral-common models) first shipped in 5.12.1 — on older 5.x the kwarg
+    # is silently swallowed and Tekken prompts stay corrupted.
+    "transformers>=5.12.1,<5.13",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -112,16 +115,24 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10 (9ca0028) - bstnxbt repo. Apple G17 NAX verify,
-    # prefix snapshot metrics, CopySpec mode, and full-context draft-layer cache checks.
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@9ca002898b48e14c9727dec17299f497e8467870",
+    # dflash-mlx v0.1.10+omlx.3 (474f8e1) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
+    # fired upstream) and the single-host-sync decode cycle (one D2H transfer
+    # per cycle instead of four syncs plus a hard eval). Also supports current
+    # Gemma 4 unified target exports.
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@474f8e1ba95864f5bb0759cd1b9a13c80abc5ce3",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
 [project.optional-dependencies]
 grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
-    "xgrammar>=0.1.32",
+    # Keep this native pair aligned with omlx/_torch_stub.py and the DMG
+    # build. xgrammar 0.2.3 crashes at import with apache-tvm-ffi 0.1.13
+    # on macOS arm64, so an open-ended resolver can break Homebrew installs
+    # without any oMLX source change (#2428).
+    "xgrammar==0.2.3",
+    "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
     "mcp>=1.5.0",
@@ -188,7 +199,7 @@ dev = [
     # in the dev environment so the test actually runs.
     #
     # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
-    # which conflicts with our transformers>=5.7.0 pin and makes
+    # which conflicts with our transformers>=5.12.1 pin and makes
     # pip/uv dev installs unresolvable (#2289). Bump again once
     # upstream lifts the cap.
     "xgrammar==0.2.3",
@@ -227,7 +238,12 @@ include = ["omlx*"]
 
 [tool.setuptools.package-data]
 "omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
-"omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
+"omlx.admin" = [
+    "templates/**/*.html",
+    "static/**/*",
+    "i18n/*.json",
+    "bench_corpora/*",
+]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]

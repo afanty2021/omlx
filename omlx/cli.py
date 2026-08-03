@@ -38,37 +38,34 @@ def _has_cli_overrides(args) -> bool:
     All argparse defaults are None, so `is not None` means the user
     explicitly passed the flag on the command line.
     """
-    if hasattr(args, "model_dir") and args.model_dir is not None:
+    persisted_fields = (
+        "model_dir",
+        "port",
+        "host",
+        "log_level",
+        "sse_keepalive_mode",
+        "max_concurrent_requests",
+        "embedding_batch_size",
+        "memory_guard",
+        "memory_guard_gb",
+        "paged_ssd_cache_dir",
+        "paged_ssd_cache_max_size",
+        "hot_cache_max_size",
+        "initial_cache_blocks",
+        "mcp_config",
+        "hf_endpoint",
+        "hf_cache_enabled",
+        "ms_endpoint",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "ca_bundle",
+    )
+    if any(getattr(args, field, None) is not None for field in persisted_fields):
         return True
-    if hasattr(args, "port") and args.port is not None:
-        return True
-    if hasattr(args, "host") and args.host is not None:
-        return True
-    if hasattr(args, "log_level") and args.log_level is not None:
-        return True
-    if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
-        return True
-    if hasattr(args, "memory_guard") and args.memory_guard is not None:
-        return True
-    if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
-        return True
-    if hasattr(args, "mcp_config") and args.mcp_config is not None:
-        return True
-    if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
-        return True
-    if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
-        return True
-    if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
-        return True
-    if hasattr(args, "http_proxy") and args.http_proxy is not None:
-        return True
-    if hasattr(args, "https_proxy") and args.https_proxy is not None:
-        return True
-    if hasattr(args, "no_proxy") and args.no_proxy is not None:
-        return True
-    if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
-        return True
-    return False
+
+    # --no-cache is the only persistable boolean flag with a False default.
+    return bool(getattr(args, "no_cache", False))
 
 
 def serve_command(args):
@@ -177,7 +174,7 @@ def serve_command(args):
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
-            settings.save()
+            settings.save_cli_overrides(args)
             print("Saved CLI arguments to settings.json")
         except Exception as e:
             print(f"Warning: Failed to save settings: {e}")
@@ -239,7 +236,12 @@ def serve_command(args):
         model_dirs = settings.get_effective_model_dirs()
         print(f"Base path: {settings.base_path}")
         print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
-        print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
+        # State first: a bare tier line reads as "this is enforced" even when
+        # the guard is off, and with it off the tier governs nothing.
+        if settings.memory.prefill_memory_guard:
+            print(f"Memory guard: on (tier: {settings.memory.memory_guard_tier})")
+        else:
+            print("Memory guard: off")
 
         # Store MCP config path for FastAPI startup
         # Priority: CLI arg > settings.json
@@ -384,7 +386,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     # for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind targets
     # but not connectable — fall back to localhost in that case.
     first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
-    connect_host = first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    connect_host = (
+        first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    )
 
     # Check if oMLX server is running
     base_url = f"http://{connect_host}:{port}"
@@ -471,10 +475,45 @@ def launch_command(args, extra_args: list[str] | None = None):
     # If the model was chosen interactively (no --model and no explicit tier flags),
     # use the picked model for all tiers instead of letting settings-based tier
     # models override the user's selection.
-    if args.model is None and not (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+    if args.model is None and not (
+        cli_opus_model or cli_sonnet_model or cli_haiku_model
+    ):
         opus_model = None
         sonnet_model = None
         haiku_model = None
+
+    # Enforce Claude Code's model requirements after all interactive,
+    # automatic, and explicit model paths have resolved. The picker also marks
+    # disabled models, but this central check prevents --model and tier flags
+    # from bypassing the same restriction.
+    if tool_name == "claude":
+        from .integrations.claude import claude_code_model_disabled_reason
+
+        models_to_validate = [
+            ("", model),
+            ("Opus tier ", opus_model),
+            ("Sonnet tier ", sonnet_model),
+            ("Haiku tier ", haiku_model),
+        ]
+        validated_models: set[str] = set()
+        for role, model_id in models_to_validate:
+            if not model_id or model_id in validated_models:
+                continue
+            validated_models.add(model_id)
+            disabled_reason = claude_code_model_disabled_reason(
+                {"id": model_id, **models_status_map.get(model_id, {})}
+            )
+            if disabled_reason:
+                print(
+                    f"Cannot launch {integration.display_name} with "
+                    f"{role}model '{model_id}'."
+                )
+                print(disabled_reason)
+                print(
+                    "Choose a model with at least 48K context or increase its "
+                    "configured max_context_window."
+                )
+                sys.exit(1)
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
@@ -684,15 +723,15 @@ def diagnose_menubar() -> int:
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         print(f"Menubar app:    check failed ({e})")
 
-    # The Swift app writes `server.log` (stdout/stderr of the Python child).
-    # No separate menubar.log — visibility-probe lines are logged into the
-    # same file via OSLog.
+    # `menubar.log` is the Swift app's own visibility-probe log — every line
+    # in it is relevant. `server.log` is the Python child's stdout/stderr, so
+    # only lines that mention the menubar are worth pulling out of it.
     log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
-    log_candidates = [log_dir / "server.log"]
+    log_candidates = [(log_dir / "menubar.log", False), (log_dir / "server.log", True)]
     print(f"Log dir:        {log_dir}")
 
     hits: list[tuple[str, str]] = []
-    for path in log_candidates:
+    for path, needs_filter in log_candidates:
         if not path.exists():
             continue
         try:
@@ -705,13 +744,16 @@ def diagnose_menubar() -> int:
             print(f"Could not read {path.name}: {e}")
             continue
         for ln in tail.splitlines():
-            if (
+            if not ln.strip():
+                continue
+            if needs_filter and not (
                 "menubar visibility probe" in ln
                 or "NSStatusItem" in ln
                 or "ControlCenter" in ln
                 or "Menu Bar" in ln
             ):
-                hits.append((path.name, ln))
+                continue
+            hits.append((path.name, ln))
 
     if hits:
         print("\nRecent visibility log entries (last 10):")
@@ -722,15 +764,15 @@ def diagnose_menubar() -> int:
 
     print()
     print("If the icon is missing on macOS Tahoe (26.x):")
-    print("  1. Open System Settings > Menu Bar")
+    print("  1. In the oMLX app: Settings > Appearance > Menu Bar Icon > Restore")
+    print("  2. Or turn it back on in System Settings > Menu Bar")
     print(
         "     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'"
     )
-    print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
     print("  3. If oMLX isn't in the list, quit the app and relaunch oMLX.app")
     print()
-    print("Note: Apple's sandbox policy prevents third-party apps from")
-    print("programmatically re-enabling their own menubar visibility on Tahoe.")
+    print("Note: Restore edits ControlCenter's own StatusKit approval, which")
+    print("needs Full Disk Access. Without it, use the System Settings toggle.")
     return 0
 
 
@@ -856,15 +898,15 @@ Example directory structure:
     serve_parser.add_argument(
         "--memory-guard",
         type=str,
-        choices=["safe", "balanced", "aggressive"],
+        choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier. safe reserves more system memory; aggressive allows more oMLX memory use. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. safe reserves more system memory; aggressive allows more oMLX memory use. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
         type=_positive_float,
         default=None,
-        help="Custom memory guard ceiling in GB. Sets memory guard tier to custom.",
+        help="Custom memory guard ceiling in GB. Sets memory guard tier to custom and turns the guard on.",
     )
 
     # paged SSD cache options
@@ -1071,6 +1113,14 @@ Example directory structure:
         if extra_args:
             parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
         if args.command == "serve":
+            if (
+                getattr(args, "memory_guard", None) == "off"
+                and getattr(args, "memory_guard_gb", None) is not None
+            ):
+                parser.error(
+                    "--memory-guard off cannot be combined with "
+                    "--memory-guard-gb (a custom ceiling needs the guard on)"
+                )
             serve_command(args)
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))

@@ -778,7 +778,11 @@ class TestCacheMaterialization:
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         source = inspect.getsource(dsv4.DeepseekV4Model.__call__)
 
-        loop_pos = source.index("for layer, layer_cache in zip")
+        loop_pos = max(
+            source.find("for layer, layer_cache in zip"),
+            source.find("for layer_idx, (layer, layer_cache) in enumerate"),
+        )
+        assert loop_pos >= 0
         materialize_pos = source.index("_materialize_cache_arrays(cache)")
         pipeline_send_pos = source.index("if pipeline_rank != 0")
 
@@ -787,6 +791,56 @@ class TestCacheMaterialization:
 
 class TestDeepseekV4SwitchGLU:
     """DeepSeek-V4 SwitchGLU execution guards."""
+
+    def test_short_affine_route_restores_bfloat16_output(
+        self, applied_patch, monkeypatch
+    ):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        mx.random.seed(17)
+        layer = switch_layers.SwitchGLU(
+            input_dims=64,
+            hidden_dims=64,
+            num_experts=4,
+            bias=False,
+        )
+        for name in ("up_proj", "gate_proj", "down_proj"):
+            projection = getattr(layer, name).to_quantized(
+                group_size=64,
+                bits=2,
+                mode="affine",
+            )
+            projection.scales = projection.scales.astype(mx.float16)
+            projection.biases = projection.biases.astype(mx.float16)
+            setattr(layer, name, projection)
+
+        projection_input_dtypes = []
+        original_call = switch_layers.QuantizedSwitchLinear.__call__
+
+        def record_projection_input(projection, value, *args, **kwargs):
+            projection_input_dtypes.append(value.dtype)
+            return original_call(projection, value, *args, **kwargs)
+
+        monkeypatch.setattr(
+            switch_layers.QuantizedSwitchLinear,
+            "__call__",
+            record_projection_input,
+        )
+
+        x = mx.random.normal((1, 7, 64), dtype=mx.bfloat16)
+        indices = mx.array(
+            [[[0, 1, 2, 3, 0, 1]] * 7],
+            dtype=mx.int32,
+        )
+
+        assert indices.size < 64
+        y = layer(x, indices)
+        mx.eval(y)
+
+        assert y.shape == (1, 7, 6, 64)
+        assert y.dtype == mx.bfloat16
+        assert projection_input_dtypes == [mx.float16, mx.float16, mx.float16]
 
     def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
@@ -960,6 +1014,28 @@ class TestMakeQuantizationConfigMtp:
 
         qcfg = dsv4.make_quantization_config(_ModelStub())
         assert not any(k.startswith("mtp.") for k in qcfg)
+
+    def test_dspark_main_projection_gets_mxfp8(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _DSparkStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.main_proj = nn.Linear(24, 8, bias=False)
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp = [_DSparkStub()]
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        assert qcfg["mtp.0.main_proj"] == {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        }
 
 
 class TestDeepSeekV4SanitizeAffineSwitchMLP:
@@ -1196,8 +1272,14 @@ class TestPoolingCacheTrimRollback:
         self._push(cache, self._tok(verify), pos)
         assert cache.is_trimmable()
         assert cache.trim(1) == 1
-        self._push(ref, self._tok(verify[:1]), pos)
-        pos += 1
+        if cache_cls.__name__ == "BatchPoolingCache" and cache.pooled is not None:
+            # A rejected speculative token may have completed a pooled
+            # window.  The physical tail must be removed as well as hidden
+            # from the logical length; DSpark's M=1 verify path consumes the
+            # physical view directly.
+            assert cache.pooled.shape[1] == max(cache._pool_lengths)
+        self._push(ref, self._tok(verify[:-1]), pos)
+        pos += len(verify) - 1
 
         out = self._push(cache, self._tok(post), pos)
         ref_out = self._push(ref, self._tok(post), pos)
@@ -1293,6 +1375,31 @@ class TestPoolingCacheTrimRollback:
         # in the remainder buffer and no pooled row remains visible.
         assert cache.remainder == 3
         assert cache.size() == 0
+
+    def test_accepted_prefix_can_cross_pool_boundary(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # The four-row verify crosses the boundary on its first row. Keeping
+        # three rows must retain that pooled result and restore the two raw
+        # rows after it, exactly like three ordinary decode calls.
+        self._equivalence(
+            PoolingCache,
+            [[1.0, 2.0, 3.0]],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0],
+            applied_patch,
+        )
+
+    def test_singleton_batch_accepted_prefix_crosses_boundary(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        self._equivalence(
+            BatchPoolingCache,
+            [[1.0, 2.0, 3.0]],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0],
+            applied_patch,
+        )
 
 
 class TestNaxMoEStockRouting:

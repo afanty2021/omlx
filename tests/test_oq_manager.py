@@ -176,6 +176,44 @@ class TestOQManagerMtpDetection:
         assert model["has_mtp_heads"] is True
 
     @pytest.mark.asyncio
+    async def test_inkling_mtp_config_is_reported_as_preservable(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        model = root / "Inkling-Small"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "inkling_mm_model",
+                    "text_config": {
+                        "hidden_size": 4096,
+                        "num_hidden_layers": 42,
+                    },
+                    "vision_config": {},
+                    "mtp_config": {"num_nextn_predict_layers": 8},
+                }
+            )
+        )
+        (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+        (model / "mtp.safetensors").write_bytes(b"\x00" * 4096)
+        (model / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "model.mtp.layers.0.input_proj.weight": "mtp.safetensors",
+                    },
+                }
+            )
+        )
+
+        manager = OQManager(model_dirs=[str(root)])
+        source_models, _ = await manager.list_quantizable_models()
+
+        [model_info] = source_models
+        assert model_info["has_mtp_heads"] is True
+
+    @pytest.mark.asyncio
     async def test_start_quantization_disables_preserve_mtp_without_weights(
         self, tmp_path, monkeypatch
     ):
@@ -199,6 +237,319 @@ class TestOQManagerMtpDetection:
 
         assert task.preserve_mtp is False
         assert task.output_name == "QwenPawLike-oQ4"
+
+
+class TestOQManagerAssistantCombine:
+    """Gemma 4 assistant MTP combine wiring through start/run."""
+
+    def _write_gemma4_base(self, root):
+        model = root / "gemma-4-test"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "gemma4",
+                    "vision_config": {},
+                    "text_config": {"model_type": "gemma4_text", "hidden_size": 24},
+                }
+            )
+        )
+        (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+        return model
+
+    def _write_assistant(self, root, backbone_hidden=24):
+        model = root / "gemma-4-test-assistant"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "gemma4_assistant",
+                    "backbone_hidden_size": backbone_hidden,
+                    "text_config": {
+                        "model_type": "gemma4_text",
+                        "num_hidden_layers": 4,
+                    },
+                }
+            )
+        )
+        (model / "model.safetensors").write_bytes(b"\x00" * 512)
+        return model
+
+    @pytest.mark.asyncio
+    async def test_start_names_output_with_mtp_suffix(self, tmp_path, monkeypatch):
+        root = tmp_path / "models"
+        root.mkdir()
+        base = self._write_gemma4_base(root)
+        assistant = self._write_assistant(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        task = await manager.start_quantization(
+            str(base),
+            4,
+            mtp_assistant_model_path=str(assistant),
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.output_name == "gemma-4-test-oQ4-mtp"
+        assert task.mtp_assistant_model_path == str(assistant)
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_mismatched_assistant(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        base = self._write_gemma4_base(root)
+        assistant = self._write_assistant(root, backbone_hidden=32)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        with pytest.raises(ValueError, match="backbone_hidden_size"):
+            await manager.start_quantization(
+                str(base),
+                4,
+                mtp_assistant_model_path=str(assistant),
+            )
+        assert manager._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_run_invokes_combine_after_quantization(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "models"
+        root.mkdir()
+        base = self._write_gemma4_base(root)
+        assistant = self._write_assistant(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        def _fake_quantize(model_path, output_path, *args, **kwargs):
+            from pathlib import Path
+
+            Path(output_path).mkdir(parents=True)
+
+        combine_calls = []
+        monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
+        monkeypatch.setattr(
+            "omlx.oq.combine_mtp_into_output",
+            lambda out, asst: combine_calls.append((out, asst)),
+        )
+
+        task = await manager.start_quantization(
+            str(base),
+            4,
+            mtp_assistant_model_path=str(assistant),
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.status is QuantStatus.COMPLETED
+        assert combine_calls == [(task.output_path, str(assistant))]
+
+    @pytest.mark.asyncio
+    async def test_run_dispatches_gemma4_assistant_to_legacy_combine(
+        self, tmp_path, monkeypatch
+    ):
+        # The real dispatcher must route a gemma4_assistant donor to the
+        # legacy assistant merge.
+        root = tmp_path / "models"
+        root.mkdir()
+        base = self._write_gemma4_base(root)
+        assistant = self._write_assistant(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        def _fake_quantize(model_path, output_path, *args, **kwargs):
+            from pathlib import Path
+
+            Path(output_path).mkdir(parents=True)
+
+        legacy_calls = []
+        monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
+        monkeypatch.setattr(
+            "omlx.oq.combine_gemma4_assistant_mtp",
+            lambda out, asst: legacy_calls.append((out, asst)),
+        )
+
+        task = await manager.start_quantization(
+            str(base),
+            4,
+            mtp_assistant_model_path=str(assistant),
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.status is QuantStatus.COMPLETED
+        assert legacy_calls == [(task.output_path, str(assistant))]
+
+
+class TestOQManagerMtpDonorCombine:
+    """Native Qwen3.5/3.6 donor head graft wiring through start/run."""
+
+    _GEOMETRY = {
+        "vocab_size": 16,
+        "hidden_size": 8,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "intermediate_size": 16,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 10000,
+    }
+
+    def _write_source(self, root, *, with_mtp=False):
+        model = root / "Qwen-Test"
+        model.mkdir()
+        config = {"model_type": "qwen3_5", "num_hidden_layers": 2, **self._GEOMETRY}
+        if with_mtp:
+            config["mtp_num_hidden_layers"] = 1
+        (model / "config.json").write_text(json.dumps(config))
+        (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+        if with_mtp:
+            (model / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {},
+                        "weight_map": {"mtp.fc.weight": "model.safetensors"},
+                    }
+                )
+            )
+        (model / "tokenizer.json").write_bytes(b'{"v": "tok"}')
+        return model
+
+    def _write_donor(self, root, *, model_type="qwen3_5"):
+        model = root / "Qwen-Test-Donor"
+        model.mkdir()
+        config = {
+            "model_type": model_type,
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
+            **self._GEOMETRY,
+        }
+        (model / "config.json").write_text(json.dumps(config))
+        (model / "model.safetensors").write_bytes(b"\x00" * 512)
+        (model / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "mtp.fc.weight": "model.safetensors",
+                        "mtp.norm.weight": "model.safetensors",
+                    },
+                }
+            )
+        )
+        (model / "tokenizer.json").write_bytes(b'{"v": "tok"}')
+        return model
+
+    @pytest.mark.asyncio
+    async def test_start_names_output_with_mtp_suffix(self, tmp_path, monkeypatch):
+        root = tmp_path / "models"
+        root.mkdir()
+        source = self._write_source(root)
+        donor = self._write_donor(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        task = await manager.start_quantization(
+            str(source),
+            4,
+            mtp_assistant_model_path=str(donor),
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.output_name == "Qwen-Test-oQ4-mtp"
+        assert task.mtp_assistant_model_path == str(donor)
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_preserve_mtp_with_donor(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        # Source ships its own mtp weights so the preserve flag survives the
+        # auto-disable and hits the mutual-exclusion check.
+        source = self._write_source(root, with_mtp=True)
+        donor = self._write_donor(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        with pytest.raises(ValueError, match="not both"):
+            await manager.start_quantization(
+                str(source),
+                4,
+                preserve_mtp=True,
+                mtp_assistant_model_path=str(donor),
+            )
+        assert manager._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_family_mismatch_donor(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        source = self._write_source(root)
+        donor = self._write_donor(root, model_type="qwen3_6")
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        with pytest.raises(ValueError, match="does not match the recipient"):
+            await manager.start_quantization(
+                str(source),
+                4,
+                mtp_assistant_model_path=str(donor),
+            )
+        assert manager._tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_run_invokes_donor_combine_after_quantization(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "models"
+        root.mkdir()
+        source = self._write_source(root)
+        donor = self._write_donor(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        def _fake_quantize(model_path, output_path, *args, **kwargs):
+            from pathlib import Path
+
+            Path(output_path).mkdir(parents=True)
+
+        combine_calls = []
+        monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
+        monkeypatch.setattr(
+            "omlx.oq.combine_mtp_into_output",
+            lambda out, donor_path: combine_calls.append((out, donor_path)),
+        )
+
+        task = await manager.start_quantization(
+            str(source),
+            4,
+            mtp_assistant_model_path=str(donor),
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.status is QuantStatus.COMPLETED
+        assert combine_calls == [(task.output_path, str(donor))]
+
+    @pytest.mark.asyncio
+    async def test_list_models_includes_hidden_size(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        self._write_source(root)
+
+        manager = OQManager(model_dirs=[str(root)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        [model] = source_models
+        assert model["hidden_size"] == 8
+        assert all_models[0]["hidden_size"] == 8
 
 
 class TestOQManagerDtypeSupport:

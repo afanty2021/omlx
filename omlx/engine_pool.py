@@ -37,12 +37,14 @@ from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
 from .engine_core import get_mlx_executor
 from .exceptions import (
+    DEFAULT_CEILING_ADVICE,
     InsufficientMemoryError,
     ModelBusyError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
@@ -71,6 +73,7 @@ class EngineEntry:
         "audio_sts",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
@@ -104,6 +107,9 @@ class EngineEntry:
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
+    # Requested load-time variant. This deliberately tracks the settings that
+    # produced the engine, even when an optional accelerator fails soft and the
+    # engine falls back, so identical requests keep reusing that fallback.
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
@@ -225,6 +231,49 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _ceiling_binding_and_advice(
+        self, *, ceiling: int, current: int, tail: str
+    ) -> tuple[str | None, str | None]:
+        """Name the ceiling that refused this load and the knob that moves it.
+
+        A load refusal used to say "free system memory or lower
+        memory_guard_tier" with no breakdown, which is the wrong knob twice
+        over: the tier ladder runs safe → balanced → aggressive, so lowering
+        it shrinks the ceiling further, and on a dynamic-bound machine the
+        static / metal caps the user is likely to be shown elsewhere have
+        room to spare. Reuses the scheduler's advice ladder so both
+        rejection paths name the same constraint.
+
+        Returns ``(None, None)`` when the enforcer is not wired up or its
+        breakdown is unreadable; callers fall back to the generic advice.
+        """
+        enforcer = self._process_memory_enforcer
+        getter = (
+            getattr(enforcer, "get_ceiling_breakdown", None)
+            if enforcer is not None
+            else None
+        )
+        if not callable(getter):
+            return None, None
+        try:
+            breakdown = getter()
+            static = int(breakdown["static"])
+            dynamic = int(breakdown["dynamic"])
+            metal_cap = int(breakdown["metal_cap"])
+        except Exception:  # noqa: BLE001
+            return None, None
+        if max(static, dynamic, metal_cap) <= 0:
+            return None, None
+        return describe_ceiling_binding(
+            static=static,
+            dynamic=dynamic,
+            metal_cap=metal_cap,
+            tier=str(getattr(enforcer, "memory_guard_tier", "") or ""),
+            current=current,
+            fmt=format_size,
+            tail=tail,
+        )
+
     def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
         enforcer = self._process_memory_enforcer
         wake = getattr(enforcer, "wake", None) if enforcer is not None else None
@@ -241,8 +290,6 @@ class EnginePool:
         self,
         model_id: str,
         runtime_settings: object | None = None,
-        *,
-        loaded_engine: object | None = None,
     ) -> tuple[tuple[str, str], ...] | None:
         settings = runtime_settings
         if settings is None and self._settings_manager is not None:
@@ -256,9 +303,6 @@ class EnginePool:
         data = to_dict() if callable(to_dict) else {}
         entry = self._entries.get(model_id)
         is_diffusion = bool(entry and self._entry_is_diffusion_model(entry))
-        loaded_engine_name = (
-            type(loaded_engine).__name__ if loaded_engine is not None else None
-        )
 
         def has_value(key: str) -> bool:
             value = data.get(key)
@@ -307,8 +351,6 @@ class EnginePool:
             and has_value("dflash_draft_model")
             and not is_diffusion
         )
-        if loaded_engine_name is not None:
-            dflash_active = loaded_engine_name == "DFlashEngine"
         add("dflash_enabled", dflash_active)
         if dflash_active:
             add("dflash_draft_model", data.get("dflash_draft_model"))
@@ -351,11 +393,6 @@ class EnginePool:
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"
         )
-        if loaded_engine is not None and vlm_mtp_active:
-            drafter = getattr(loaded_engine, "vlm_mtp_drafter", None)
-            if callable(drafter):
-                drafter = drafter()
-            vlm_mtp_active = drafter is not None
         add("vlm_mtp_enabled", vlm_mtp_active)
         if vlm_mtp_active:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
@@ -429,6 +466,7 @@ class EnginePool:
                     model_type=info.model_type,
                     engine_type=info.engine_type,
                     estimated_size=info.estimated_size,
+                    text_only_size=getattr(info, "text_only_size", 0),
                     config_model_type=getattr(info, "config_model_type", ""),
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(
@@ -852,6 +890,16 @@ class EnginePool:
             # ceiling (static, guard-independent) and keep evicting, but
             # never refuse the load under it — with the guard off the
             # user opted out of hard limits.
+            # A VLM-shaped checkpoint served by the text engine (force_lm or a
+            # model_type_override that flipped engine_type to "batched") loads
+            # only its language weights, so admit it by the text-only estimate
+            # instead of the vision-inclusive file size (#2385).
+            admission_size = entry.estimated_size
+            if entry.text_only_size and (
+                force_lm or entry.engine_type == "batched"
+            ):
+                admission_size = entry.text_only_size
+
             ceiling = self._current_ceiling()
             best_effort = False
             if ceiling <= 0:
@@ -876,7 +924,7 @@ class EnginePool:
                         get_phys_footprint(),
                         self._current_model_memory,
                     )
-                    projected = current + entry.estimated_size
+                    projected = current + admission_size
                     if projected <= evict_target:
                         break
                     victim = self._find_lru_victim()
@@ -925,7 +973,7 @@ class EnginePool:
                         committed = max(
                             mx.get_active_memory(), self._current_model_memory
                         )
-                        committed_projected = committed + entry.estimated_size
+                        committed_projected = committed + admission_size
                         if committed_projected <= ceiling:
                             logger.info(
                                 f"Admitting '{model_id}': committed baseline "
@@ -958,20 +1006,35 @@ class EnginePool:
                     # ModelTooLargeError when the model alone exceeds the
                     # ceiling (no chance of fitting), InsufficientMemoryError
                     # when current usage leaves no room.
-                    if entry.estimated_size > ceiling:
-                        raise ModelTooLargeError(
-                            model_id, entry.estimated_size, ceiling
+                    if admission_size > ceiling:
+                        binding, advice = self._ceiling_binding_and_advice(
+                            ceiling=ceiling,
+                            current=failure_current,
+                            tail="use a smaller model",
                         )
+                        raise ModelTooLargeError(
+                            model_id,
+                            admission_size,
+                            ceiling,
+                            binding=binding,
+                            advice=advice,
+                        )
+                    binding, advice = self._ceiling_binding_and_advice(
+                        ceiling=ceiling,
+                        current=failure_current,
+                        tail="unload another model",
+                    )
+                    label = f"{binding} memory ceiling" if binding else "memory ceiling"
                     raise InsufficientMemoryError(
-                        required=entry.estimated_size,
+                        required=admission_size,
                         current=failure_current,
                         message=(
                             f"Cannot load {model_id}: projected memory "
                             f"{format_size(failure_projected)} would exceed "
-                            f"the memory ceiling {format_size(ceiling)} "
+                            f"the {label} {format_size(ceiling)} "
                             f"({failure_label}: {format_size(failure_current)}, "
-                            f"model: {format_size(entry.estimated_size)}). "
-                            "Free system memory or lower memory_guard_tier."
+                            f"model: {format_size(admission_size)}). "
+                            f"{advice or DEFAULT_CEILING_ADVICE}."
                         ),
                     )
 
@@ -1964,10 +2027,13 @@ class EnginePool:
                         f"load failed; toggle ignored"
                     )
 
+            # Keep the requested construction variant as the reuse key. DFlash
+            # and VLM MTP are fail-soft: either can leave a normal engine in
+            # place. Recording that effective engine as a different variant
+            # makes the next identical concurrent request attempt a reload and
+            # fail with ModelBusyError before it reaches the scheduler (#2406).
             entry.runtime_settings_signature = self._engine_runtime_signature(
-                model_id,
-                model_settings,
-                loaded_engine=engine,
+                model_id, model_settings
             )
 
             # Propagate memory limit to new engine's scheduler
@@ -2141,6 +2207,7 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
+                    "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,

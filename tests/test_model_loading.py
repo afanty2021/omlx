@@ -387,6 +387,79 @@ class TestVlmMtpPreLoadDispatch:
         runtime_mock.assert_not_called()
         assert calls == []
 
+    def test_gemma4_merged_assistant_dispatch(self, tmp_path, monkeypatch):
+        # Gemma 4 merged-assistant checkpoints (assistant weights under
+        # language_model.mtp.* + text_config.mtp_assistant_config) route
+        # through the same VLM MTP pre-load dispatch as Qwen3.5/3.6.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_gemma4_default_depth_is_eight(self, tmp_path, monkeypatch):
+        # The fused multi-row verify kernel keeps gemma4 verify forwards
+        # near-flat in L, so the default depth ceiling is 8 there; the
+        # adaptive controller still settles shallow when accept is low.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(8)
+
+    def test_gemma4_explicit_depth_overrides_default(self, tmp_path, monkeypatch):
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_num_draft_tokens=2)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(2)
+
+    def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
+        # Plain gemma4 VLMs (no merged assistant) must stay untouched by
+        # the MTP dispatch — no declared heads, no runtime patch.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, "text_config": {}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        runtime_mock.assert_not_called()
+        attach_mock.assert_not_called()
+        assert "runtime" not in calls
+
     def test_qwen36_moe_vlm_sanitize_when_no_mtp_heads(self, tmp_path, monkeypatch):
         # mlx-lm Qwen3.6 MoE VLMs without MTP heads still need the mlx-vlm
         # sanitize replacement so pre-converted switch_mlp weights load.
@@ -484,7 +557,15 @@ class TestCheckpointHasMtpWeights:
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
-    def test_returns_true_for_nextn_layout(self, tmp_path):
+    @pytest.mark.parametrize(
+        "prefix",
+        (
+            "model.layers.78",
+            "language_model.model.layers.78",
+            "model.language_model.layers.78",
+        ),
+    )
+    def test_returns_true_for_nextn_layout(self, tmp_path, prefix):
         # DeepSeek-V3-style checkpoints (GLM-5.2) keep the MTP head as an
         # extra decoder layer past num_hidden_layers, not under mtp.*.
         import json as _json
@@ -496,7 +577,7 @@ class TestCheckpointHasMtpWeights:
             tmp_path,
             {
                 "model.layers.0.self_attn.q_a_proj.weight": "model.safetensors",
-                "model.layers.78.eh_proj.weight": "model.safetensors",
+                f"{prefix}.eh_proj.weight": "model.safetensors",
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
@@ -584,6 +665,36 @@ class TestExpandPerLayerQuantKeys:
         swapped = "language_model.model.layers.0.linear_attn.in_proj_qkv"
         assert swapped in cfg["quantization"]
         assert cfg["quantization"][swapped]["bits"] == 8
+
+    def test_adds_gate_proj_variant_for_laguna_router_overrides(self):
+        """Laguna checkpoints key router quant overrides as ``mlp.gate``.
+
+        The model's runtime module path is ``mlp.gate.proj`` (the router
+        ``nn.Linear`` is ``LagunaTopKRouter.proj``).  Without the ``.proj``
+        variant, ``nn.quantize`` falls back to the global bits and builds
+        the router at the wrong width, causing a shape mismatch on load.
+        """
+        cfg = {
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "model.layers.1.mlp.gate": {"bits": 8, "group_size": 64},
+                "model.layers.2.mlp.gate": {"bits": 8, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert (
+            cfg["quantization"]["model.layers.1.mlp.gate.proj"]
+            == {"bits": 8, "group_size": 64}
+        )
+        assert (
+            cfg["quantization"]["model.layers.2.mlp.gate.proj"]
+            == {"bits": 8, "group_size": 64}
+        )
+        # The original key is preserved (other code paths may still use it)
+        assert "model.layers.1.mlp.gate" in cfg["quantization"]
 
 
 class TestMaterializeLazyState:

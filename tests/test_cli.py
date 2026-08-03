@@ -496,7 +496,7 @@ class TestLaunchCommandFunction:
                 {
                     "id": "qwen2.5-vl",
                     "model_type": "llm",
-                    "max_context_window": 32768,
+                    "max_context_window": 65536,
                     "max_tokens": 8192,
                 }
             ]
@@ -524,6 +524,179 @@ class TestLaunchCommandFunction:
 
         ctx = integration.launch.call_args.args[0]
         assert ctx.extra_args == ("--resume", "abc123")
+
+    def test_launch_command_rejects_small_explicit_claude_model(self, capsys):
+        """--model must not bypass Claude Code's minimum context check."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen-32k",
+                    "model_type": "llm",
+                    "max_context_window": 32768,
+                    "max_tokens": 8192,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen-32k",
+            tools_profile="coding",
+            opus_model=None,
+            sonnet_model=None,
+            haiku_model=None,
+        )
+
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        integration.launch.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Cannot launch Claude Code with model 'qwen-32k'" in output
+        assert "at least 48K" in output
+
+    def test_launch_command_rejects_small_claude_tier_model(self, capsys):
+        """Explicit tier flags must all satisfy the same context requirement."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {"id": "opus-32k", "max_context_window": 32768},
+                {"id": "sonnet-64k", "max_context_window": 65536},
+                {"id": "haiku-64k", "max_context_window": 65536},
+            ]
+        }
+
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model=None,
+                sonnet_model=None,
+                haiku_model=None,
+            ),
+        )
+
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+            opus_model="opus-32k",
+            sonnet_model="sonnet-64k",
+            haiku_model="haiku-64k",
+        )
+
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        integration.launch.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Opus tier model 'opus-32k'" in output
+        assert "at least 48K" in output
+
+    def test_launch_command_rejects_small_auto_selected_claude_model(self, capsys):
+        """A single available model must not bypass the minimum context check."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [{"id": "only-32k", "max_context_window": 32768}]
+        }
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [{"id": "only-32k", "model_type": "llm"}]
+        }
+
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model=None,
+                sonnet_model=None,
+                haiku_model=None,
+            ),
+        )
+
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+            opus_model=None,
+            sonnet_model=None,
+            haiku_model=None,
+        )
+
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        integration.launch.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Using model: only-32k" in output
+        assert "Cannot launch Claude Code with model 'only-32k'" in output
 
     def test_launch_command_shows_picker_and_clears_saved_tiers(self):
         """Bare `omlx launch claude` shows the picker and ignores saved tier models."""
@@ -716,7 +889,9 @@ class TestServeCommandFunctions:
             get_model_dirs=lambda base_path: [tmp_path / "models"],
         )
         settings.get_effective_model_dirs = lambda: [tmp_path / "models"]
-        settings.memory = SimpleNamespace(memory_guard_tier="balanced")
+        settings.memory = SimpleNamespace(
+            memory_guard_tier="balanced", prefill_memory_guard=True
+        )
         settings.mcp = SimpleNamespace(config_path=None)
         settings.cache = SimpleNamespace(
             enabled=False,
@@ -728,6 +903,7 @@ class TestServeCommandFunctions:
         settings.ensure_directories = lambda: log_dir.mkdir(parents=True, exist_ok=True)
         settings.validate = lambda: []
         settings.save = MagicMock()
+        settings.save_cli_overrides = MagicMock()
         settings.to_scheduler_config = lambda: SimpleNamespace(
             paged_ssd_cache_dir=None,
             paged_ssd_cache_max_size=0,
@@ -862,6 +1038,8 @@ class TestServeCommandFunctions:
 
             assert exc.value.code != 0
             assert events == ["bind"]
+            settings.save_cli_overrides.assert_called_once_with(args)
+            settings.save.assert_not_called()
             assert "omlx.server" not in sys.modules
         finally:
             listener.close()
@@ -944,9 +1122,25 @@ class TestHasCliOverrides:
             "port": None,
             "host": None,
             "log_level": None,
+            "sse_keepalive_mode": None,
+            "max_concurrent_requests": None,
             "embedding_batch_size": None,
             "memory_guard": None,
             "memory_guard_gb": None,
+            "paged_ssd_cache_dir": None,
+            "paged_ssd_cache_max_size": None,
+            "hot_cache_max_size": None,
+            "no_cache": False,
+            "initial_cache_blocks": None,
+            "mcp_config": None,
+            "hf_endpoint": None,
+            "hf_cache_enabled": None,
+            "ms_endpoint": None,
+            "http_proxy": None,
+            "https_proxy": None,
+            "no_proxy": None,
+            "ca_bundle": None,
+            "api_key": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -1000,6 +1194,29 @@ class TestHasCliOverrides:
 
         assert _has_cli_overrides(self._make_args(hf_cache_enabled=False)) is True
         assert _has_cli_overrides(self._make_args(hf_cache_enabled=True)) is True
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("sse_keepalive_mode", "off"),
+            ("max_concurrent_requests", 2),
+            ("paged_ssd_cache_dir", "/tmp/cache"),
+            ("paged_ssd_cache_max_size", "2GB"),
+            ("hot_cache_max_size", "1GB"),
+            ("no_cache", True),
+            ("initial_cache_blocks", 64),
+        ],
+    )
+    def test_all_persisted_serve_flags_count_as_overrides(self, field, value):
+        from omlx.cli import _has_cli_overrides
+
+        assert _has_cli_overrides(self._make_args(**{field: value})) is True
+
+    def test_api_key_alone_is_not_persisted(self):
+        """A command-line secret must not be written to settings.json."""
+        from omlx.cli import _has_cli_overrides
+
+        assert _has_cli_overrides(self._make_args(api_key="test-key")) is False
 
     def test_multiple_overrides(self):
         from omlx.cli import _has_cli_overrides

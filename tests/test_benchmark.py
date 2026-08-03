@@ -2,28 +2,34 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+import json
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from omlx.admin.benchmark import (
-    VALID_BATCH_SIZES,
-    VALID_PROMPT_LENGTHS,
+    BENCHMARK_CONTEXT_PROFILES,
+    BenchmarkContextProfile,
     BenchmarkRequest,
     BenchmarkRun,
-    _clean_model_name,
     _compute_single_metrics,
+    _derive_feature_flags,
     _detect_experimental_features,
     _detect_quantization,
+    _filter_uploaded_settings,
     _generate_prompt,
+    _load_bench_corpus,
+    _run_batch_test,
     _run_single_test,
+    _upload_model_name,
     cleanup_old_runs,
     create_run,
     get_run,
     run_benchmark,
 )
-
 
 # =============================================================================
 # BenchmarkRequest validation tests
@@ -103,6 +109,27 @@ class TestBenchmarkRequest:
         )
         assert req.force_lm_engine is True
 
+    def test_context_profile_defaults_to_python_code(self):
+        req = BenchmarkRequest(model_id="test-model", prompt_lengths=[1024])
+        assert req.context_profile is BenchmarkContextProfile.CODE_PYTHON
+
+    @pytest.mark.parametrize("profile", list(BenchmarkContextProfile))
+    def test_all_context_profiles_are_accepted(self, profile):
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[1024],
+            context_profile=profile.value,
+        )
+        assert req.context_profile is profile
+
+    def test_unknown_context_profile_is_rejected(self):
+        with pytest.raises(ValueError, match="context_profile"):
+            BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                context_profile="unknown",
+            )
+
 
 # =============================================================================
 # Prompt generation tests
@@ -111,7 +138,7 @@ class TestBenchmarkRequest:
 
 class TestGeneratePrompt:
     def test_exact_token_count(self):
-        """Verify prompt generates exact number of tokens."""
+        """Prompt IDs are exact without a decode/re-encode round trip."""
         tokenizer = MagicMock()
 
         # Simulate tokenizer behavior
@@ -119,33 +146,134 @@ class TestGeneratePrompt:
             # Return roughly 1 token per 4 chars
             return list(range(len(text) // 4))
 
-        def mock_decode(tokens):
-            return "x" * len(tokens) * 4
-
         tokenizer.encode = mock_encode
-        tokenizer.decode = mock_decode
 
         prompt = _generate_prompt(tokenizer, 1024)
 
-        # Verify encode was called and result was truncated
-        encoded = tokenizer.encode(prompt)
-        assert len(encoded) == 1024
+        assert isinstance(prompt, list)
+        assert len(prompt) == 1024
+        tokenizer.decode.assert_not_called()
+
+    def test_rejects_non_positive_target(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            _generate_prompt(MagicMock(), 0)
 
     def test_uuid_prefix_uniqueness(self):
         """Verify each generated prompt has a unique UUID prefix."""
-        tokenizer = MagicMock()
-        tokenizer.encode = lambda text: list(range(2048))
-        tokenizer.decode = lambda tokens: f"decoded-{len(tokens)}"
+        tokenizer = _WordTokenizer()
 
         prompts = set()
         for _ in range(10):
-            # We can't easily verify uniqueness since decode is mocked,
-            # but we verify encode is called with text containing "BENCH-"
             prompt = _generate_prompt(tokenizer, 100)
-            prompts.add(prompt)
+            prompts.add(tuple(prompt))
 
-        # With mock decode they'll all be the same, but in real usage
-        # the UUID prefix ensures cache isolation
+        assert len(prompts) == 10
+
+
+class _WordTokenizer:
+    """Word-level round-trip tokenizer for content-sensitive prompt tests."""
+
+    def __init__(self):
+        self.vocab = {}
+        self.words = []
+
+    def encode(self, text):
+        ids = []
+        for word in text.split(" "):
+            if word not in self.vocab:
+                self.vocab[word] = len(self.words)
+                self.words.append(word)
+            ids.append(self.vocab[word])
+        return ids
+
+    def decode(self, ids):
+        return " ".join(self.words[i] for i in ids)
+
+
+class TestPromptRealism:
+    @pytest.mark.parametrize("profile", list(BenchmarkContextProfile))
+    def test_all_corpus_files_ship_with_long_form_content(self, profile):
+        corpus = _load_bench_corpus(profile)
+        assert len(corpus) > 400_000
+        assert "quick brown fox jumps" not in corpus
+
+    def test_english_corpus_keeps_moby_dick_content(self):
+        corpus = _load_bench_corpus(BenchmarkContextProfile.NOVEL_EN)
+        assert corpus.startswith("Call me Ishmael.")
+
+    def test_manifest_records_representative_250k_token_headroom(self):
+        manifest_path = (
+            Path(__file__).parents[1]
+            / "omlx"
+            / "admin"
+            / "bench_corpora"
+            / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for counts in manifest["representative_token_counts"].values():
+            assert set(counts) == {
+                spec.filename for spec in BENCHMARK_CONTEXT_PROFILES.values()
+            }
+            assert min(counts.values()) >= 250_000
+
+    def test_prompt_is_not_repetitive(self):
+        """Speculative decoders (MTP/DFlash) hit ~99% draft acceptance on
+        repeated filler, inflating benchmark tg ~2x over real prompts; the
+        prompt must be natural, non-looping text."""
+        tokenizer = _WordTokenizer()
+        ids = _generate_prompt(tokenizer, 2048, BenchmarkContextProfile.NOVEL_EN)
+        window = 16
+        windows = {tuple(ids[i : i + window]) for i in range(len(ids) - window)}
+        distinct_ratio = len(windows) / (len(ids) - window)
+        assert distinct_ratio > 0.5
+
+    def test_prompt_deterministic_apart_from_uuid_prefix(self):
+        tokenizer = _WordTokenizer()
+        first = _generate_prompt(tokenizer, 512, BenchmarkContextProfile.NOVEL_EN)
+        second = _generate_prompt(tokenizer, 512, BenchmarkContextProfile.NOVEL_EN)
+        assert first[0] != second[0]
+        assert first[1:] == second[1:]
+
+    def test_prefix_and_corpus_are_encoded_together(self):
+        tokenizer = _WordTokenizer()
+        encoded_texts = []
+        original_encode = tokenizer.encode
+
+        def recording_encode(text):
+            encoded_texts.append(text)
+            return original_encode(text)
+
+        tokenizer.encode = recording_encode
+        _generate_prompt(tokenizer, 256, BenchmarkContextProfile.NOVEL_EN)
+        assert encoded_texts
+        assert all(text.startswith("BENCH-") for text in encoded_texts)
+        assert all("Call me Ishmael." in text for text in encoded_texts)
+
+    def test_external_prompt_is_not_repetitive(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        prompt = _generate_external_prompt(1024, BenchmarkContextProfile.NOVEL_EN)
+        assert "Call me Ishmael." in prompt[:100]
+        words = prompt.split(" ")
+        window = 12
+        windows = {tuple(words[i : i + window]) for i in range(len(words) - window)}
+        distinct_ratio = len(windows) / (len(words) - window)
+        assert distinct_ratio > 0.5
+
+    def test_whole_corpus_repeats_when_tokenizer_needs_more_content(self):
+        tokenizer = MagicMock()
+        encoded_texts = []
+
+        def encode(text):
+            encoded_texts.append(text)
+            return list(range(len(text)))
+
+        tokenizer.encode = encode
+        with patch("omlx.admin.benchmark._load_bench_corpus", return_value="abcdef"):
+            ids = _generate_prompt(tokenizer, 100)
+
+        assert len(ids) == 100
+        assert encoded_texts[-1].count("abcdef") > 1
 
 
 # =============================================================================
@@ -198,10 +326,12 @@ class TestComputeMetrics:
             peak_memory=0,
             cached_tokens=0,
         )
-        # Should not raise, values should be finite
+        # Should not raise, values should be finite. Decode rate is
+        # unmeasurable (not 0.0 tok/s, which would misleadingly read as
+        # a real stall) so it reports None.
         assert metrics["ttft_ms"] == 0.0
-        assert metrics["gen_tps"] == 0.0
-        assert metrics["tpot_ms"] == 0.0
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
 
     def test_native_duration_overrides(self):
         """Native engine timings can override streaming timing artifacts."""
@@ -233,12 +363,47 @@ class TestComputeMetrics:
             cached_tokens=0,
         )
 
-        assert metrics["gen_tps"] == 0.0
-        assert metrics["tpot_ms"] == 0.0
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
         assert metrics["total_throughput"] == pytest.approx(1898.7, abs=0.1)
 
 
 class TestRunSingleTest:
+    @pytest.mark.asyncio
+    async def test_rejects_prompt_length_before_submission(self):
+        engine = MagicMock()
+
+        with pytest.raises(RuntimeError, match="before pp1024"):
+            await _run_single_test(
+                engine,
+                prompt=[0] * 1023,
+                max_tokens=1,
+                pp_len=1024,
+            )
+
+        engine.stream_generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_engine_reported_prompt_length(self):
+        class MismatchedEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=1,
+                    prompt_tokens=1023,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        with pytest.raises(RuntimeError, match="engine reported 1023 tokens"):
+            await _run_single_test(
+                MismatchedEngine(),
+                prompt=[0] * 1024,
+                max_tokens=1,
+                pp_len=1024,
+            )
+
     @pytest.mark.asyncio
     async def test_uses_native_diffusion_metrics_for_chunked_stream(self):
         """Diffusion streams by canvas, so benchmark must not use chunk timing."""
@@ -258,7 +423,7 @@ class TestRunSingleTest:
 
         metrics = await _run_single_test(
             ChunkedDiffusionEngine(),
-            prompt="prompt",
+            prompt=[0] * 1024,
             max_tokens=128,
             pp_len=1024,
         )
@@ -288,7 +453,7 @@ class TestRunSingleTest:
 
         metrics = await _run_single_test(
             EarlyStopDiffusionEngine(),
-            prompt="prompt",
+            prompt=[0] * 1024,
             max_tokens=128,
             pp_len=1024,
         )
@@ -317,7 +482,7 @@ class TestRunSingleTest:
         with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.3]):
             metrics = await _run_single_test(
                 AggregatedEngine(),
-                prompt="prompt",
+                prompt=[0] * 1024,
                 max_tokens=128,
                 pp_len=1024,
             )
@@ -345,14 +510,66 @@ class TestRunSingleTest:
         with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.2]):
             metrics = await _run_single_test(
                 AggregatedEngine(),
-                prompt="prompt",
+                prompt=[0] * 1024,
                 max_tokens=128,
                 pp_len=1024,
             )
 
         assert metrics["ttft_ms"] == pytest.approx(200.0)
-        assert metrics["gen_tps"] == 0.0
-        assert metrics["tpot_ms"] == 0.0
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
+
+
+class TestRunBatchTest:
+    @pytest.mark.asyncio
+    async def test_submits_exact_token_ids(self):
+        class Core:
+            def __init__(self):
+                self.prompts = {}
+
+            async def add_request(self, prompt, sampling_params):
+                request_id = f"request-{len(self.prompts)}"
+                self.prompts[request_id] = prompt
+                return request_id
+
+            async def stream_outputs(self, request_id):
+                prompt = self.prompts[request_id]
+                yield SimpleNamespace(
+                    completion_tokens=2,
+                    prompt_tokens=len(prompt),
+                    finished=True,
+                )
+
+        core = Core()
+        engine = SimpleNamespace(_engine=core)
+        prompts = [[row] * 1024 for row in (1, 2)]
+
+        metrics = await _run_batch_test(
+            engine=engine,
+            prompts=prompts,
+            prompt_tokens=1024,
+            max_tokens=2,
+            batch_size=2,
+        )
+
+        assert list(core.prompts.values()) == prompts
+        assert metrics["batch_size"] == 2
+
+    @pytest.mark.asyncio
+    async def test_rejects_mismatched_prompt_before_submission(self):
+        core = MagicMock()
+        engine = SimpleNamespace(_engine=core)
+
+        with pytest.raises(RuntimeError, match="expected 1024"):
+            await _run_batch_test(
+                engine=engine,
+                prompts=[[0] * 1023, [1] * 1024],
+                prompt_tokens=1024,
+                max_tokens=1,
+                batch_size=2,
+            )
+
+        core.add_request.assert_not_called()
 
 
 # =============================================================================
@@ -508,6 +725,40 @@ class TestBenchmarkEngineSelection:
         assert run.status == "completed"
 
     @pytest.mark.asyncio
+    async def test_run_benchmark_pins_speed_priority_and_restores(self):
+        """Throughput runs force prefill speed priority (no throttle
+        shrinking mid-measurement) and restore the previous mode after."""
+        pool = _FakeBenchEnginePool()
+        pool._scheduler_config = SimpleNamespace(prefill_speed_priority=False)
+        seen = []
+
+        class _Recorder(_FakeBenchEngine):
+            async def stream_generate(self, **kwargs):
+                seen.append(pool._scheduler_config.prefill_speed_priority)
+                yield SimpleNamespace(
+                    completion_tokens=1,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        pool._engine = _Recorder()
+        run = BenchmarkRun(
+            bench_id="bench-pin",
+            request=BenchmarkRequest(
+                model_id="m", prompt_lengths=[1024], generation_length=1
+            ),
+        )
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert seen and all(seen), "speed priority must be pinned during the run"
+        assert pool._scheduler_config.prefill_speed_priority is False
+
+    @pytest.mark.asyncio
     async def test_batch_request_skips_engine_with_none_scheduler_core(self):
         run = BenchmarkRun(
             bench_id="bench-test",
@@ -594,6 +845,157 @@ class TestExperimentalFeatureDetection:
         assert _detect_experimental_features(SimpleNamespace()) == []
 
 
+class TestDeriveFeatureFlags:
+    """The upload projection: [{key, label}] for the active features only."""
+
+    def test_shape_is_key_and_label(self):
+        settings = SimpleNamespace(mtp_enabled=True)
+        assert _derive_feature_flags(settings) == [
+            {"key": "lightning_mtp", "label": "Lightning MTP"}
+        ]
+
+    def test_only_active_features_appear(self):
+        settings = SimpleNamespace(mtp_enabled=True, dflash_enabled=False)
+        keys = [f["key"] for f in _derive_feature_flags(settings)]
+        assert keys == ["lightning_mtp"]
+
+    def test_turboquant_carries_its_bit_width(self):
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=4)
+        assert _derive_feature_flags(settings) == [
+            {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"}
+        ]
+
+    def test_fractional_bit_width_stays_key_safe(self):
+        # Keys must match [a-z0-9_] for the leaderboard, so 2.5 becomes 2_5.
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=2.5)
+        flag = _derive_feature_flags(settings)[0]
+        assert flag["key"] == "turboquant_kv_2_5bit"
+        assert flag["label"] == "TurboQuant KV 2.5-bit"
+
+    def test_float_valued_whole_bits_do_not_render_a_decimal(self):
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=4.0)
+        assert _derive_feature_flags(settings)[0]["key"] == "turboquant_kv_4bit"
+
+    def test_turboquant_without_a_bit_width_falls_back_to_the_bare_key(self):
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=None)
+        assert _derive_feature_flags(settings) == [
+            {"key": "turboquant_kv", "label": "TurboQuant KV"}
+        ]
+
+    def test_index_cache_freq_is_not_a_flag(self):
+        # It is a layer stride, not an on/off accelerator — tagging a run
+        # "accelerated" for it would mislead the leaderboard.
+        settings = SimpleNamespace(index_cache_freq=4)
+        assert _derive_feature_flags(settings) == []
+
+    def test_no_settings_yields_no_flags(self):
+        assert _derive_feature_flags(SimpleNamespace()) == []
+
+
+class TestFilterUploadedSettings:
+    """Allowlist projection — a denylist would ship every future field."""
+
+    def _settings(self, **overrides):
+        from omlx.model_settings import ModelSettings
+
+        return ModelSettings(**overrides)
+
+    def test_performance_fields_are_kept(self):
+        out = _filter_uploaded_settings(
+            self._settings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_bits=4,
+                mtp_enabled=True,
+                mtp_num_draft_tokens=3,
+                index_cache_freq=4,
+                guided_grammar_enabled=True,
+            )
+        )
+        assert out["turboquant_kv_bits"] == 4
+        assert out["mtp_num_draft_tokens"] == 3
+        assert out["index_cache_freq"] == 4
+        assert out["guided_grammar_enabled"] is True
+
+    def test_free_text_and_organization_fields_are_dropped(self):
+        out = _filter_uploaded_settings(
+            self._settings(
+                display_name="my private name",
+                description="notes only I should see",
+                model_alias="alias",
+                is_favorite=True,
+                is_pinned=True,
+                is_default=True,
+                is_hidden=True,
+                active_profile_name="profile",
+                trust_remote_code=True,
+                ttl_seconds=60,
+            )
+        )
+        for key in (
+            "display_name",
+            "description",
+            "model_alias",
+            "is_favorite",
+            "is_pinned",
+            "is_default",
+            "is_hidden",
+            "active_profile_name",
+            "trust_remote_code",
+            "ttl_seconds",
+        ):
+            assert key not in out
+
+    def test_grammar_body_is_dropped_but_the_toggle_is_kept(self):
+        out = _filter_uploaded_settings(
+            self._settings(
+                guided_grammar_enabled=True,
+                guided_grammar="root ::= " + "x" * 5000,
+            )
+        )
+        assert "guided_grammar" not in out
+        assert out["guided_grammar_enabled"] is True
+
+    def test_draft_model_paths_are_reduced_to_a_basename(self):
+        # The drafter's identity explains an MTP/DFlash result; the full path
+        # would leak the local filesystem layout and the OS username.
+        out = _filter_uploaded_settings(
+            self._settings(
+                dflash_enabled=True,
+                dflash_draft_model="/Users/someone/Workspace/models/Qwen3-0.6B-4bit",
+            )
+        )
+        assert out["dflash_draft_model"] == "Qwen3-0.6B-4bit"
+
+    def test_bare_draft_model_name_is_unchanged(self):
+        out = _filter_uploaded_settings(
+            self._settings(
+                dflash_enabled=True,
+                dflash_draft_model="Qwen3-0.6B-4bit",
+            )
+        )
+        assert out["dflash_draft_model"] == "Qwen3-0.6B-4bit"
+
+    def test_non_settings_object_returns_none(self):
+        assert _filter_uploaded_settings(SimpleNamespace()) is None
+
+    def test_oversized_snapshot_falls_back_to_accelerator_flags(self):
+        # The fallback keeps every accelerator toggle, disabled ones included:
+        # knowing a feature was off is as useful as knowing it was on.
+        settings = self._settings(mtp_enabled=True, turboquant_kv_enabled=True)
+        with patch("omlx.admin.benchmark._MAX_UPLOADED_SETTINGS_BYTES", 10):
+            out = _filter_uploaded_settings(settings)
+        assert out == {
+            "dflash_enabled": False,
+            "specprefill_enabled": False,
+            "turboquant_kv_enabled": True,
+            "mtp_enabled": True,
+            "vlm_mtp_enabled": False,
+        }
+        # Everything else is gone.
+        assert "temperature" not in out
+        assert "max_context_window" not in out
+
+
 # =============================================================================
 # SSE event format tests
 # =============================================================================
@@ -613,13 +1015,16 @@ class TestSSEEventFormat:
             ),
         )
 
-        await _send_event(run, {
-            "type": "progress",
-            "phase": "single",
-            "message": "Testing",
-            "current": 1,
-            "total": 3,
-        })
+        await _send_event(
+            run,
+            {
+                "type": "progress",
+                "phase": "single",
+                "message": "Testing",
+                "current": 1,
+                "total": 3,
+            },
+        )
 
         # SSE delivery: events are appended to `run.events` (replay log).
         assert len(run.events) == 1
@@ -665,16 +1070,12 @@ class TestSSEEventFormat:
 class TestDetectQuantization:
     def test_from_config_json(self, tmp_path):
         config = {"quantization_config": {"quant_method": "awq", "bits": 4}}
-        (tmp_path / "config.json").write_text(
-            __import__("json").dumps(config)
-        )
+        (tmp_path / "config.json").write_text(__import__("json").dumps(config))
         assert _detect_quantization(str(tmp_path)) == "4bit"
 
     def test_from_config_json_8bit(self, tmp_path):
         config = {"quantization_config": {"bits": 8}}
-        (tmp_path / "config.json").write_text(
-            __import__("json").dumps(config)
-        )
+        (tmp_path / "config.json").write_text(__import__("json").dumps(config))
         assert _detect_quantization(str(tmp_path)) == "8bit"
 
     def test_from_dirname_4bit(self, tmp_path):
@@ -711,9 +1112,7 @@ class TestDetectQuantization:
         model_dir = tmp_path / "Model-4bit"
         model_dir.mkdir()
         config = {"quantization_config": {"bits": 8}}
-        (model_dir / "config.json").write_text(
-            __import__("json").dumps(config)
-        )
+        (model_dir / "config.json").write_text(__import__("json").dumps(config))
         assert _detect_quantization(str(model_dir)) == "8bit"
 
 
@@ -722,35 +1121,35 @@ class TestDetectQuantization:
 # =============================================================================
 
 
-class TestCleanModelName:
-    def test_strip_4bit(self):
-        assert _clean_model_name("Qwen3-30B-A3B-4bit", "4bit") == "Qwen3-30B-A3B"
+class TestUploadModelName:
+    """The published name is what oMLX shows and its copy button copies.
 
-    def test_strip_8bit(self):
-        assert _clean_model_name("Llama-3-8B-8bit", "8bit") == "Llama-3-8B"
+    Quantization and MLX suffixes used to be stripped, which erased the one
+    detail distinguishing two builds of the same model on the leaderboard.
+    """
 
-    def test_strip_fp16(self):
-        assert _clean_model_name("Model-fp16", "fp16") == "Model"
+    def test_keeps_quantization_suffix(self):
+        assert _upload_model_name("Qwen3-30B-A3B-4bit") == "Qwen3-30B-A3B-4bit"
 
-    def test_strip_mlx_marker(self):
-        assert _clean_model_name("Qwen3-30B-MLX-4bit", "4bit") == "Qwen3-30B"
+    def test_keeps_mlx_marker(self):
+        assert (
+            _upload_model_name("qwen3.6-35b-a3b-8bit-mlx") == "qwen3.6-35b-a3b-8bit-mlx"
+        )
 
-    def test_strip_mxfp4(self):
-        assert _clean_model_name("gpt-oss-120b-MXFP4", "mxfp4") == "gpt-oss-120b"
+    def test_keeps_mixed_case_and_dwq_style_suffixes(self):
+        assert _upload_model_name("Llama-3-8B-4bit-DWQ") == "Llama-3-8B-4bit-DWQ"
 
-    def test_strip_nvfp4(self):
-        assert _clean_model_name("Model-NVFP4", "nvfp4") == "Model"
+    def test_plain_name_is_unchanged(self):
+        assert _upload_model_name("Qwen3-30B-A3B") == "Qwen3-30B-A3B"
 
-    def test_no_quant_suffix(self):
-        assert _clean_model_name("Qwen3-30B-A3B", "unknown") == "Qwen3-30B-A3B"
+    def test_takes_last_path_component(self):
+        assert (
+            _upload_model_name("mlx-community/Qwen3-30B-A3B-4bit")
+            == "Qwen3-30B-A3B-4bit"
+        )
 
-    def test_preserves_model_size(self):
-        assert _clean_model_name("DeepSeek-R1-0528-Qwen3-8B-4bit", "4bit") == "DeepSeek-R1-0528-Qwen3-8B"
-
-
-# =============================================================================
-# Upload integration tests (mocked HTTP)
-# =============================================================================
+    def test_truncates_to_the_leaderboard_limit(self):
+        assert len(_upload_model_name("x" * 300)) == 150
 
 
 class TestUploadToOmlxAi:
@@ -927,8 +1326,8 @@ class TestUploadToOmlxAi:
         assert done_event["data"]["skipped"] == 1
 
     @pytest.mark.asyncio
-    async def test_upload_skipped_when_experimental_features_enabled(self):
-        """Upload is skipped (no HTTP call) when experimental features were active."""
+    async def test_upload_proceeds_when_acceleration_is_active(self):
+        """Accelerated runs upload too, carrying their flags."""
         from omlx.admin.benchmark import _upload_to_omlx_ai
 
         run = BenchmarkRun(
@@ -938,6 +1337,11 @@ class TestUploadToOmlxAi:
                 prompt_lengths=[1024],
             ),
             experimental_features=["dflash", "turboquant"],
+            feature_flags=[
+                {"key": "dflash", "label": "DFlash"},
+                {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"},
+            ],
+            model_settings_snapshot={"dflash_enabled": True},
         )
         run.results = [
             {
@@ -947,32 +1351,92 @@ class TestUploadToOmlxAi:
                 "processing_tps": 500.0,
                 "gen_tps": 50.0,
                 "ttft_ms": 100.0,
-                "peak_memory_bytes": 0,
+                "peak_memory_bytes": 8 * 1024**3,
+                "system_metrics": {"sample_count": 4, "interval_s": 1.0},
             },
         ]
 
+        mock_entry = MagicMock()
+        mock_entry.model_path = "/models/Qwen3-30B-4bit"
         mock_pool = MagicMock()
+        mock_pool.get_entry.return_value = mock_entry
         mock_pool._settings_manager = None
-        mock_to_thread = AsyncMock()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": "abc", "url": "https://omlx.ai/b/abc"}
+        mock_to_thread = AsyncMock(return_value=mock_response)
 
         with patch("asyncio.to_thread", mock_to_thread):
             await _upload_to_omlx_ai(run, mock_pool)
 
-        events = list(run.events)
+        mock_to_thread.assert_awaited_once()
+        payload = mock_to_thread.await_args.kwargs["json"]
+        assert payload["feature_flags"] == [
+            {"key": "dflash", "label": "DFlash"},
+            {"key": "turboquant_kv_4bit", "label": "TurboQuant KV 4-bit"},
+        ]
+        assert payload["context_profile"] == "code_python"
+        assert payload["model_settings"] == {
+            "benchmark_context": "Code (Python)",
+            "dflash_enabled": True,
+        }
+        assert payload["system_metrics"] == {"sample_count": 4, "interval_s": 1.0}
 
-        # Only an upload_skipped event is emitted, no progress / upload / upload_done
-        event_types = [e["type"] for e in events]
-        assert "upload_skipped" in event_types
-        assert "upload" not in event_types
-        assert "upload_done" not in event_types
-        assert "progress" not in event_types
+        event_types = [e["type"] for e in run.events]
+        assert "upload_done" in event_types
+        assert "upload_skipped" not in event_types
+        assert run.upload_state["phase"] == "done"
+        assert run.upload_state["feature_flags"] == run.feature_flags
 
-        skipped = next(e for e in events if e["type"] == "upload_skipped")
-        assert skipped["reason"] == "experimental_features"
-        assert skipped["features"] == ["dflash", "turboquant"]
+    @pytest.mark.asyncio
+    async def test_payload_carries_new_fields_when_unaccelerated(self):
+        """A plain run still sends the new keys, with empty/None values."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
 
-        # No HTTP call was made
-        mock_to_thread.assert_not_called()
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="qwen3.6-35b-a3b-8bit-mlx",
+                prompt_lengths=[1024],
+            ),
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 8 * 1024**3,
+            },
+        ]
+
+        mock_entry = MagicMock()
+        mock_entry.model_path = "/models/qwen3.6-35b-a3b-8bit-mlx"
+        mock_pool = MagicMock()
+        mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
+
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": "abc", "url": "https://omlx.ai/b/abc"}
+        mock_to_thread = AsyncMock(return_value=mock_response)
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        payload = mock_to_thread.await_args.kwargs["json"]
+        # The full id reaches the leaderboard, suffixes intact.
+        assert payload["model_name"] == "qwen3.6-35b-a3b-8bit-mlx"
+        assert payload["feature_flags"] == []
+        assert payload["context_profile"] == "code_python"
+        assert payload["model_settings"] == {"benchmark_context": "Code (Python)"}
+        # Null rather than a zero-filled object, so the site does not average
+        # fabricated measurements.
+        assert payload["system_metrics"] is None
+        assert "peak_footprint_gb" in payload
 
 
 _CF_INTERSTITIAL = (
@@ -989,8 +1453,11 @@ class TestSanitizeUploadError:
     sanitizer must detect that case and surface an actionable message
     without dumping the full 5KB HTML body."""
 
-    def _resp(self, status=403, headers=None, text="", json_raises=True, json_data=None):
+    def _resp(
+        self, status=403, headers=None, text="", json_raises=True, json_data=None
+    ):
         from unittest.mock import MagicMock
+
         resp = MagicMock()
         resp.status_code = status
         resp.headers = headers or {}
@@ -1003,6 +1470,7 @@ class TestSanitizeUploadError:
 
     def test_cloudflare_challenge_via_header(self):
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(
             status=403,
             headers={"cf-mitigated": "challenge"},
@@ -1020,6 +1488,7 @@ class TestSanitizeUploadError:
         """Header missing but body still contains the interstitial — covers
         edge transports / proxies that strip cf-mitigated."""
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(status=403, headers={}, text=_CF_INTERSTITIAL)
         msg = _sanitize_upload_error(resp)
         assert "Cloudflare" in msg
@@ -1027,6 +1496,7 @@ class TestSanitizeUploadError:
 
     def test_json_error_field_extracted(self):
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(
             status=400,
             json_raises=False,
@@ -1037,6 +1507,7 @@ class TestSanitizeUploadError:
 
     def test_json_detail_field_extracted(self):
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(
             status=422,
             json_raises=False,
@@ -1048,6 +1519,7 @@ class TestSanitizeUploadError:
     def test_html_body_without_cf_signals_collapses_to_hint(self):
         """Non-CF HTML body (e.g. nginx 502 page) should not be dumped raw."""
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(
             status=502,
             text="<html><body>502 Bad Gateway</body></html>",
@@ -1058,11 +1530,13 @@ class TestSanitizeUploadError:
 
     def test_plain_text_short_body_passes_through(self):
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(status=500, text="upstream connection refused")
         assert _sanitize_upload_error(resp) == "upstream connection refused"
 
     def test_empty_body_falls_back_to_status(self):
         from omlx.admin.benchmark import _sanitize_upload_error
+
         resp = self._resp(status=503, text="")
         assert _sanitize_upload_error(resp) == "HTTP 503"
 
@@ -1126,6 +1600,8 @@ class TestGenerateExternalPrompt:
 
         short = _generate_external_prompt(1024)
         long = _generate_external_prompt(4096)
+        assert len(short) == 1024 * 4
+        assert len(long) == 4096 * 4
         assert len(long) > len(short) * 3
 
     def test_unique_prefix(self):
@@ -1151,9 +1627,7 @@ class TestRunExternalBenchmark:
 
     def _mock_client(self, stats=None):
         client = MagicMock()
-        client.stream_chat_completion = AsyncMock(
-            return_value=stats or _stream_stats()
-        )
+        client.stream_chat_completion = AsyncMock(return_value=stats or _stream_stats())
         client.aclose = AsyncMock()
         return client
 
@@ -1162,9 +1636,7 @@ class TestRunExternalBenchmark:
         pool = MagicMock()
         client = self._mock_client()
 
-        with patch(
-            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
-        ):
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
             await run_benchmark(run, pool)
 
         assert run.status == "completed"
@@ -1176,9 +1648,7 @@ class TestRunExternalBenchmark:
         run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
         client = self._mock_client()
 
-        with patch(
-            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
-        ):
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
             await run_benchmark(run, MagicMock())
 
         event_types = [e["type"] for e in run.events]
@@ -1201,15 +1671,13 @@ class TestRunExternalBenchmark:
         run = self._make_run(prompt_lengths=[4096])
         client = self._mock_client(_stream_stats(prompt=3900, completion=128))
 
-        with patch(
-            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
-        ):
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
             await run_benchmark(run, MagicMock())
 
         result = run.results[0]
         assert result["test_type"] == "single"
-        assert result["pp"] == 4096
-        # Actual usage counts, not the nominal pp target
+        assert result["requested_pp"] == 4096
+        assert result["pp"] == 3900
         assert result["prompt_tokens"] == 3900
         assert result["completion_tokens"] == 128
         assert result["peak_memory_bytes"] is None
@@ -1221,14 +1689,198 @@ class TestRunExternalBenchmark:
         run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
         client = self._mock_client(_stream_stats(prompt=1000, completion=100))
 
-        with patch(
-            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
-        ):
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
             await run_benchmark(run, MagicMock())
 
         batch = [r for r in run.results if r["test_type"] == "batch"][0]
         assert batch["batch_size"] == 2
+        assert batch["requested_pp"] == 1024
+        assert batch["pp"] == 1000
+        assert batch["prompt_tokens_min"] == 1000
+        assert batch["prompt_tokens_max"] == 1000
+        assert batch["total_prompt_tokens"] == 2000
         assert batch["total_gen_tokens"] == 200
+
+    async def test_single_result_unmeasurable_span_reports_none(self):
+        """A true single-chunk dump (first_content_time == last_content_time
+        == end_time) must report tg TPS as unmeasured, not 0.0.
+
+        Content was still observed, so TTFT and the prefill rate derived from
+        it remain real measurements and must keep their values.
+        """
+        from omlx.admin.external_api import StreamStats
+
+        collapsed_stats = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=128,
+            cached_tokens=0,
+            start_time=0.0,
+            first_content_time=0.5,
+            last_content_time=0.5,
+            end_time=0.5,
+            text="x" * 16,
+            content_observed=True,
+        )
+        run = self._make_run(prompt_lengths=[1024])
+        client = self._mock_client(collapsed_stats)
+
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["gen_tps"] is None
+        assert result["tpot_ms"] is None
+        assert result["ttft_ms"] == pytest.approx(500.0)
+        assert result["processing_tps"] == pytest.approx(2000.0)
+
+    async def test_single_result_without_content_reports_ttft_none(self):
+        """When no content or reasoning delta was ever seen, the fallback
+        timestamps make TTFT and pp TPS describe the whole response, so both
+        have to report unmeasured alongside the decode metrics."""
+        from omlx.admin.external_api import StreamStats
+
+        unobserved_stats = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=128,
+            cached_tokens=0,
+            start_time=0.0,
+            # stream_chat_completion falls both timestamps back to end_time
+            first_content_time=1.2,
+            last_content_time=1.2,
+            end_time=1.2,
+            text="",
+            content_observed=False,
+        )
+        run = self._make_run(prompt_lengths=[1024])
+        client = self._mock_client(unobserved_stats)
+
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["ttft_ms"] is None
+        assert result["processing_tps"] is None
+        assert result["gen_tps"] is None
+        assert result["tpot_ms"] is None
+        # e2e still spans a real interval and stays measured
+        assert result["e2e_latency_s"] == pytest.approx(1.2)
+
+    async def test_batch_without_content_reports_none_not_inflated(self):
+        """Models the real collapse on the real clock: no field matched, so
+        every timestamp fell back to end_time, which stream_chat_completion
+        samples inside the request coroutine and therefore always before the
+        wall_end sampled after asyncio.gather.
+
+        The aggregate window stays a small positive number in that state, so
+        a sign check on it cannot detect the collapse and the batch reports
+        millions of tok/s. Measurability has to come from the stats.
+        """
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        async def collapsed_stream(**kwargs):
+            await asyncio.sleep(0.01)
+            now = time.perf_counter()
+            return StreamStats(
+                prompt_tokens=1000,
+                completion_tokens=128,
+                cached_tokens=0,
+                start_time=now - 0.01,
+                first_content_time=now,
+                last_content_time=now,
+                end_time=now,
+                text="",
+                content_observed=False,
+            )
+
+        client = MagicMock()
+        client.stream_chat_completion = collapsed_stream
+
+        result = await _run_external_batch_test(
+            client=client,
+            prompts=["p1", "p2"],
+            max_tokens=128,
+            batch_size=2,
+        )
+
+        assert result["tg_tps"] is None
+        assert result["pp_tps"] is None
+        assert result["avg_ttft_ms"] is None
+        assert result["total_gen_tokens"] == 256
+
+    async def test_batch_single_chunk_dump_keeps_ttft_but_drops_tg(self):
+        """Content arrived, but all of it in one chunk: the decode span is
+        unmeasurable while TTFT and pp TPS are real measurements."""
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        async def single_chunk_stream(**kwargs):
+            await asyncio.sleep(0.01)
+            now = time.perf_counter()
+            return StreamStats(
+                prompt_tokens=1000,
+                completion_tokens=128,
+                cached_tokens=0,
+                start_time=now - 0.01,
+                first_content_time=now,
+                last_content_time=now,
+                end_time=now,
+                text="x" * 16,
+                content_observed=True,
+            )
+
+        client = MagicMock()
+        client.stream_chat_completion = single_chunk_stream
+
+        result = await _run_external_batch_test(
+            client=client,
+            prompts=["p1", "p2"],
+            max_tokens=128,
+            batch_size=2,
+        )
+
+        assert result["tg_tps"] is None
+        assert result["pp_tps"] is not None
+        assert result["avg_ttft_ms"] is not None
+
+    async def test_batch_measurable_window_computes_tg_tps(self):
+        """A real, observed decode span still computes a normal tg_tps, with
+        no regression from the None guard."""
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        measured = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=128,
+            cached_tokens=0,
+            start_time=0.0,
+            first_content_time=0.5,
+            last_content_time=1.5,
+            end_time=1.6,
+            text="x" * 16,
+            content_observed=True,
+        )
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(return_value=measured)
+
+        # A plain two-element side_effect would raise StopIteration on any
+        # other perf_counter call in the process during this block, so fall
+        # back to the last value instead.
+        clock = iter([0.0, 1.6])  # wall_start, wall_end
+        with patch(
+            "omlx.admin.benchmark.time.perf_counter",
+            side_effect=lambda: next(clock, 1.6),
+        ):
+            result = await _run_external_batch_test(
+                client=client,
+                prompts=["p1", "p2"],
+                max_tokens=128,
+                batch_size=2,
+            )
+
+        # total_gen_tokens=256, gen window = wall_end(1.6) - max_first_token(0.5) = 1.1s
+        assert result["tg_tps"] == pytest.approx(256 / 1.1, abs=0.1)
+        assert result["pp_tps"] == pytest.approx(2000 / 0.5, abs=0.1)
 
     async def test_missing_usage_fails_run(self):
         from omlx.admin.external_api import ExternalEndpointError
@@ -1242,9 +1894,7 @@ class TestRunExternalBenchmark:
         )
         client.aclose = AsyncMock()
 
-        with patch(
-            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
-        ):
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
             await run_benchmark(run, MagicMock())
 
         assert run.status == "error"
@@ -1264,9 +1914,7 @@ class TestRunExternalBenchmark:
         client.stream_chat_completion = AsyncMock(side_effect=hang)
         client.aclose = AsyncMock()
 
-        with patch(
-            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
-        ):
+        with patch("omlx.admin.benchmark.ExternalAPIClient", return_value=client):
             task = asyncio.create_task(run_benchmark(run, MagicMock()))
             await started.wait()
             task.cancel()

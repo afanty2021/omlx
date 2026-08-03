@@ -28,6 +28,14 @@
                         class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
                         {{ t('navbar.dropdown.accuracy') }}
                     </button>
+                    <button
+                        @click="setBenchTab('context')"
+                        :class="benchTab === 'context'
+                            ? 'bg-neutral-900 text-white'
+                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                        {{ t('navbar.dropdown.context') }}
+                    </button>
                 </div>
 
                 <!-- Throughput tab -->
@@ -100,6 +108,21 @@
                                         <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
                                     </template>
                                 </select>
+                            </div>
+
+                            <!-- Context Profile -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.context_profile') }}</label>
+                                <select x-model="benchContextProfile"
+                                        :disabled="benchRunning"
+                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                    <option value="code_python">{{ t('bench.config.context.code_python') }}</option>
+                                    <option value="code_mixed">{{ t('bench.config.context.code_mixed') }}</option>
+                                    <option value="novel_ko">{{ t('bench.config.context.novel_ko') }}</option>
+                                    <option value="novel_en">{{ t('bench.config.context.novel_en') }}</option>
+                                    <option value="novel_ja">{{ t('bench.config.context.novel_ja') }}</option>
+                                </select>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.context_hint') }}</p>
                             </div>
 
                             <!-- Single Request Config -->
@@ -279,13 +302,13 @@
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <template x-for="r in benchSingleResults" :key="r.pp">
+                                    <template x-for="r in benchSingleResults" :key="benchRequestedPp(r)">
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
-                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="'pp' + r.pp + '/tg' + r.tg"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="benchSingleTestLabel(r)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.ttft_ms, 1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.tpot_ms, 2)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.processing_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.gen_tps, 1, ' tok/s')"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
@@ -303,7 +326,7 @@
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch.section_label') }}</span>
                             </div>
-                            <span class="text-xs text-neutral-400">{{ t('bench.results.batch.subtitle') }}</span>
+                            <span class="text-xs text-neutral-400" x-text="benchBatchPromptSummary()"></span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">
@@ -320,23 +343,23 @@
                                 </thead>
                                 <tbody>
                                     <!-- 1x baseline from single request -->
-                                    <tr x-show="benchSingleResults.some(r => r.pp === 1024)" class="border-b border-neutral-100 bg-neutral-50/50">
+                                    <tr x-show="benchFindSingle(1024)" class="border-b border-neutral-100 bg-neutral-50/50">
                                         <td class="px-4 py-3 font-medium text-neutral-500">{{ t('bench.results.batch.baseline') }}</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchSingleResults.find(r => r.pp === 1024)?.ttft_ms?.toFixed(1) || '-'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFindSingle(1024)?.ttft_ms?.toFixed(1) || '-'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
                                     </tr>
                                     <template x-for="r in benchBatchResults" :key="r.batch_size">
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r).toFixed(2) + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.pp_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(r.pp_tps / r.batch_size).toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.avg_ttft_ms.toFixed(1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.tg_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) !== null && benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r) !== null ? benchGetSpeedup(r).toFixed(2) + 'x' : 'N/A'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.pp_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFmtNum(benchPpPerReq(r), 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.avg_ttft_ms, 1)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                         </tr>
                                     </template>
@@ -389,6 +412,13 @@
                             </div>
                         </div>
                         <div class="px-6 py-4 space-y-2">
+                            <div x-show="benchUploadFlags.length" x-cloak class="flex flex-wrap items-center gap-2 pb-2">
+                                <span class="text-xs text-neutral-500" x-text="t('bench.upload.flags_label')"></span>
+                                <template x-for="f in benchUploadFlags" :key="f.key">
+                                    <span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium"
+                                          x-text="f.label"></span>
+                                </template>
+                            </div>
                             <template x-for="r in benchUploadResults" :key="r.context_length">
                                 <div class="flex items-center justify-between py-2 border-b border-neutral-100 last:border-0">
                                     <span class="text-sm font-medium text-neutral-700" x-text="'pp' + r.context_length"></span>
@@ -436,7 +466,7 @@
                         </div>
                     </div>
 
-                    <!-- Community Benchmark Upload Skipped (experimental features) -->
+                    <!-- Community Benchmark Upload Skipped (external endpoint) -->
                     <div x-show="benchUploadSkipped" x-cloak
                          class="bg-amber-50 rounded-2xl border border-amber-200 overflow-hidden mb-6">
                         <div class="flex items-center gap-3 px-6 py-4 border-b border-amber-200">
@@ -446,12 +476,7 @@
                         </div>
                         <div class="px-6 py-4 space-y-2">
                             <p class="text-sm text-amber-600"
-                               x-text="benchUploadSkipped?.reason === 'external_endpoint' ? t('bench.upload_skipped.reason_external') : t('bench.upload_skipped.reason')"></p>
-                            <ul class="text-sm text-amber-600 list-disc list-inside">
-                                <template x-for="f in (benchUploadSkipped?.features || [])" :key="f">
-                                    <li x-text="t('bench.upload_skipped.features.' + f)"></li>
-                                </template>
-                            </ul>
+                               x-text="t('bench.upload_skipped.reason_external')"></p>
                         </div>
                     </div>
 
@@ -528,4 +553,5 @@
 
                 <!-- Accuracy tab -->
                 {% include "dashboard/_bench_accuracy.html" %}
+                {% include "dashboard/_bench_context.html" %}
             </div>

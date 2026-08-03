@@ -1,10 +1,38 @@
 import SwiftUI
 
+extension BenchmarkContextProfile {
+    var localizedLabel: String {
+        switch self {
+        case .codePython:
+            String(localized: "bench.throughput.context.code_python",
+                   defaultValue: "Code (Python)",
+                   comment: "Python code context profile for the throughput benchmark")
+        case .codeMixed:
+            String(localized: "bench.throughput.context.code_mixed",
+                   defaultValue: "Code (Mixed)",
+                   comment: "Mixed-language code context profile for the throughput benchmark")
+        case .novelKorean:
+            String(localized: "bench.throughput.context.novel_ko",
+                   defaultValue: "Novel (Korean)",
+                   comment: "Korean novel context profile for the throughput benchmark")
+        case .novelEnglish:
+            String(localized: "bench.throughput.context.novel_en",
+                   defaultValue: "Novel (English)",
+                   comment: "English novel context profile for the throughput benchmark")
+        case .novelJapanese:
+            String(localized: "bench.throughput.context.novel_ja",
+                   defaultValue: "Novel (Japanese)",
+                   comment: "Japanese novel context profile for the throughput benchmark")
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class ThroughputBenchScreenVM {
     // Form state — defaults mirror the HTML admin panel's pre-ticked options.
     var selectedModelId: String = ""
+    var contextProfile: BenchmarkContextProfile = .codePython
     var promptLengths: Set<Int> = [4096, 16384]
     var genLength: String = "128"
     var batchSizes: Set<Int> = [2, 4]
@@ -18,9 +46,10 @@ final class ThroughputBenchScreenVM {
     private(set) var batchResults: [BenchResultDTO] = []
     private(set) var currentBenchId: String?
     /// Server-side upload-to-leaderboard state, populated after the
-    /// bench completes. Phases: "idle" (not yet started, or no upload
-    /// because of experimental features detected later in the run) →
-    /// "uploading" → "done" | "skipped". The poll loop keeps running
+    /// bench completes. Phases: "idle" (not yet started) → "uploading" →
+    /// "done" | "skipped". Only external-endpoint runs skip now;
+    /// accelerated runs upload with their flags attached. The poll loop
+    /// keeps running
     /// past `status=completed` until this reaches a terminal phase so
     /// the user sees the leaderboard URL light up without manually
     /// refreshing.
@@ -48,6 +77,32 @@ final class ThroughputBenchScreenVM {
             && (Int(genLength) ?? 0) > 0
     }
 
+    /// Acceleration features the selected model has enabled, so the user knows
+    /// before starting that the run will be tagged on the leaderboard.
+    /// Derived from settings already fetched by `loadModels()` — no extra
+    /// request. Mirrors `_FEATURE_FLAG_SPECS` in omlx/admin/benchmark.py.
+    var pendingFeatureFlags: [String] {
+        guard let s = models.first(where: { $0.id == selectedModelId })?.settings else {
+            return []
+        }
+        var flags: [String] = []
+        if s.dflashEnabled == true { flags.append("DFlash") }
+        if s.specprefillEnabled == true { flags.append("SpecPrefill") }
+        if s.turboquantKvEnabled == true {
+            if let bits = s.turboquantKvBits {
+                let text = bits == bits.rounded()
+                    ? String(Int(bits))
+                    : String(format: "%g", bits)
+                flags.append("TurboQuant KV \(text)-bit")
+            } else {
+                flags.append("TurboQuant KV")
+            }
+        }
+        if s.mtpEnabled == true { flags.append("Lightning MTP") }
+        if s.vlmMtpEnabled == true { flags.append("VLM MTP") }
+        return flags
+    }
+
     /// Synthetic 1× baseline for the Batch Results table: the first single
     /// trial whose pp == 1024 (matches the JS admin panel's behaviour).
     var batchBaseline: BenchResultDTO? {
@@ -57,7 +112,7 @@ final class ThroughputBenchScreenVM {
 
     /// Monospaced two-table dump used by the Text export card.
     var exportText: String {
-        var lines: [String] = []
+        var lines = ["# Context: \(contextProfile.localizedLabel)", ""]
         if !singleResults.isEmpty {
             lines.append("# Single request results")
             lines.append(
@@ -167,6 +222,7 @@ final class ThroughputBenchScreenVM {
         guard canRun else { return }
         let body = BenchStartRequest(
             modelId: selectedModelId,
+            contextProfile: contextProfile,
             promptLengths: promptLengths.sorted(),
             generationLength: Int(genLength) ?? 128,
             batchSizes: batchSizes.sorted()
@@ -233,6 +289,9 @@ final class ThroughputBenchScreenVM {
                 do {
                     let resp = try await client.getBenchResults(benchId: benchId)
                     await MainActor.run {
+                        if let profile = resp.contextProfile {
+                            self.contextProfile = profile
+                        }
                         self.absorb(results: resp.results)
                         if let err = resp.error, !err.isEmpty {
                             self.lastError = err

@@ -57,6 +57,17 @@ class TestCacheRollback:
         cache = ArraysCache(size=2)
         assert cache.rollback_state is None
 
+    def test_full_accept_clears_pooling_undo_chain(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _clear_rollback
+
+        pool = SimpleNamespace(_undo=object(), _undo_chain=True)
+        container = SimpleNamespace(caches=[SimpleNamespace(caches=[pool])])
+
+        _clear_rollback([container])
+
+        assert pool._undo is None
+        assert pool._undo_chain is False
+
 
 class TestQwen35Model:
     @pytest.fixture(autouse=True)
@@ -1491,6 +1502,17 @@ class TestMtpCompatibilityHelpers:
     def test_has_mtp_heads_nextn_field(self):
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
 
+    def test_has_mtp_heads_dspark_fields(self):
+        assert (
+            _has_mtp_heads(
+                {
+                    "dspark_block_size": 5,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                }
+            )
+            is True
+        )
+
     def test_has_mtp_heads_text_config_field(self):
         assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
 
@@ -2010,3 +2032,55 @@ class TestRotatingCacheMtpUndo:
         assert cache.is_trimmable()
         assert cache.trim(1) == 1
         assert cache.offset == 3
+
+
+class TestParkedScopePerSequence:
+    """The depth-0 hand-off must park exactly one sequence, not the batch.
+
+    GenerationBatch objects are reused across requests through extend()
+    merges, so the parked marker is keyed by uid: it blocks re-activation
+    only while that uid is still in the batch, and a later request that
+    inherits the same batch object gets MTP normally.
+    """
+
+    def _fake_batch(self, uids):
+        model = SimpleNamespace(
+            mtp_forward=lambda *a, **k: None,
+            mtp=object(),
+            _omlx_mtp_decode_enabled=True,
+        )
+        return SimpleNamespace(
+            model=model,
+            uids=list(uids),
+            logits_processors=None,
+        )
+
+    def test_parked_uid_blocks_only_that_sequence(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _mtp_common_eligible
+
+        gb = self._fake_batch([7])
+        assert _mtp_common_eligible(gb)
+        gb._omlx_mtp_parked_uid = 7
+        assert not _mtp_common_eligible(gb)
+        # The parked request finished; a new request reuses the batch object.
+        gb.uids = [8]
+        assert _mtp_common_eligible(gb)
+
+    def test_tax_probe_discarded_when_batch_gains_rows(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        for _ in range(_STD_TAX_SKIP + 2):
+            _record_std_tax_sample(gb, 10.0)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        # Another request merges in mid-probe: multi-row step timings must
+        # not contaminate the singleton loop-tax ratio.
+        gb.uids = [7, 9]
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")

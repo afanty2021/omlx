@@ -37,6 +37,10 @@ import numpy as np
 from omlx.utils.formatting import format_bytes
 
 from .interface import CacheManager
+from .pooling_delta import (
+    POOLING_CACHE_DELTA_CLASS,
+    POOLING_CACHE_DELTA_FORMAT_VERSION,
+)
 from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
@@ -155,8 +159,11 @@ _CACHE_FORMAT_VERSION = "3"
 # Versions whose blocks the current code can read. V3 polyfills V2 blocks
 # whose layer data was stored as the legacy 2-tuple `(keys, values)` —
 # they are upgraded to N-tuple markers on read so the rest of omlx core
-# sees a uniform shape. New writes always use V3.
-_READABLE_CACHE_FORMAT_VERSIONS = frozenset({"2", "3"})
+# sees a uniform shape. New writes use V3 unless a PoolingCache block carries
+# the V4 append-only delta representation.
+_READABLE_CACHE_FORMAT_VERSIONS = frozenset(
+    {"2", "3", POOLING_CACHE_DELTA_FORMAT_VERSION}
+)
 
 
 # Layer cache type names whose meta_state should be clamped on save so the
@@ -204,6 +211,7 @@ def _canonicalize_layer_cache_types(
     wrapper_to_canonical = {
         "SizedArraysCache": "ArraysCache",
         "PrefillReadyRotatingKVCache": "RotatingKVCache",
+        POOLING_CACHE_DELTA_CLASS: "PoolingCache",
         # Batch and single-request TurboQuant caches persist the same packed
         # per-request state (the save path records whichever class name it
         # extracted; the restore path rebuilds a TurboQuantKVCache from
@@ -225,6 +233,7 @@ def _cache_compat_signature(
     block_size: int = 0,
     layer_cache_types: list[str] | None = None,
     turboquant_kv_bits: float | None = None,
+    cachelist_subtypes: dict[str, list[str]] | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -240,6 +249,14 @@ def _cache_compat_signature(
     # byte-identical to the previous format.
     if turboquant_kv_bits is not None:
         payload["turboquant_kv_bits"] = float(turboquant_kv_bits)
+    # Mixed CacheList layers (a non-sliceable sub next to a KVCache, e.g.
+    # inkling's CacheList(KVCache, ArraysCache(4))) additionally stamp
+    # their sub composition: the flat "CacheList" type name cannot tell a
+    # 2-slot ArraysCache block from a 4-slot one, and restoring the wrong
+    # arity IndexErrors in the model. Only stamped when such layers exist
+    # so other signatures stay byte-identical to the previous format.
+    if cachelist_subtypes:
+        payload["cachelist_subtypes"] = cachelist_subtypes
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -290,6 +307,150 @@ def _block_turboquant_bits(
             except (TypeError, ValueError):
                 return None
     return None
+
+
+_CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
+    {
+        "ArraysCache",
+        "SizedArraysCache",
+        "PoolingCache",
+        "BatchPoolingCache",
+        "RotatingKVCache",
+        "BatchRotatingKVCache",
+        "PrefillReadyRotatingKVCache",
+        "BufferedRotatingKVCache",
+    }
+)
+
+_ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
+_POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+
+
+def _canonical_sub_name(name: Any) -> str:
+    """Canonicalize one CacheList sub-cache class name for signatures."""
+    canonical = _canonicalize_layer_cache_types([str(name or "")])
+    return canonical[0] if canonical else ""
+
+
+def _signature_cachelist_subtypes(cache_signature: str) -> dict | None:
+    """Extract ``cachelist_subtypes`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    subtypes = payload.get("cachelist_subtypes")
+    return subtypes if isinstance(subtypes, dict) else None
+
+
+def _block_cachelist_subtypes(
+    cache_data: list[Any] | None,
+    layer_cache_types: list[str] | None,
+    layer_meta_states: list[tuple] | None,
+) -> dict[str, list[str]] | None:
+    """Describe mixed CacheList layers' sub composition from block payload.
+
+    Only layers whose composition contains a non-sliceable sub class are
+    stamped, so signatures of KVCache-only CacheList models (GLM /
+    deepseek_v32) stay byte-identical to the previous format. ArraysCache
+    descriptors carry the slot count (``"ArraysCache:4"``), while pooling
+    descriptors carry the logical state arity (``"PoolingCache:5"``).
+    Both values are part of the persisted layout identity.
+    """
+    if not cache_data or not layer_cache_types:
+        return None
+    subtypes: dict[str, list[str]] = {}
+    for i, cache_type in enumerate(layer_cache_types):
+        if cache_type != "CacheList" or i >= len(cache_data):
+            continue
+        layer_data = cache_data[i]
+        if not (
+            isinstance(layer_data, tuple)
+            and len(layer_data) == 2
+            and layer_data[0] == "__cache_list__"
+            and isinstance(layer_data[1], (list, tuple))
+        ):
+            continue
+        meta_names: list[Any] = []
+        if (
+            layer_meta_states
+            and i < len(layer_meta_states)
+            and isinstance(layer_meta_states[i], (list, tuple))
+            and len(layer_meta_states[i]) >= 1
+            and isinstance(layer_meta_states[i][0], (list, tuple))
+        ):
+            meta_names = list(layer_meta_states[i][0])
+        descriptors: list[str] = []
+        has_non_sliceable = False
+        for j, sub_tensor in enumerate(layer_data[1]):
+            name = _canonical_sub_name(meta_names[j] if j < len(meta_names) else "")
+            element_count = None
+            is_pooling_delta = False
+            if (
+                isinstance(sub_tensor, tuple)
+                and len(sub_tensor) >= 3
+                and sub_tensor[0] == "__nstate__"
+            ):
+                if not name:
+                    name = _canonical_sub_name(sub_tensor[1])
+                if isinstance(sub_tensor[2], (list, tuple)):
+                    element_count = len(sub_tensor[2])
+                    is_pooling_delta = sub_tensor[1] == POOLING_CACHE_DELTA_CLASS
+            elif isinstance(sub_tensor, (list, tuple)):
+                element_count = len(sub_tensor)
+            if name in _CACHELIST_NON_SLICEABLE_SUB_CLASSES:
+                has_non_sliceable = True
+            if name in _ARRAYS_SUB_CLASSES and element_count is not None:
+                descriptors.append(f"ArraysCache:{element_count}")
+            elif name in _POOLING_SUB_CLASSES and element_count is not None:
+                logical_count = element_count - 1 if is_pooling_delta else element_count
+                descriptors.append(f"{name}:{logical_count}")
+            else:
+                descriptors.append(name or "?")
+        if descriptors and has_non_sliceable:
+            subtypes[str(i)] = descriptors
+    return subtypes or None
+
+
+def cachelist_subtypes_from_cache_list(
+    cache_list: list[Any] | tuple[Any, ...] | None,
+) -> dict[str, list[str]] | None:
+    """Describe mixed CacheList layers' sub composition from live caches.
+
+    The live-model counterpart of ``_block_cachelist_subtypes`` — produces
+    the expectation the manager compares stored blocks against. Stamps the
+    same layers (composition contains a non-sliceable sub) with the same
+    descriptor format.
+    """
+    if not cache_list:
+        return None
+    subtypes: dict[str, list[str]] = {}
+    for i, cache_obj in enumerate(cache_list):
+        sub_caches = getattr(cache_obj, "caches", None)
+        if type(cache_obj).__name__ != "CacheList" or not sub_caches:
+            continue
+        descriptors: list[str] = []
+        has_non_sliceable = False
+        for sub in sub_caches:
+            name = _canonical_sub_name(type(sub).__name__)
+            if name in _CACHELIST_NON_SLICEABLE_SUB_CLASSES:
+                has_non_sliceable = True
+            if name in _ARRAYS_SUB_CLASSES:
+                slots = getattr(sub, "cache", None)
+                slot_count = len(slots) if isinstance(slots, list) else 0
+                descriptors.append(f"ArraysCache:{slot_count}")
+            elif name in _POOLING_SUB_CLASSES:
+                state = getattr(sub, "state", ())
+                state_count = len(state) if isinstance(state, (list, tuple)) else 0
+                descriptors.append(f"{name}:{state_count}")
+            else:
+                descriptors.append(name or "?")
+        if descriptors and has_non_sliceable:
+            subtypes[str(i)] = descriptors
+    return subtypes or None
 
 
 def _clamp_rotating_meta_states(
@@ -1216,6 +1377,11 @@ class PagedSSDCacheManager(CacheManager):
         # (the depth is only known once the engine has applied the model's
         # TurboQuant settings, after this manager is constructed).
         self._expected_turboquant_kv_bits: float | None = None
+        # Sub composition of mixed CacheList layers (see
+        # ``cachelist_subtypes_from_cache_list``); learned together with
+        # the layer signature. None disables the check (legacy managers /
+        # models without mixed CacheList layers).
+        self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -1698,6 +1864,15 @@ class PagedSSDCacheManager(CacheManager):
             ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
 
+        # The block must PROVE a matching CacheList sub composition — an
+        # unstamped or mismatched block would rebuild a CacheList whose
+        # sub arity/classes disagree with the live model.
+        if (
+            self._expected_cachelist_subtypes is not None
+            and payload.get("cachelist_subtypes") != self._expected_cachelist_subtypes
+        ):
+            return False
+
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
@@ -1720,6 +1895,22 @@ class PagedSSDCacheManager(CacheManager):
             == self._expected_turboquant_kv_bits
         )
 
+    def is_signature_compatible(self, cache_signature: str) -> bool:
+        """Per-block signature gate for restore paths that bypass the
+        index scan (hot-cache / pending-write loads never pass through
+        ``_is_compatible_block``). Checks the expectation-gated signature
+        fields: TurboQuant depth and CacheList sub composition.
+        """
+        if not self._signature_bits_match(cache_signature or ""):
+            return False
+        if (
+            self._expected_cachelist_subtypes is not None
+            and _signature_cachelist_subtypes(cache_signature or "")
+            != self._expected_cachelist_subtypes
+        ):
+            return False
+        return True
+
     def _expected_cache_signature(self) -> str:
         if (
             not self._expected_model_name
@@ -1734,6 +1925,7 @@ class PagedSSDCacheManager(CacheManager):
             block_size=self._expected_block_size,
             layer_cache_types=self._expected_layer_cache_types,
             turboquant_kv_bits=self._expected_turboquant_kv_bits,
+            cachelist_subtypes=self._expected_cachelist_subtypes,
         )
 
     def _read_file_metadata(self, file_path: Path) -> PagedSSDBlockMetadata | None:
@@ -2049,6 +2241,7 @@ class PagedSSDCacheManager(CacheManager):
             #   is uniform regardless of whether the producer (prefix_cache,
             #   etc.) has been migrated to emit ``__nstate__`` markers yet.
             arrays = {}
+            has_pooling_cache_delta = False
             cache_list_meta = (
                 {}
             )  # Per-layer sidecar metadata (sub_count, state_count, etc.)
@@ -2070,6 +2263,8 @@ class PagedSSDCacheManager(CacheManager):
                     elements = layer_data[2] if len(layer_data) >= 3 else []
                     if class_name:
                         cache_list_meta[f"layer_{i}_state_class_name"] = class_name
+                    if class_name == POOLING_CACHE_DELTA_CLASS:
+                        has_pooling_cache_delta = True
                     _store_nstate_elements(f"layer_{i}", elements)
                 elif (
                     isinstance(layer_data, tuple)
@@ -2097,6 +2292,8 @@ class PagedSSDCacheManager(CacheManager):
                                 cache_list_meta[f"{sub_prefix}_state_class_name"] = (
                                     sub_class_name
                                 )
+                            if sub_class_name == POOLING_CACHE_DELTA_CLASS:
+                                has_pooling_cache_delta = True
                             _store_nstate_elements(sub_prefix, sub_elements)
                         elif (
                             isinstance(sub_tensor, (list, tuple))
@@ -2160,11 +2357,20 @@ class PagedSSDCacheManager(CacheManager):
                     if block_bits is not None
                     else self._expected_turboquant_kv_bits
                 ),
+                # Stamped from the block's own payload (observation), like
+                # the TurboQuant depth above.
+                cachelist_subtypes=_block_cachelist_subtypes(
+                    cache_data, layer_cache_types, layer_meta_states
+                ),
             )
 
             # Prepare metadata
             metadata = {
-                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+                "omlx_cache_format_version": (
+                    POOLING_CACHE_DELTA_FORMAT_VERSION
+                    if has_pooling_cache_delta
+                    else _CACHE_FORMAT_VERSION
+                ),
                 "block_hash": block_hash.hex(),
                 "token_count": str(token_count),
                 "num_layers": str(len(cache_data)),
@@ -3036,6 +3242,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_cache_types: list[str] | None,
         *,
         turboquant_kv_bits: float | None = None,
+        cachelist_subtypes: dict[str, list[str]] | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -3064,21 +3271,31 @@ class PagedSSDCacheManager(CacheManager):
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
             bits_changed = new_bits != self._expected_turboquant_kv_bits
-            if old_canonical == new_canonical and not bits_changed:
+            subtypes_changed = (
+                cachelist_subtypes != self._expected_cachelist_subtypes
+            )
+            if (
+                old_canonical == new_canonical
+                and not bits_changed
+                and not subtypes_changed
+            ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
                 return False
 
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
+            self._expected_cachelist_subtypes = cachelist_subtypes
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
-            "(%d layers, %d unique types, turboquant_kv_bits=%s)",
+            "(%d layers, %d unique types, turboquant_kv_bits=%s, "
+            "cachelist_subtypes=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
+            "yes" if cachelist_subtypes else "no",
         )
         return True
 
@@ -3130,6 +3347,12 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if self._expected_cachelist_subtypes is not None and (
+                    _signature_cachelist_subtypes(meta.cache_signature)
+                    != self._expected_cachelist_subtypes
+                ):
                     stale.append(h)
 
         for h in stale:

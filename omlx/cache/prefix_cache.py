@@ -24,6 +24,7 @@ from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
+    BlockHash,
     BlockTable,
     CacheBlock,
     PagedCacheManager,
@@ -31,6 +32,7 @@ from .paged_cache import (
     resolve_block_extra_keys,
 )
 from .paged_ssd_cache import PagedSSDCacheManager
+from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
@@ -40,6 +42,7 @@ logger = logging.getLogger(__name__)
 # Each entry is two 32-byte hashes; the cap only guards against unbounded
 # growth from many distinct conversation chains over a long-lived process.
 _TIP_LINEAGE_MAX_ENTRIES = 4096
+_EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 
 
 @dataclass
@@ -141,6 +144,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._exact_prefix_hits = 0
+        self._exact_prefix_misses = 0
+        self._exact_prefix_tokens_restored = 0
+        self._exact_prefix_stores = 0
+        self._exact_prefix_store_failures = 0
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -204,9 +212,7 @@ class BlockAwarePrefixCache(CacheManager):
             try:
                 paged_ssd_cache_manager.invalidate_stale_layer_signature()
             except Exception as e:
-                logger.warning(
-                    "Stale-signature sweep on manager attach failed: %s", e
-                )
+                logger.warning("Stale-signature sweep on manager attach failed: %s", e)
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
     def _forget_incompatible_ssd_block(
@@ -393,9 +399,7 @@ class BlockAwarePrefixCache(CacheManager):
             for block_id, expected_hash in zip(
                 matched_block_ids[:num_blocks], chain_hashes
             ):
-                block = self.paged_cache.acquire_cached_block(
-                    block_id, expected_hash
-                )
+                block = self.paged_cache.acquire_cached_block(block_id, expected_hash)
                 if block is None:
                     # Chain broken: self-heal the stale index entry so the
                     # next lookup does not walk the same dead chain.
@@ -440,6 +444,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
         hot_cache_write_back: bool = True,
+        _store_exact_terminal: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -462,6 +467,9 @@ class BlockAwarePrefixCache(CacheManager):
                 ArraysCache state instead of placeholders in hybrid models.
             hot_cache_write_back: When False, SSD-backed hot cache is bypassed
                 for newly stored dirty blocks.
+            _store_exact_terminal: Internal exact-prefix mode that persists the
+                trailing partial block and isolates the terminal hash from
+                ordinary prefix matching.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -528,15 +536,21 @@ class BlockAwarePrefixCache(CacheManager):
         # Skipping partial blocks also ensures is_last_block points to
         # the last full block, which is critical for non-sliceable caches
         # (ArraysCache/RotatingKVCache) that use last-block-only storage.
-        num_new_blocks = len(new_tokens) // self.block_size
+        num_new_blocks = (
+            math.ceil(len(new_tokens) / self.block_size)
+            if _store_exact_terminal
+            else len(new_tokens) // self.block_size
+        )
         trailing_partial_tokens = len(new_tokens) % self.block_size
-        self._last_partial_tokens_skipped = trailing_partial_tokens
+        self._last_partial_tokens_skipped = (
+            0 if _store_exact_terminal else trailing_partial_tokens
+        )
         self._last_tokens_to_next_block = (
             self.block_size - trailing_partial_tokens
-            if trailing_partial_tokens > 0
+            if trailing_partial_tokens > 0 and not _store_exact_terminal
             else 0
         )
-        if trailing_partial_tokens > 0:
+        if trailing_partial_tokens > 0 and not _store_exact_terminal:
             self._partial_block_skips += 1
             self._partial_tokens_skipped += trailing_partial_tokens
             logger.debug(
@@ -570,15 +584,20 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
-            block_extra_keys = resolve_block_extra_keys(
-                global_end,
-                extra_keys=extra_keys,
-                extra_key_token_start=extra_key_token_start,
-                extra_key_ranges=extra_key_ranges,
-            )
+            is_exact_terminal = _store_exact_terminal and i == num_new_blocks - 1
+            block_extra_keys: tuple[Any, ...] | None
+            if is_exact_terminal:
+                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+            else:
+                block_extra_keys = resolve_block_extra_keys(
+                    global_end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
 
             # Check if this block already exists (deduplication)
-            if len(block_tokens) == self.block_size:
+            if len(block_tokens) == self.block_size and not is_exact_terminal:
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -617,10 +636,17 @@ class BlockAwarePrefixCache(CacheManager):
                 model_name=self.paged_cache.model_name,
             )
 
-            # Register hash for full blocks (for deduplication)
-            if len(block_tokens) == self.block_size:
+            # Register ordinary full blocks for general prefix matching. The
+            # exact terminal uses a separate hash domain so it can carry the
+            # complete non-sliceable state without colliding with a normal
+            # block that may contain placeholders.
+            if len(block_tokens) == self.block_size and not is_exact_terminal:
                 self.paged_cache.register_block_hash(
                     block, block_tokens, parent_hash, extra_keys=block_extra_keys
+                )
+            elif is_exact_terminal and block.block_hash is not None:
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block.block_hash, block
                 )
 
             # Extract tensor slice and save to paged SSD
@@ -805,8 +831,12 @@ class BlockAwarePrefixCache(CacheManager):
                 if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._rotating_tip_lineage.clear()
 
-        # Update prefix index
-        self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
+        # Exact terminal blocks are discoverable only through
+        # fetch_exact_prefix(); never expose them to general prefix matching.
+        if not _store_exact_terminal:
+            self._update_prefix_index(
+                tokens, block_table.block_ids, extra_keys=extra_keys
+            )
 
         # Store entry for request tracking
         self._request_tables[request_id] = BlockCacheEntry(
@@ -821,6 +851,151 @@ class BlockAwarePrefixCache(CacheManager):
         )
 
         return block_table
+
+    def store_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        cache_data: list[Any],
+        model_cache_config: ModelCacheConfig | None = None,
+    ) -> BlockTable | None:
+        """Persist a complete prefix, including its exact terminal boundary.
+
+        Ordinary prefix matching remains full-block-only. This path stores one
+        domain-separated terminal block, excludes it from general matching,
+        and restores it only when the complete static-prefix token chain
+        matches. That captures an arbitrary system/tool boundary without
+        making the target model repeatedly prefill its uncached suffix.
+        SSD-backed configurations use write-through so the hot tier is never
+        the only durable copy.
+        """
+        if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        block_table = self.store_cache(
+            request_id,
+            tokens,
+            cache_data,
+            model_cache_config=model_cache_config,
+            hot_cache_write_back=False,
+            _store_exact_terminal=True,
+        )
+        if block_table is None or block_table.num_tokens != len(tokens):
+            self.paged_cache.delete_block_table(request_id)
+            self._request_tables.pop(request_id, None)
+            self._exact_prefix_store_failures += 1
+            return None
+
+        stored_table = block_table.copy(request_id)
+        self._request_tables.pop(request_id, None)
+        self.paged_cache.request_tables.pop(request_id, None)
+        # Drop request ownership while retaining indexed, zero-reference block
+        # metadata so the exact chain remains discoverable and evictable.
+        self.paged_cache.release_for_eviction(block_table.block_ids)
+        self._exact_prefix_stores += 1
+        return stored_table
+
+    def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
+        """Return deterministic block hashes and token counts for an exact prefix."""
+        block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
+        parent_hash: BlockHash | None = None
+        terminal_start = ((len(tokens) - 1) // self.block_size) * self.block_size
+
+        for block_start in range(0, len(tokens), self.block_size):
+            block_tokens = tokens[block_start : block_start + self.block_size]
+            extra_keys = (
+                (_EXACT_PREFIX_TERMINAL_KEY,) if block_start == terminal_start else None
+            )
+            block_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+            block_hashes_and_token_counts.append((block_hash, len(block_tokens)))
+            parent_hash = block_hash
+
+        return block_hashes_and_token_counts
+
+    def fetch_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+    ) -> BlockTable | None:
+        """Acquire an all-or-nothing exact prefix chain from hot cache or SSD."""
+        if not tokens or self.paged_ssd_cache is None:
+            return None
+
+        acquired_blocks: list[CacheBlock] = []
+        for block_hash, token_count in self._exact_prefix_hashes(tokens):
+            cached_block = self.paged_cache.cached_block_hash_to_block.get_block(
+                block_hash
+            )
+            if cached_block is None:
+                if not self.paged_ssd_cache.has_block(block_hash):
+                    for block_to_release in acquired_blocks:
+                        self.paged_cache.free_block(block_to_release.block_id)
+                    return None
+                # Recreate only the paged-manager metadata; reconstruction
+                # still loads the tensor payload from the existing cache tier.
+                cached_block = self.paged_cache.allocate_block()
+                if cached_block is None:
+                    for block_to_release in acquired_blocks:
+                        self.paged_cache.free_block(block_to_release.block_id)
+                    return None
+                cached_block.block_hash = block_hash
+                cached_block.token_count = token_count
+                cached_block.ref_count = 0
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block_hash, cached_block
+                )
+
+            acquired_block = self.paged_cache.acquire_cached_block(
+                cached_block.block_id, block_hash
+            )
+            if acquired_block is None:
+                for previous_block in acquired_blocks:
+                    self.paged_cache.free_block(previous_block.block_id)
+                return None
+            acquired_blocks.append(acquired_block)
+
+        block_table = self.paged_cache.create_block_table(request_id)
+        for acquired_block in acquired_blocks:
+            block_table.add_block(acquired_block.block_id, acquired_block.token_count)
+        self._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            last_access=time.time(),
+        )
+        return block_table
+
+    def restore_exact_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        promote_to_hot_cache: bool,
+    ) -> list[Any] | None:
+        """Reconstruct a complete exact prefix and release temporary block refs."""
+        block_table = self.fetch_exact_prefix(request_id, tokens)
+        if block_table is None:
+            self._exact_prefix_misses += 1
+            return None
+
+        try:
+            if promote_to_hot_cache:
+                self.preload_blocks(block_table)
+            restored_cache = self.reconstruct_cache(
+                block_table,
+                promote_to_hot_cache=promote_to_hot_cache,
+            )
+            if restored_cache is None or block_table.num_tokens != len(tokens):
+                self._exact_prefix_misses += 1
+                return None
+            self._exact_prefix_hits += 1
+            self._exact_prefix_tokens_restored += len(tokens)
+            return restored_cache
+        finally:
+            self.release_cache(request_id)
 
     def _get_cache_seq_len(self, cache_data: list[dict[str, Any]]) -> int:
         """
@@ -1239,6 +1414,17 @@ class BlockAwarePrefixCache(CacheManager):
                 elif cache_type_name == "CacheList":
                     state = layer_state["state"]  # List[sub_state]
                     sub_class_names = layer_state.get("sub_class_names") or []
+                    if not sub_class_names:
+                        # Snapshot entries and older extract paths carry the
+                        # sub class names only inside the composite
+                        # meta_state ([class_names], [sub_meta_states]).
+                        meta = layer_state.get("meta_state")
+                        if (
+                            isinstance(meta, (list, tuple))
+                            and len(meta) >= 2
+                            and isinstance(meta[0], (list, tuple))
+                        ):
+                            sub_class_names = [str(n) for n in meta[0]]
                     if not isinstance(state, list) or len(state) == 0:
                         block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                         continue
@@ -1260,7 +1446,7 @@ class BlockAwarePrefixCache(CacheManager):
                             return sub_class_names[sub_idx]
                         return None
 
-                    def _wrap_sub_marker(sub_idx, elements):
+                    def _wrap_sub_marker(sub_idx, elements, storage_class_name=None):
                         # Length-2 element lists round-trip as legacy
                         # ``(keys, values)`` so existing callers (prefix
                         # cache reconstruct, tests) keep their shape. Real
@@ -1270,7 +1456,7 @@ class BlockAwarePrefixCache(CacheManager):
                             return (elements[0], elements[1])
                         return (
                             "__nstate__",
-                            _sub_class_for(sub_idx),
+                            storage_class_name or _sub_class_for(sub_idx),
                             list(elements),
                         )
 
@@ -1332,9 +1518,14 @@ class BlockAwarePrefixCache(CacheManager):
                                 and layer_idx < len(snapshot_cache_data)
                                 and "state" in snapshot_cache_data[layer_idx]
                             ):
-                                source_state = snapshot_cache_data[layer_idx]["state"]
+                                source_layer = snapshot_cache_data[layer_idx]
+                                source_state = source_layer["state"]
                             else:
+                                source_layer = layer_state
                                 source_state = state
+                            pooling_delta_ranges = source_layer.get(
+                                "pooling_delta_ranges", {}
+                            )
                             if isinstance(source_state, list):
                                 sub_tensors = []
                                 for sub_idx, sub_state in enumerate(source_state):
@@ -1350,9 +1541,28 @@ class BlockAwarePrefixCache(CacheManager):
                                             )
                                             for elem in sub_state
                                         ]
-                                        sub_tensors.append(
-                                            _wrap_sub_marker(sub_idx, cloned)
+                                        delta_range = pooling_delta_ranges.get(
+                                            str(sub_idx)
                                         )
+                                        if (
+                                            _sub_class_for(sub_idx) == "PoolingCache"
+                                            and isinstance(delta_range, (list, tuple))
+                                            and len(delta_range) == 2
+                                        ):
+                                            cloned.append(
+                                                mx.array(delta_range, dtype=mx.int64)
+                                            )
+                                            sub_tensors.append(
+                                                _wrap_sub_marker(
+                                                    sub_idx,
+                                                    cloned,
+                                                    POOLING_CACHE_DELTA_CLASS,
+                                                )
+                                            )
+                                        else:
+                                            sub_tensors.append(
+                                                _wrap_sub_marker(sub_idx, cloned)
+                                            )
                                 block_slices.append(("__cache_list__", sub_tensors))
                             else:
                                 block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
@@ -1779,9 +1989,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # Load with metadata for type information
                 if promote_to_hot_cache:
                     block_data, block_metadata = (
-                        self.paged_ssd_cache.load_block_with_metadata(
-                            block.block_hash
-                        )
+                        self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
                     )
                 else:
                     block_data, block_metadata = (
@@ -1875,6 +2083,27 @@ class BlockAwarePrefixCache(CacheManager):
                             block_id,
                             block_layer_cache_types,
                             layer_cache_types,
+                        )
+                        self._forget_incompatible_ssd_block(
+                            block.block_hash, block.block_id
+                        )
+                        break
+
+                    # Expectation-gated signature fields (TurboQuant depth,
+                    # CacheList sub composition). Hot-cache / pending-write
+                    # loads bypass the manager's index-scan compatibility
+                    # check, so the restore loop must gate them here.
+                    signature_gate = getattr(
+                        self.paged_ssd_cache, "is_signature_compatible", None
+                    )
+                    if callable(signature_gate) and not signature_gate(
+                        block_metadata.get("cache_signature", "")
+                    ):
+                        logger.warning(
+                            "Cache signature mismatch at block %s "
+                            "(TurboQuant depth or CacheList sub composition). "
+                            "Truncating cached prefix before this block.",
+                            block_id,
                         )
                         self._forget_incompatible_ssd_block(
                             block.block_hash, block.block_id
@@ -2038,6 +2267,15 @@ class BlockAwarePrefixCache(CacheManager):
                             return list(sub_state)
                         return None
 
+                    def _sub_state_class(sub_state):
+                        if (
+                            isinstance(sub_state, tuple)
+                            and len(sub_state) >= 3
+                            and sub_state[0] == "__nstate__"
+                        ):
+                            return sub_state[1]
+                        return None
+
                     # Collect CacheList data from all blocks that have List[sub_state]
                     cl_block_data = []
                     for block_data in all_block_data:
@@ -2079,6 +2317,7 @@ class BlockAwarePrefixCache(CacheManager):
                     non_sliceable_sub_classes = {
                         "PoolingCache",
                         "ArraysCache",
+                        "SizedArraysCache",
                         "BatchPoolingCache",
                     }
 
@@ -2088,25 +2327,42 @@ class BlockAwarePrefixCache(CacheManager):
                             or CacheTypeRegistry.is_rotating_family(class_name)
                         )
 
-                    if len(cl_block_data) > 1:
-                        # Per-block storage: concatenate sliceable sub-caches
-                        # element-wise; pick last block for non-sliceable.
+                    # The store path (_extract_block_tensor_slice) picks ONE
+                    # storage mode for the whole layer: per-block slices only
+                    # when every sub-state is a >=2-element tuple of 4D
+                    # sequence tensors and no sub is a known non-sliceable
+                    # class; otherwise EVERY block stores the full cumulative
+                    # state of ALL subs at that block's boundary. Restore
+                    # mirrors that layer-level decision here. Dispatching per
+                    # sub (concat KVCache subs, last-block the rest) silently
+                    # concatenated a mixed CacheList's cumulative KV snapshots
+                    # into a duplicated sequence (e.g. inkling-style
+                    # CacheList(KVCache, ArraysCache): 4+8+12 tokens instead
+                    # of 12).
+                    any_non_sliceable_sub = any(
+                        _is_non_sliceable_sub_class(
+                            sub_class_names_for_layer[j]
+                            if j < len(sub_class_names_for_layer)
+                            else ""
+                        )
+                        for j in range(num_sub_caches)
+                    )
+                    last_block_elements = [
+                        _sub_state_elements(s) for s in cl_block_data[-1]
+                    ]
+                    stored_slice_mode = not any_non_sliceable_sub and all(
+                        elems is not None
+                        and len(elems) >= 2
+                        and hasattr(elems[0], "shape")
+                        and len(elems[0].shape) == 4
+                        for elems in last_block_elements
+                    )
+
+                    if len(cl_block_data) > 1 and stored_slice_mode:
+                        # Per-block slices: concatenate every sub along the
+                        # sequence axis into the full sequence.
                         concatenated_sub_states = []
                         for j in range(num_sub_caches):
-                            sub_class = (
-                                sub_class_names_for_layer[j]
-                                if j < len(sub_class_names_for_layer)
-                                else ""
-                            )
-                            if _is_non_sliceable_sub_class(sub_class):
-                                # Each saved block already snapshots the
-                                # full state at its boundary — pick the
-                                # last block, which corresponds to the
-                                # latest boundary of the matched prefix.
-                                concatenated_sub_states.append(
-                                    tuple(_sub_state_elements(cl_block_data[-1][j]))
-                                )
-                                continue
                             per_block_elements = [
                                 _sub_state_elements(bd[j]) for bd in cl_block_data
                             ]
@@ -2139,12 +2395,104 @@ class BlockAwarePrefixCache(CacheManager):
                                     cat_elements.append(column[-1])
                             concatenated_sub_states.append(tuple(cat_elements))
                     else:
-                        # Single block: unwrap markers to raw tuples so the
-                        # downstream handler.reconstruct_cache → sub_handler.
-                        # deserialize_state pipeline sees uniform N-tuples.
-                        concatenated_sub_states = [
-                            tuple(_sub_state_elements(s)) for s in cl_block_data[0]
-                        ]
+                        # Cumulative snapshots (or a single block): the last
+                        # matched block already holds the complete state of
+                        # every sub at its boundary. PoolingCache V4 markers
+                        # are the exception: their append-only pooled tensor
+                        # is stored as an absolute-range delta per block and
+                        # must be rebuilt in order. A legacy full snapshot may
+                        # appear before V4 deltas in an existing cache chain;
+                        # it becomes the reconstruction base.
+                        concatenated_sub_states = []
+                        for j, last_elements in enumerate(last_block_elements):
+                            has_pooling_deltas = any(
+                                _sub_state_class(bd[j]) == POOLING_CACHE_DELTA_CLASS
+                                for bd in cl_block_data
+                            )
+                            if not has_pooling_deltas:
+                                concatenated_sub_states.append(tuple(last_elements))
+                                continue
+
+                            pooled_parts = []
+                            pooled_length = 0
+                            last_pooling_state = None
+                            valid_pooling_chain = True
+                            for block_cache_list in cl_block_data:
+                                sub_state = block_cache_list[j]
+                                elements = _sub_state_elements(sub_state)
+                                marker_class = _sub_state_class(sub_state)
+                                if elements is None:
+                                    valid_pooling_chain = False
+                                    break
+
+                                if marker_class != POOLING_CACHE_DELTA_CLASS:
+                                    if len(elements) < 3:
+                                        valid_pooling_chain = False
+                                        break
+                                    if elements[2] is None:
+                                        pooled_parts = []
+                                        pooled_length = 0
+                                    elif (
+                                        hasattr(elements[2], "shape")
+                                        and len(elements[2].shape) >= 2
+                                    ):
+                                        pooled_parts = [elements[2]]
+                                        pooled_length = int(elements[2].shape[1])
+                                    else:
+                                        valid_pooling_chain = False
+                                        break
+                                    last_pooling_state = list(elements)
+                                    continue
+
+                                if (
+                                    len(elements) not in (4, 6)
+                                    or not hasattr(elements[2], "shape")
+                                    or len(elements[2].shape) < 2
+                                    or not hasattr(elements[-1], "tolist")
+                                ):
+                                    valid_pooling_chain = False
+                                    break
+                                try:
+                                    delta_range = elements[-1].tolist()
+                                    delta_start, delta_end = (
+                                        int(delta_range[0]),
+                                        int(delta_range[1]),
+                                    )
+                                except (IndexError, TypeError, ValueError):
+                                    valid_pooling_chain = False
+                                    break
+                                if (
+                                    delta_start != pooled_length
+                                    or delta_end < delta_start
+                                    or int(elements[2].shape[1])
+                                    != delta_end - delta_start
+                                ):
+                                    valid_pooling_chain = False
+                                    break
+                                pooled_parts.append(elements[2])
+                                pooled_length = delta_end
+                                last_pooling_state = list(elements[:-1])
+
+                            if (
+                                not valid_pooling_chain
+                                or not pooled_parts
+                                or last_pooling_state is None
+                            ):
+                                logger.info(
+                                    "CacheList layer %d sub-cache %d: invalid "
+                                    "PoolingCache delta chain. Rejecting cache.",
+                                    layer_idx,
+                                    j,
+                                )
+                                return None
+
+                            pooled = (
+                                pooled_parts[0]
+                                if len(pooled_parts) == 1
+                                else mx.concatenate(pooled_parts, axis=1)
+                            )
+                            last_pooling_state[2] = pooled
+                            concatenated_sub_states.append(tuple(last_pooling_state))
 
                     # Build meta_state with correct offsets for reconstructed
                     # sequence length (may differ from original if partial match)
@@ -3170,6 +3518,11 @@ class BlockAwarePrefixCache(CacheManager):
             last_tokens_to_next_block=self._last_tokens_to_next_block,
             tokens_matched_total=self._tokens_matched_total,
             tokens_requested_total=self._tokens_requested_total,
+            exact_prefix_hits=self._exact_prefix_hits,
+            exact_prefix_misses=self._exact_prefix_misses,
+            exact_prefix_tokens_restored=self._exact_prefix_tokens_restored,
+            exact_prefix_stores=self._exact_prefix_stores,
+            exact_prefix_store_failures=self._exact_prefix_store_failures,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -3198,6 +3551,11 @@ class BlockAwarePrefixCache(CacheManager):
             "last_tokens_to_next_block": self._last_tokens_to_next_block,
             "tokens_matched_total": self._tokens_matched_total,
             "tokens_requested_total": self._tokens_requested_total,
+            "exact_prefix_hits": self._exact_prefix_hits,
+            "exact_prefix_misses": self._exact_prefix_misses,
+            "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
+            "exact_prefix_stores": self._exact_prefix_stores,
+            "exact_prefix_store_failures": self._exact_prefix_store_failures,
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -3213,6 +3571,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._exact_prefix_hits = 0
+        self._exact_prefix_misses = 0
+        self._exact_prefix_tokens_restored = 0
+        self._exact_prefix_stores = 0
+        self._exact_prefix_store_failures = 0
         self.paged_cache.reset_stats()
 
     def clear(self) -> int:

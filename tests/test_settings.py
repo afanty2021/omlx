@@ -322,7 +322,20 @@ class TestSchedulerSettings:
             "max_concurrent_requests": 8,
             "embedding_batch_size": 32,
             "chunked_prefill": False,
+            "prefill_priority": "context",
         }
+
+    def test_prefill_priority_from_dict(self):
+        """Valid values pass through; anything else falls back to context."""
+        assert SchedulerSettings.from_dict({}).prefill_priority == "context"
+        assert (
+            SchedulerSettings.from_dict({"prefill_priority": "speed"}).prefill_priority
+            == "speed"
+        )
+        assert (
+            SchedulerSettings.from_dict({"prefill_priority": "bogus"}).prefill_priority
+            == "context"
+        )
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -821,6 +834,48 @@ class TestGlobalSettings:
         assert settings.memory.memory_guard_tier == "custom"
         assert settings.memory.memory_guard_custom_ceiling_gb == 48.0
 
+    def test_cli_memory_guard_off_disables_the_guard(self, tmp_path):
+        args = Namespace(memory_guard="off", memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is False
+        # The tier is left alone so turning the guard back on restores it.
+        assert settings.memory.memory_guard_tier == "balanced"
+
+    def test_cli_tier_turns_a_disabled_guard_back_on(self, tmp_path):
+        """A saved prefill_memory_guard=false used to make --memory-guard a
+        silent no-op: the enforcer reports a ceiling of 0 with the guard off,
+        so the requested tier governed nothing."""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"memory": {"prefill_memory_guard": False}})
+        )
+        args = Namespace(memory_guard="aggressive", memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is True
+        assert settings.memory.memory_guard_tier == "aggressive"
+
+    def test_cli_memory_guard_gb_turns_a_disabled_guard_back_on(self, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"memory": {"prefill_memory_guard": False}})
+        )
+        args = Namespace(memory_guard=None, memory_guard_gb=20.0)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is True
+        assert settings.memory.memory_guard_tier == "custom"
+        assert settings.memory.memory_guard_custom_ceiling_gb == 20.0
+
+    def test_cli_memory_guard_absent_leaves_saved_state(self, tmp_path):
+        """No flag means "use settings.json", both ways."""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"memory": {"prefill_memory_guard": False}})
+        )
+        args = Namespace(memory_guard=None, memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.prefill_memory_guard is False
+
     def test_load_from_file(self):
         """Test loading settings from JSON file."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -918,6 +973,20 @@ class TestGlobalSettings:
             assert data["version"] == "1.0"
             assert data["server"]["port"] == 9001
             assert data["auth"]["api_key"] == "saved-key"
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions only")
+    def test_save_restricts_settings_file_permissions(self):
+        """Credential-bearing settings are readable only by their owner."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.save()
+
+            settings_file = Path(tmpdir) / "settings.json"
+            assert settings_file.stat().st_mode & 0o777 == 0o600
+
+            settings_file.chmod(0o644)
+            settings.save()
+            assert settings_file.stat().st_mode & 0o777 == 0o600
 
     def test_save_and_load_cors_origins(self):
         """Test saving and loading cors_origins through settings file."""
@@ -1427,6 +1496,61 @@ class TestGlobalSettings:
             assert settings.cache.ssd_cache_dir == "/cli/cache"
             assert settings.cache.ssd_cache_max_size == "500GB"
 
+    def test_cli_override_paged_ssd_cache(self):
+        """Public serve cache flags persist to the matching settings fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                paged_ssd_cache_dir="/cli/cache",
+                paged_ssd_cache_max_size="500GB",
+                hot_cache_max_size="8GB",
+                no_cache=False,
+            )
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.cache.enabled = False
+            settings._apply_cli_overrides(args)
+            assert settings.cache.enabled is True
+            assert settings.cache.ssd_cache_dir == "/cli/cache"
+            assert settings.cache.ssd_cache_max_size == "500GB"
+            assert settings.cache.hot_cache_max_size == "8GB"
+
+    def test_cli_override_no_cache(self):
+        """--no-cache persists an explicit cache disablement."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings.load(
+                base_path=tmpdir,
+                cli_args=Namespace(
+                    paged_ssd_cache_dir="/cli/cache",
+                    no_cache=True,
+                ),
+            )
+            assert settings.cache.enabled is False
+            assert settings.cache.ssd_cache_dir == "/cli/cache"
+
+    def test_save_cli_overrides_preserves_runtime_secrets_and_env(self):
+        """Saving a CLI setting must not serialize transient overrides."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            stored = GlobalSettings(base_path=base_path)
+            stored.auth.api_key = "stored-key"
+            stored.cache.enabled = True
+            stored.save()
+
+            args = Namespace(port=8765, api_key="cli-key")
+            with patch.dict(
+                os.environ,
+                {"OMLX_API_KEY": "env-key", "OMLX_CACHE_ENABLED": "false"},
+                clear=False,
+            ):
+                runtime = GlobalSettings.load(base_path=base_path, cli_args=args)
+                assert runtime.auth.api_key == "cli-key"
+                assert runtime.cache.enabled is False
+                runtime.save_cli_overrides(args)
+
+            persisted = GlobalSettings.load(base_path=base_path)
+            assert persisted.server.port == 8765
+            assert persisted.auth.api_key == "stored-key"
+            assert persisted.cache.enabled is True
+
     def test_cli_override_initial_cache_blocks(self):
         """Test CLI override for initial_cache_blocks."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1869,42 +1993,35 @@ class TestClaudeCodeSettings:
     def test_defaults(self):
         """Test default values."""
         settings = ClaudeCodeSettings()
-        assert settings.context_scaling_enabled is False
-        assert settings.target_context_size == 200000
-
-    def test_custom_values(self):
-        """Test custom values."""
-        settings = ClaudeCodeSettings(
-            context_scaling_enabled=True, target_context_size=131072
-        )
-        assert settings.context_scaling_enabled is True
-        assert settings.target_context_size == 131072
+        assert settings.mode == "cloud"
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = ClaudeCodeSettings(
-            context_scaling_enabled=True, target_context_size=100000
-        )
+        settings = ClaudeCodeSettings(mode="cloud")
         result = settings.to_dict()
-        assert result["context_scaling_enabled"] is True
-        assert result["target_context_size"] == 100000
         assert result["mode"] == "cloud"
         assert result["opus_model"] is None
         assert result["sonnet_model"] is None
         assert result["haiku_model"] is None
 
-    def test_from_dict(self):
-        """Test creation from dictionary."""
-        data = {"context_scaling_enabled": True, "target_context_size": 131072}
+    def test_from_dict_ignores_legacy_scaling_keys(self):
+        """Old settings.json with context_scaling_enabled/target_context_size
+        (or the later autocompact_threshold_pct) must load without error;
+        the removed keys are silently dropped — no cache-credit-adjacent
+        setting replaces them, since auto-compact is now driven entirely by
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS / CLAUDE_CODE_AUTO_COMPACT_WINDOW
+        (see fix-claude-code-autocompact-threshold's follow-up design)."""
+        data = {
+            "context_scaling_enabled": True,
+            "target_context_size": 1000000,
+            "autocompact_threshold_pct": 90,
+            "mode": "local",
+        }
         settings = ClaudeCodeSettings.from_dict(data)
-        assert settings.context_scaling_enabled is True
-        assert settings.target_context_size == 131072
-
-    def test_from_dict_defaults(self):
-        """Test from_dict uses defaults for missing fields."""
-        settings = ClaudeCodeSettings.from_dict({})
-        assert settings.context_scaling_enabled is False
-        assert settings.target_context_size == 200000
+        assert settings.mode == "local"
+        assert not hasattr(settings, "context_scaling_enabled")
+        assert not hasattr(settings, "target_context_size")
+        assert not hasattr(settings, "autocompact_threshold_pct")
 
     def test_new_fields_defaults(self):
         """Test that the four new fields have correct defaults."""
@@ -2117,11 +2234,9 @@ class TestClaudeCodeValidation:
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
-    def test_claude_code_to_dict_has_six_keys(self):
-        """to_dict must include all six keys so GlobalSettings.save() persists them."""
+    def test_claude_code_to_dict_has_four_keys(self):
+        """to_dict must include all four keys so GlobalSettings.save() persists them."""
         s = ClaudeCodeSettings(
-            context_scaling_enabled=True,
-            target_context_size=100000,
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
             sonnet_model="mlx-community/Qwen3-14B-4bit",
@@ -2129,8 +2244,6 @@ class TestClaudeCodeRouteIntegration:
         )
         d = s.to_dict()
         expected_keys = {
-            "context_scaling_enabled",
-            "target_context_size",
             "mode",
             "opus_model",
             "sonnet_model",

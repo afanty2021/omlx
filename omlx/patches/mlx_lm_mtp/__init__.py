@@ -100,14 +100,18 @@ def apply_mlx_lm_mtp_patch() -> bool:
         batch_generator,
         cache_rollback,
         deepseek_v4_model,
+        gemma4_text_model,
         glm_moe_dsa_model,
         nemotron_h_chain,
         nemotron_h_model,
         qwen35_model,
+        step3p7_model,
     )
 
     if not cache_rollback.apply():
         return False
+    if not gemma4_text_model.apply():
+        logger.debug("gemma4 text sanitize patch did not apply (likely import error)")
     if not qwen35_model.apply():
         # Qwen models are the main target; if the qwen patch refuses we
         # still continue so DeepSeek-V4 users aren't blocked.
@@ -116,6 +120,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
     if not glm_moe_dsa_model.apply():
         logger.debug("GLM-5.2 MTP patch did not apply (likely missing base patch)")
+    if not step3p7_model.apply():
+        logger.debug("Step-3.7 MTP patch did not apply (likely missing base patch)")
     if not nemotron_h_model.apply():
         logger.debug("nemotron_h MTP patch did not apply (likely import error)")
     elif not nemotron_h_chain.apply():
@@ -134,5 +140,9 @@ def apply_mlx_lm_mtp_patch() -> bool:
         apply_verify_qmm_patch()
     except Exception:
         logger.debug("verify qmm patch not applied", exc_info=True)
+
+    from ..deepseek_v4.decode_consistency import apply as apply_ds_consistency
+
+    apply_ds_consistency()
 
     return True
