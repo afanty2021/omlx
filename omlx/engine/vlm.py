@@ -52,6 +52,7 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
+from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -1877,7 +1878,6 @@ class VLMBatchedEngine(BaseEngine):
                         lm_load_compat as mlx_lm_load,
                         maybe_load_custom_quantization,
                     )
-                    from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
