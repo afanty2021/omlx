@@ -367,17 +367,14 @@ class TestDSMLToolParser:
 
 
 class TestChatTemplateV4:
-    """chat_template_v4 — DSML system prompt + tool_calls render."""
+    """Official DeepSeek V4 0731 encoding plus the mlx-lm adapter."""
 
     def test_outer_marker_uses_tool_calls_not_function_calls(self, applied_patch):
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 
-        # vllm's DeepSeekV4ToolParser overrides only the outer marker
-        # name (tool_calls vs V3.2's function_calls). Verify our copy
-        # made that one edit.
         assert "function_calls" not in ct.tool_calls_template
         assert "tool_calls" in ct.tool_calls_template
-        assert "function_calls" not in ct.TOOLS_SYSTEM_TEMPLATE
+        assert "function_calls" not in ct.TOOLS_TEMPLATE
 
     def test_inner_grammar_unchanged_from_v32(self, applied_patch):
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
@@ -400,7 +397,9 @@ class TestChatTemplateV4:
             dsml_token=ct.dsml_token, name="f", arguments=encoded_args
         )
         block = ct.tool_calls_template.format(
-            dsml_token=ct.dsml_token, tool_calls=invoke
+            dsml_token=ct.dsml_token,
+            tool_calls=invoke,
+            tc_block_name=ct.tool_calls_block_name,
         )
         # Strip the outer markers as TokenizerWrapper would.
         inner = (
@@ -441,7 +440,7 @@ class TestChatTemplateV4:
             tools=tools,
             add_generation_prompt=True,
         )
-        assert "<functions>" in prompt
+        assert "### Available Tool Schemas" in prompt
         assert "get_weather" in prompt
         assert ct.dsml_token in prompt
 
@@ -476,7 +475,7 @@ class TestChatTemplateV4:
         )
         assert "You are a helpful assistant." in prompt
         # Only one tools block — no double-injection from synthetic prepend.
-        assert prompt.count("<functions>") == 1
+        assert prompt.count("### Available Tool Schemas") == 1
 
     def test_user_only_no_tools_no_prepend(self, applied_patch):
         """No tools → no synthetic system. Plain user-only request renders
@@ -487,8 +486,138 @@ class TestChatTemplateV4:
             [{"role": "user", "content": "Hi"}],
             add_generation_prompt=True,
         )
-        assert "<functions>" not in prompt
+        assert "### Available Tool Schemas" not in prompt
         assert "## Tools" not in prompt
+
+    def test_official_basic_thinking_prompt(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "system", "content": "Be helpful."},
+                {"role": "user", "content": "Hello"},
+            ],
+            add_generation_prompt=True,
+        )
+
+        assert prompt == (
+            "<｜begin▁of▁sentence｜>Be helpful." "<｜User｜>Hello<｜Assistant｜><think>"
+        )
+
+    def test_official_latest_reminder_before_user(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "system", "content": "Be helpful."},
+                {"role": "latest_reminder", "content": "2026-08-04,Seoul"},
+                {"role": "user", "content": "Hello"},
+            ],
+            add_generation_prompt=True,
+        )
+
+        assert prompt == (
+            "<｜begin▁of▁sentence｜>Be helpful."
+            "<｜latest_reminder｜>2026-08-04,Seoul"
+            "<｜User｜>Hello<｜Assistant｜><think>"
+        )
+
+    def test_official_tool_result_is_merged_into_user_turn(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "user", "content": "Look it up"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": {"query": "oMLX"},
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "result",
+                },
+            ],
+            add_generation_prompt=True,
+        )
+
+        assert "<｜User｜><tool_result>result</tool_result>" in prompt
+        assert prompt.endswith("<｜Assistant｜><think>")
+
+    def test_declares_generic_mid_system_unsupported(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        assert ct.supports_mid_system_messages is False
+        assert ct.apply_chat_template.supports_mid_system_messages is False
+
+    def test_relocates_claude_tail_system_before_its_user(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        relocated = ct.relocate_mid_system_messages(messages)
+
+        assert relocated == [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "latest_reminder", "content": "Plan mode"},
+            {"role": "user", "content": "Hello"},
+        ]
+        assert messages[1]["role"] == "user"
+        prompt = ct.apply_chat_template(relocated, add_generation_prompt=True)
+        assert prompt == (
+            "<｜begin▁of▁sentence｜>Be helpful."
+            "<｜latest_reminder｜>Plan mode"
+            "<｜User｜>Hello<｜Assistant｜><think>"
+        )
+
+    def test_relocation_merges_system_run_before_same_user(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        relocated = ct.relocate_mid_system_messages(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "Plan mode"},
+                {"role": "system", "content": "Hook context"},
+                {"role": "assistant", "content": "OK"},
+            ]
+        )
+
+        assert relocated == [
+            {
+                "role": "latest_reminder",
+                "content": "Plan mode\n\nHook context",
+            },
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "OK"},
+        ]
+
+    def test_relocation_refuses_ambiguous_system_placement(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        assert (
+            ct.relocate_mid_system_messages(
+                [
+                    {"role": "user", "content": "First"},
+                    {"role": "system", "content": "Ambiguous"},
+                    {"role": "user", "content": "Second"},
+                ]
+            )
+            is None
+        )
 
     def test_encode_arguments_accepts_dict(self, applied_patch):
         """Anthropic /v1/messages history stores tool_call arguments as
@@ -1460,3 +1589,137 @@ class TestNaxMoEStockRouting:
         gated = linear._native_block_kind(decode_x, True)
         monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: False)
         assert gated == linear._native_block_kind(decode_x, True)
+
+
+class TestIndexerFallbackTiling:
+    """The MLX indexer fallback (used when the native glm_moe_dsa kernel is
+    not built) tiles the pooled axis so its (B, heads, L, P) intermediate
+    never crosses 2**31 elements — the boundary where mlx int32 kernel
+    indexing silently zeroes the tail and corrupts top-k selection at
+    >256k context — while keeping top-k selection identical to the untiled
+    reduction."""
+
+    def _reduce_and_ref(self):
+        # The patch registers deepseek_v4_model.py as mlx_lm.models.deepseek_v4
+        # (its relative `.base` import resolves there); import it by that name.
+        import sys
+
+        import mlx.core as mx
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        return mx, dm
+
+    def test_head_reduce_matches_naive(self, applied_patch):
+        mx, dm = self._reduce_and_ref()
+        mx.random.seed(0)
+        scores = mx.random.normal((1, 8, 16, 64))
+        weights = mx.random.normal((1, 8, 16, 1))
+        got = dm._indexer_head_reduce(scores, weights, 0.125)
+        ref = (mx.maximum(scores, 0) * 0.125 * weights).sum(axis=1)
+        assert float(mx.abs(got - ref).max()) < 1e-5
+
+    def test_missing_native_warning_fires_once(
+        self, applied_patch, caplog, monkeypatch
+    ):
+        import logging
+        import sys
+
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        config = dm.ModelArgs(
+            hidden_size=16,
+            q_lora_rank=16,
+            qk_rope_head_dim=2,
+            num_hidden_layers=1,
+            compress_ratios=[4],
+            index_n_heads=32,
+            index_head_dim=128,
+            index_topk=8,
+        )
+        indexer = dm.Indexer(config, compress_ratio=4)
+        pooled = mx.zeros((1, 64, 128), dtype=mx.float16)
+        monkeypatch.setattr(
+            dm.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: pooled,
+        )
+        monkeypatch.setattr(glm_fast, "has_symbol", lambda name: False)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_NATIVE_DISABLED", False)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_FALLBACK_WARNED", False)
+
+        x = mx.zeros((1, 64, 16), dtype=mx.float16)
+        projected_q = mx.zeros((1, 32, 64, 128), dtype=mx.float16)
+        projected_weights = mx.zeros((1, 64, 32), dtype=mx.float16)
+        with caplog.at_level(logging.WARNING, logger=dm.__name__):
+            for _ in range(2):
+                result = indexer(
+                    x,
+                    q_residual=x,
+                    position_rope=None,
+                    pool_cache=None,
+                    offset=0,
+                    projected_q=projected_q,
+                    projected_weights=projected_weights,
+                )
+                mx.eval(result)
+
+        fallback_warnings = [
+            record
+            for record in caplog.records
+            if "native dsa_indexer_scores/dsa_topk_indices unavailable"
+            in record.getMessage()
+        ]
+        assert len(fallback_warnings) == 1
+
+    def test_tiling_selects_identical_topk(self, applied_patch):
+        # Split a non-reduced axis: the top-k indices must be bit-stable
+        # regardless of tile size, at pooled counts that straddle the tile.
+        mx, dm = self._reduce_and_ref()
+        mx.random.seed(1)
+        heads, length, head_dim, topk = 64, 32, 128, 64
+        scale = head_dim**-0.5
+
+        def untiled(q, pooled, w):
+            wf = (w.astype(mx.float32)).swapaxes(-1, -2)[..., None]
+            s = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
+                mx.float32
+            )
+            return dm._indexer_head_reduce(s, wf, scale)
+
+        def tiled(q, pooled, w, tile):
+            wf = (w.astype(mx.float32)).swapaxes(-1, -2)[..., None]
+            qf = q.astype(mx.float32)
+            kf = pooled[:, None].swapaxes(-1, -2).astype(mx.float32)
+            pool_count = pooled.shape[1]
+            if pool_count <= tile:
+                return dm._indexer_head_reduce(qf @ kf, wf, scale)
+            return mx.concatenate(
+                [
+                    dm._indexer_head_reduce(qf @ kf[..., s : s + tile], wf, scale)
+                    for s in range(0, pool_count, tile)
+                ],
+                axis=-1,
+            )
+
+        for pool_count in (255, 256, 257, 800):
+            q = mx.random.normal((1, heads, length, head_dim))
+            pooled = mx.random.normal((1, pool_count, head_dim))
+            w = mx.random.normal((1, length, heads))
+            a = untiled(q, pooled, w)
+            b = tiled(q, pooled, w, tile=256)
+            k = min(topk, pool_count)
+            ia = mx.sort(mx.argpartition(-a, k - 1, axis=-1)[..., :k], axis=-1)
+            ib = mx.sort(mx.argpartition(-b, k - 1, axis=-1)[..., :k], axis=-1)
+            assert (
+                int((ia != ib).sum()) == 0
+            ), f"top-k differs at pool_count={pool_count}"
+
+    def test_tile_stays_under_int32_index_limit(self, applied_patch):
+        # The prefill chunk is 512 and index heads are 64; the tiled matmul
+        # output must stay below 2**31 elements at any context length.
+        _, dm = self._reduce_and_ref()
+        assert 64 * 512 * dm._INDEXER_POOL_TILE < 2**31
+        assert dm._INDEXER_MAX_ELEMS < 2**31

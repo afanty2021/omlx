@@ -5571,6 +5571,7 @@ class Scheduler:
             )
 
         self._boundary_snapshot_required = True
+        self._enable_mtp_boundary_alignment()
         logger.debug(
             "Captured prefill boundary cache snapshot for %s at %s tokens",
             request_id,
@@ -5723,12 +5724,7 @@ class Scheduler:
             # few tokens ahead of the emitted count when a boundary token
             # surfaces, which forces the consistency guard in
             # _extract_boundary_snapshot to skip most captures.
-            block = int(self.config.paged_cache_block_size or 0)
-            if block > 0:
-                try:
-                    self.model._omlx_mtp_commit_align = block
-                except Exception:
-                    pass
+            self._enable_mtp_boundary_alignment()
         else:
             logger.debug(
                 "Boundary cache snapshots disabled (no stateful non-sliceable "
@@ -5736,6 +5732,16 @@ class Scheduler:
             )
 
         return self._boundary_snapshot_required
+
+    def _enable_mtp_boundary_alignment(self) -> None:
+        """Tell MTP decode to expose exact cache state at paged boundaries."""
+        block = int(self.config.paged_cache_block_size or 0)
+        if block <= 0:
+            return
+        try:
+            self.model._omlx_mtp_commit_align = block
+        except Exception:
+            pass
 
     def _extract_boundary_snapshot(
         self, uid: int, expected_tokens: int | None = None
@@ -9062,6 +9068,25 @@ class Scheduler:
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
                     tracker.remove(request.request_id)
+                    if cache_to_use is not None:
+                        # run_specprefill_target_prefill bases its prefill on
+                        # the restored prefix cache when the request had a
+                        # cache hit (#2443), and may have appended partial KV
+                        # to it in place before failing. Re-prefilling the
+                        # post-hit remainder on top would double-write those
+                        # positions, so drop the hit and prefill the full
+                        # prompt from scratch.
+                        logger.info(
+                            f"Request {request.request_id}: dropping "
+                            f"{request.cached_tokens}-token prefix-cache hit "
+                            "after sparse-prefill failure, re-prefilling the "
+                            "full prompt"
+                        )
+                        cache_to_use = None
+                        request.prompt_cache = None
+                        request.cached_tokens = 0
+                        request.remaining_tokens = request.prompt_token_ids
+                        tokens_to_process = request.prompt_token_ids
                     # Fall through to normal prefill
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
