@@ -356,6 +356,7 @@ try:
         MemoryMonitor,
         collect_kv_layer_specs,
         estimate_mla_kv_bytes_per_token,
+        make_prefill_memory_profile,
     )
 
     HAS_TIERED_CACHE = True
@@ -365,6 +366,7 @@ except ImportError:
     MemoryMonitor = None
     collect_kv_layer_specs = None
     estimate_mla_kv_bytes_per_token = None
+    make_prefill_memory_profile = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -2301,6 +2303,14 @@ class Scheduler:
                     gate.note_done()
                 drained = True
         self._pending_async_removes = pending
+        if drained:
+            # The completion-time deferred clear may have already fired while
+            # the async store worker still owned extracted KV buffers. Anchor
+            # another ordinary deferred clear to the point where those final
+            # references are actually released; clearing earlier cannot
+            # reclaim them and leaves the next route preflight charging both
+            # requests until macOS eventually settles the footprint.
+            self._schedule_deferred_metal_clear()
         return drained
 
     def _calculate_max_blocks(self) -> int:
@@ -8190,6 +8200,27 @@ class Scheduler:
             or self._pending_pressure_clear
         )
 
+    def has_pending_route_preflight_cleanup(self) -> bool:
+        """Return whether finished-request memory is still being reclaimed.
+
+        Route-level preflight uses this read-only signal to avoid turning a
+        temporary footprint into a final HTTP 400. The engine loop remains the
+        sole owner of async-remove draining and deferred Metal cache clearing.
+        Active requests are intentionally not included: their memory is live
+        and must remain charged to a concurrent admission.
+        """
+        return bool(
+            self._pending_async_removes or self._deferred_clear_at is not None
+        )
+
+    def refresh_route_preflight_usage(self) -> int:
+        """Publish a fresh MLX memory sample for route-level retry.
+
+        The engine wrapper dispatches this method to the owning MLX executor;
+        it must not be called directly from the asyncio event-loop thread.
+        """
+        return self._current_usage_bytes()
+
     def _refresh_generation_overflow_recovery_ids(self) -> None:
         """Drop serial-retry markers once the affected requests leave the scheduler."""
         if not self._generation_overflow_recovery_ids:
@@ -8457,8 +8488,16 @@ class Scheduler:
             charge_tokens = max(1, int(self.config.prefill_step_size))
         else:
             charge_tokens = max(1, self._prefill_min_chunk_tokens)
-        floor_chunk = min(charge_tokens, new_tokens)
-        kv_len = max(int(num_prompt_tokens) - 1, 1)
+        # External prefill evaluates prompt[0:N-1]; the final token is left
+        # for BatchGenerator.insert(). Price the final real prefill chunk and
+        # pass its *pre-chunk* context to _predicted_chunk_transient, which
+        # adds the query width exactly once. Passing N-1 here used to add the
+        # floor chunk twice (issue #2521).
+        prefill_tokens = max(new_tokens - 1, 0)
+        if prefill_tokens == 0:
+            return None
+        floor_chunk = min(charge_tokens, prefill_tokens)
+        kv_len = max(int(num_prompt_tokens) - 1 - floor_chunk, 0)
         kv_exact = int(
             monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
         )
@@ -10842,6 +10881,10 @@ class Scheduler:
             should_clear = True
         if should_clear:
             _sync_and_clear_cache(self._stream)
+            # Route preflight cannot call mx.get_active_memory() from the
+            # event-loop thread, so publish a fresh executor-owned sample once
+            # the deferred pool reclaim has completed.
+            self._current_usage_bytes()
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0
@@ -11244,6 +11287,14 @@ class Scheduler:
                 if estimate_mla_kv_bytes_per_token is not None
                 else None
             )
+            prefill_memory_profile = (
+                make_prefill_memory_profile(
+                    config,
+                    compute_dtype_size=base_dtype_size,
+                )
+                if make_prefill_memory_profile is not None
+                else None
+            )
 
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
@@ -11266,6 +11317,7 @@ class Scheduler:
                     compute_dtype_size=base_dtype_size,
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
+                    prefill_memory_profile=prefill_memory_profile,
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
