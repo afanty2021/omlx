@@ -34,6 +34,14 @@ struct OMLXDSATopKParams {
       topk,                                                             \
       threads)
 
+// bn=64,wm=2,wn=2 (128 threads): the historical config, used for all
+// shapes. A bn=128/wn=4 variant measured slower on M3 Ultra and was
+// removed; see the tile-config note in dsa_indexer.cpp. bm/bn/wm/wn never
+// enter the per-element K-reduction order (bk=16 and the MMA fragment
+// K-layout are unchanged), so tile configs are bit-identical.
+// NOTE: a K-panel hoist (resident B tile across heads) was tried and
+// REVERTED: the 27KB threadgroup footprint collapses occupancy to 1
+// threadgroup/core (32KB budget) and costs ~18% despite the traffic saving.
 instantiate_dsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 

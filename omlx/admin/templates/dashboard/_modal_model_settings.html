@@ -664,6 +664,13 @@
                                             <p x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason"
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.mtp_compatibility_reason"></p>
+                                            <button type="button"
+                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
+                                                    @click="importMtplxSidecar()"
+                                                    :disabled="importingMtplx"
+                                                    :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
+                                                    class="mt-2 px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
+                                                    x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing') }}' : '{{ t('modal.model_settings.mtplx_import') }}'"></button>
                                             <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                         </div>

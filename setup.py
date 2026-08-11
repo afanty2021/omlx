@@ -32,6 +32,19 @@ def _custom_kernel_build_kwargs() -> dict:
         os.environ["CMAKE_ARGS"] = (
             f"{cmake_args} {target_arg}".strip() if cmake_args else target_arg
         )
+        cmake_args = os.environ["CMAKE_ARGS"]
+
+    # CMake otherwise chooses the first framework Python on PATH, which can
+    # differ from the interpreter running pip (and lack nanobind / MLX).  The
+    # extensions must use the active environment's ABI and CMake packages.
+    python_args = " ".join(
+        (
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
+        )
+    )
+    if "Python_EXECUTABLE" not in cmake_args:
+        os.environ["CMAKE_ARGS"] = f"{cmake_args} {python_args}".strip()
 
     from mlx import extension
 

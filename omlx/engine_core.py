@@ -611,6 +611,7 @@ class EngineCore:
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -641,6 +642,7 @@ class EngineCore:
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
             images=images,
             videos=videos,
             vlm_inputs_embeds=vlm_inputs_embeds,

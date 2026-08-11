@@ -7,6 +7,8 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 
 import json
 import logging
+import re
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,9 +24,13 @@ from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _coerce_param_value,
     _gemma4_args_to_json_robust,
+    _json_value_end,
+    _marker_payloads,
     _parse_gemma4_tool_call_fallback,
+    _parse_hermes_tool_calls,
     _parse_namespaced_tool_calls,
     _parse_xml_tool_calls,
+    _strip_marker_spans,
     _remap_tool_call_names,
     _repair_json_value,
     _serialize_tool_call_arguments,
@@ -1132,6 +1138,15 @@ def _make_tokenizer_with_end(tool_call_start="", tool_call_end=""):
     return tok
 
 
+def _feed_chunked(f, text, chunk_size):
+    """Feed text whole (chunk_size 0) or in fixed-size chunks."""
+    if chunk_size == 0:
+        return f.feed(text)
+    return "".join(
+        f.feed(text[i : i + chunk_size]) for i in range(0, len(text), chunk_size)
+    )
+
+
 def _paired_envelope_cases():
     return [
         ("<tool_call>", "</tool_call>", _make_tokenizer()),
@@ -1205,6 +1220,129 @@ def test_closed_paired_envelope_never_creates_recovery_candidate(
     assert "Unclosed tool-call envelope" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+@pytest.mark.parametrize("chunked", [False, True])
+def test_malformed_payload_keeps_prose_after_a_real_close_marker(
+    start_marker, end_marker, tokenizer, chunked
+):
+    """A payload that never parses must not swallow the prose after its close.
+
+    The payload scan cannot confirm where a malformed value ends, but the
+    literal close marker still bounds the envelope, so trailing text stays
+    visible instead of being withheld to EOF.
+    """
+    f = ToolCallStreamFilter(tokenizer)
+    text = "Before " + start_marker + '{"name":"f"' + end_marker + " After"
+
+    if chunked:
+        visible = "".join(f.feed(ch) for ch in text)
+    else:
+        visible = f.feed(text)
+    visible += f.finish()
+
+    assert visible == "Before  After"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_embedded_close_marker_still_bounds_the_envelope():
+    """The #2507 case must not regress: a marker inside JSON is not the close."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'Before <tool_call>{"name":"f","arguments":'
+        '{"x":"</tool_call>"}}</tool_call> After'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "Before  After"
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_array_payload_with_embedded_close_marker_is_suppressed(chunk_size):
+    """A ``[{...}]`` array payload gets the same #2507 protection as an object.
+
+    Classifying every leading ``[`` as the Hermes bracket dialect made the
+    filter fall back to first-marker splitting, so an embedded close marker
+    leaked the array's tail as visible content while the non-streaming parser
+    recovered the call.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>[{"name":"f","arguments":'
+        '{"s":"a </tool_call> b"}}]</tool_call> AFTER'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_array_payload_with_leading_whitespace_is_suppressed():
+    """Whitespace between ``[`` and ``{`` still classifies as a JSON array."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>[ {"name":"f","arguments":'
+        '{"s":"</tool_call>"}} ]</tool_call> AFTER'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unterminated_array_payload_becomes_recovery_candidate():
+    """An array payload that never closes stays withheld like an object."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    visible = "".join(f.feed(ch) for ch in 'A <tool_call>[{"x"') + f.finish()
+
+    assert visible == "A "
+    assert f.take_recovery_candidate() == '<tool_call>[{"x"'
+
+
+def test_object_payload_with_nested_array_and_embedded_marker():
+    """Array depth tracking must not break object payloads with inner arrays."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f","arguments":'
+        '{"a":[1,2],"s":"</tool_call>"}}</tool_call> AFTER'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_payload_without_any_close_marker_is_still_withheld():
+    """No close marker at all means the envelope tail stays hidden."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    visible = f.feed('Before <tool_call>{"name":"f" After') + f.finish()
+
+    assert visible == "Before "
+    assert f.take_recovery_candidate() == '<tool_call>{"name":"f" After'
+
+
+def test_close_marker_fallback_rescans_the_recovered_tail():
+    """Prose recovered after a close marker is re-filtered, not emitted raw."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f"</tool_call> B '
+        "<|tool_call_start|>second<|tool_call_end|> C"
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
 def test_only_last_unclosed_envelope_becomes_recovery_candidate():
     """Completed earlier calls stay hidden when a later call is unterminated."""
     f = ToolCallStreamFilter(_make_tokenizer())
@@ -1218,6 +1356,128 @@ def test_only_last_unclosed_envelope_becomes_recovery_candidate():
 
     assert visible == "Before  middle "
     assert f.take_recovery_candidate() == "<tool_call>second</tool_"
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 3, 7, 16])
+def test_prose_between_two_malformed_envelopes_is_preserved(chunk_size):
+    """The EOF unwind must split each envelope at its own close marker.
+
+    Splitting at the LAST close marker in the withheld text deletes the
+    prose sitting between two malformed envelopes of the same pair.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f"</tool_call> B '
+        '<tool_call>{"name":"g"</tool_call> C'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_literal_close_marker_in_trailing_prose_is_preserved(chunk_size):
+    """A literal XML close marker in prose is not a malformed envelope's end.
+
+    XML-style closers may appear as ordinary prose, so the unwind must not
+    treat a later literal occurrence as the envelope boundary and delete
+    everything before it.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"name":"f"</tool_call> B literal </tool_call> C'
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B literal </tool_call> C"
+    assert f.take_recovery_candidate() == ""
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_valid_call_with_embedded_marker_after_malformed_envelope(chunk_size):
+    """A valid call after a malformed one keeps its #2507 protection at EOF.
+
+    The unwind uses the same span primitive as the non-streaming parser, so
+    the valid payload ends at its structural boundary and its embedded close
+    marker neither splits it nor leaks its tail as content.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"x"</tool_call> B <tool_call>'
+        '{"name":"g","arguments":{"x":"</tool_call>"}}</tool_call> C'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_preserves_prose_between_malformed_namespaced_envelopes():
+    """The unwind resolves dynamic namespaced close markers per envelope."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <foo:tool_call>{"x"</foo:tool_call> B '
+        '<foo:tool_call>{"y"</foo:tool_call> C'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_swallows_bracket_call_in_recovered_tail():
+    """A self-contained bracket call inside the unwound tail stays hidden."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B [Calling tool: foo] C'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_reopened_envelope_becomes_recovery_candidate():
+    """A second unterminated envelope in the unwound tail is withheld whole."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B <tool_call>{"y"'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B "
+    assert f.take_recovery_candidate() == '<tool_call>{"y"'
+
+
+def test_unwind_drops_partial_open_marker_in_trailing_prose():
+    """Strict-mode tail rules still apply to prose recovered by the unwind."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B <tool_ca'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B "
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_stays_linear_on_repeated_malformed_envelopes():
+    """The EOF unwind must not do quadratic work on marker-repeating output.
+
+    A re-feed loop that copies the remaining text once per malformed envelope
+    took ~9 s on this input; the single-pass unwind takes well under a
+    second, so the generous bound only trips on a complexity regression.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = "PRE " + '<tool_call>{"x"</tool_call> ' * 4000 + "POST"
+
+    start = time.perf_counter()
+    visible = f.feed(text) + f.finish()
+    elapsed = time.perf_counter() - start
+
+    assert visible.startswith("PRE ")
+    assert visible.endswith("POST")
+    assert elapsed < 5.0
 
 
 class TestToolCallStreamFilterSuppressAfterMarker:
@@ -3274,3 +3534,283 @@ class TestSchemaAwareFallbackCoercion:
         assert _repair_json_value('[{"a": [1, 2}]}') == [{"a": [1, 2]}]
         assert _repair_json_value('{"a": "unterminated') == {"a": "unterminated"}
         assert _repair_json_value("not json at all") is None
+
+
+class TestToolCallMarkerInArguments:
+    """Literal tool-call markers inside argument strings (#2507).
+
+    A non-greedy ``start(.*?)end`` match stops at the first close marker, so a
+    call whose argument embeds that marker was truncated mid-JSON and dropped
+    silently. Payload boundaries are now found via JSON decoding.
+    """
+
+    PAYLOAD = "text with a literal </tool_call> inside"
+
+    @staticmethod
+    def _raw(body):
+        inner = json.dumps(
+            {"name": "note_write", "arguments": {"title": "t", "body": body}},
+            ensure_ascii=False,
+        )
+        return f"<tool_call>\n{inner}\n</tool_call>"
+
+    @staticmethod
+    def _tokenizer():
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: json.loads(text)
+        return tok
+
+    def test_marker_span_helpers_span_the_embedded_marker(self):
+        text = self._raw(self.PAYLOAD)
+        payloads = _marker_payloads(text, "<tool_call>", "</tool_call>")
+        assert len(payloads) == 1
+        assert json.loads(payloads[0])["arguments"]["body"] == self.PAYLOAD
+        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>").strip() == ""
+
+    def test_native_path_preserves_argument_with_close_marker(self):
+        cleaned, calls = parse_tool_calls(self._raw(self.PAYLOAD), self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == self.PAYLOAD
+        # The whole envelope is consumed, so no markup leaks into content.
+        assert cleaned == ""
+
+    def test_xml_fallback_preserves_argument_with_close_marker(self):
+        cleaned, calls = _parse_xml_tool_calls(self._raw(self.PAYLOAD))
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == self.PAYLOAD
+        assert cleaned == ""
+
+    def test_hermes_payload_with_close_marker(self):
+        inner = json.dumps(
+            {"name": "note_write", "arguments": {"body": "a <|tool_call_end|> b"}}
+        )
+        text = f"<|tool_call_start|>{inner}<|tool_call_end|>"
+        cleaned, calls = _parse_hermes_tool_calls(text)
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == "a <|tool_call_end|> b"
+        assert cleaned == ""
+
+    def test_streaming_does_not_leak_tail_as_content(self):
+        """The stream filter must not end the envelope on the embedded marker."""
+        raw = self._raw(self.PAYLOAD)
+        for chunk in (1, 3, 7, 64):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            emitted = "".join(
+                filt.feed(raw[i : i + chunk]) for i in range(0, len(raw), chunk)
+            )
+            emitted += filt.finish()
+            assert emitted == "", f"leaked at chunk size {chunk}: {emitted!r}"
+
+    def test_multiple_calls_still_split(self):
+        a = json.dumps({"name": "f", "arguments": {"s": "has </tool_call> inside"}})
+        b = json.dumps({"name": "g", "arguments": {"y": 2}})
+        text = f"pre <tool_call>{a}</tool_call> mid <tool_call>{b}</tool_call> post"
+        payloads = _marker_payloads(text, "<tool_call>", "</tool_call>")
+        assert [json.loads(p)["name"] for p in payloads] == ["f", "g"]
+        assert (
+            _strip_marker_spans(text, "<tool_call>", "</tool_call>")
+            == "pre  mid  post"
+        )
+
+    def test_non_json_dialect_keeps_first_match_behaviour(self):
+        """GLM-style payloads are not JSON, so boundary detection must not change them."""
+        text = (
+            "<tool_call>myfunc<arg_key>k</arg_key>"
+            "<arg_value>v</arg_value></tool_call>"
+        )
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [
+            "myfunc<arg_key>k</arg_key><arg_value>v</arg_value>"
+        ]
+
+    def test_unterminated_envelope_yields_no_span(self):
+        text = '<tool_call>{"name": "f", "arguments": {}}'
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == []
+        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>") == text
+
+    def test_incomplete_json_falls_back_to_first_marker(self):
+        """Never-completing JSON must not swallow the rest of the message."""
+        text = '<tool_call>{"name": "f", "arguments": {"s": "oops </tool_call>'
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [
+            '{"name": "f", "arguments": {"s": "oops '
+        ]
+
+    def test_boundary_scan_never_raises_on_deep_nesting(self):
+        """Boundary detection must degrade, not explode, on hostile nesting.
+
+        ``raw_decode`` recurses per nesting level, so deeply nested output
+        raises RecursionError rather than a decode error. A boundary hint must
+        never turn into an exception escaping the parse chain.
+        """
+        deep = "[" * 100_000
+        assert _json_value_end(deep, 0) is None
+        text = f"<tool_call>{deep}</tool_call>"
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [deep]
+
+    def test_boundary_scan_stays_linear_on_adversarial_output(self):
+        """Guard the linear-time rule for untrusted model output.
+
+        Locating the payload end must not re-scan the accumulated buffer once
+        per chunk: an unterminated JSON object stuffed with close markers
+        would then cost quadratic time. Model output is attacker-influenceable
+        via prompt injection, so this is a DoS surface, not just a slowdown.
+        """
+        import time
+
+        def elapsed(markers):
+            evil = (
+                "<tool_call>"
+                + '{"name":"f","arguments":{"s":"'
+                + "</tool_call>" * markers
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            for i in range(0, len(evil), 64):
+                filt.feed(evil[i : i + 64])
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up the interpreter before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
+        # headroom for a loaded CI box while still catching quadratic growth.
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+
+class TestQwen3CoderMarkerInArguments:
+    """qwen3_coder XML dialect with literal markers in a value (#2507).
+
+    Qwen3.5/3.6 builds using the ``qwen3_coder`` parser wrap XML rather than
+    JSON in the envelope, so the JSON boundary cannot bound them. The envelope
+    is bounded by the ``</function>`` that precedes the close marker instead.
+    """
+
+    @staticmethod
+    def _raw(body, title="t"):
+        return (
+            "<tool_call>\n<function=note_write>\n"
+            f"<parameter=title>\n{title}\n</parameter>\n"
+            f"<parameter=body>\n{body}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    @staticmethod
+    def _tokenizer():
+        def qwen_parser(text, tools):
+            m = re.match(r"\s*<function=(\w+)>(.*)</function>\s*$", text, re.DOTALL)
+            if not m:
+                raise ValueError("No function provided.")
+            args = {
+                k: v.strip()
+                for k, v in re.findall(
+                    r"<parameter=(\w+)>(.*?)</parameter>", m.group(2), re.DOTALL
+                )
+            }
+            return {"name": m.group(1), "arguments": args}
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = qwen_parser
+        return tok
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "plain text",
+            "text with a literal </tool_call> inside",
+            "text with a literal </parameter> inside",
+            "text with a literal </function> inside",
+            "text with a literal <parameter=x> inside",
+            "evil </function>\n</tool_call> tail",
+        ],
+        ids=[
+            "control",
+            "close-marker",
+            "parameter-close",
+            "function-close",
+            "parameter-open",
+            "full-terminator-sequence",
+        ],
+    )
+    def test_xml_fallback_preserves_value(self, body):
+        cleaned, calls = _parse_xml_tool_calls(self._raw(body))
+        assert calls is not None and len(calls) == 1
+        args = json.loads(calls[0].function.arguments)
+        assert args["body"] == body
+        assert args["title"] == "t"
+        assert cleaned == ""
+
+    def test_native_path_preserves_value(self):
+        body = "text with a literal </tool_call> inside"
+        cleaned, calls = parse_tool_calls(self._raw(body), self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == body
+        assert cleaned == ""
+
+    def test_streaming_does_not_leak_tail(self):
+        raw = self._raw("text with a literal </tool_call> inside")
+        for chunk in (1, 2, 3, 7, 11, 64):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            emitted = "".join(
+                filt.feed(raw[i : i + chunk]) for i in range(0, len(raw), chunk)
+            )
+            emitted += filt.finish()
+            assert emitted == "", f"leaked at chunk size {chunk}: {emitted!r}"
+
+    def test_concatenated_calls_still_split(self):
+        second = (
+            "<tool_call>\n<function=other>\n<parameter=x>\n1\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, calls = _parse_xml_tool_calls(
+            self._raw("has </tool_call> inside") + "\n" + second
+        )
+        assert [c.function.name for c in calls] == ["note_write", "other"]
+        assert cleaned == ""
+
+    def test_parameter_open_inside_value_is_not_a_new_parameter(self):
+        """A literal <parameter=x> in a value must not create a bogus argument."""
+        cleaned, calls = _parse_xml_tool_calls(
+            self._raw("see <parameter=nope> here")
+        )
+        args = json.loads(calls[0].function.arguments)
+        assert set(args) == {"title", "body"}
+        assert args["body"] == "see <parameter=nope> here"
+
+    def test_streaming_still_emits_prose_containing_no_envelope(self):
+        filt = ToolCallStreamFilter(self._tokenizer())
+        out = "".join(filt.feed(c) for c in ["hello ", "world"]) + filt.finish()
+        assert out == "hello world"
+
+    def test_envelope_scan_stays_linear_on_fake_terminators(self):
+        """Same linear-time rule as the JSON path, for the XML boundary.
+
+        A value stuffed with fake ``</function></tool_call>`` sequences is the
+        worst case: every one is a candidate envelope end that has to be
+        rejected. That must not become quadratic.
+        """
+        import time
+
+        def elapsed(count):
+            evil = (
+                "<tool_call>\n<function=f>\n<parameter=b>\n"
+                + "</function>\n</tool_call> " * count
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            for i in range(0, len(evil), 64):
+                filt.feed(evil[i : i + 64])
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
+        # loaded CI box while still catching quadratic growth.
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"

@@ -471,6 +471,164 @@ def test_predicted_transient_zero_without_signals():
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
 
 
+def test_adaptive_throttle_charges_recently_reclaimed_footprint():
+    """A pool drop must remain priced until the next chunk reallocates it."""
+    static_prediction = 11.18 * _GB
+    released = 6.34 * _GB
+    monitor = SimpleNamespace(
+        estimate_chunk_transient_bytes=lambda _n, _kv: (
+            static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
+        ),
+        estimate_prompt_kv_bytes=lambda _n: 0,
+    )
+    ns = _throttle_ctx(
+        current=97.23 * _GB,
+        hard=119.17 * _GB,
+        soft_ratio=110.23 / 119.17,
+        monitor=monitor,
+        abort=200 * _GB,
+    )
+    ns._prefill_headroom_safety = 110.23 / 119.17
+    ns._fake_current = 97.23 * _GB
+    ns.requests = {}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    assert _call(ns, 2048, kv_len=147_680) == 2048
+
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+
+    assert _call(ns, 2048, kv_len=147_680) < 2048
+
+
+def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
+    """A conservative raw-last sample may already cover pool reallocation."""
+    raw_prediction = 11.83 * _GB
+    static_prediction = 4.11 * _GB
+    released = 6.86 * _GB
+    raw_per_token = raw_prediction / (
+        512 * Scheduler._PREFILL_TRANSIENT_SAFETY
+    )
+    monitor = SimpleNamespace(
+        estimate_chunk_transient_bytes=lambda _n, _kv: (
+            static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
+        ),
+        estimate_prompt_kv_bytes=lambda _n: 0,
+    )
+    ns = _throttle_ctx(
+        current=99.12 * _GB,
+        hard=118.71 * _GB,
+        samples_bpt=raw_per_token,
+        monitor=monitor,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+
+    predicted = ns._predicted_chunk_transient(512, 186_368)
+
+    assert predicted == pytest.approx(raw_prediction)
+
+
+def test_sub_floor_tail_release_is_charged():
+    """A release on a tail below min_chunk still feeds the reclaim ledger."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    ns._record_chunk_transient(
+        17,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+
+def test_skipped_positive_sample_clears_reclaim_charge():
+    """Any positive delta drops the charge, even on EWMA-skipped samples."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+    # Positive growth on a sub-floor tail is excluded from the EWMA but the
+    # footprint recovered, so the one-shot charge must not stay armed.
+    ns._record_chunk_transient(
+        17,
+        94 * _GB,
+        99 * _GB,
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+
+
+def test_speed_partial_positive_clears_reclaim_charge():
+    """Speed-priority partial chunks also confirm reallocation."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._prefill_speed_priority = True
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+    ns._record_chunk_transient(
+        256,
+        94 * _GB,
+        99 * _GB,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+
+
 def test_record_chunk_transient_skips_tail_samples():
     tracker = PrefillTransientTracker()
     ns = SimpleNamespace(
@@ -654,6 +812,7 @@ def test_step_prefill_reclaims_before_first_guard():
         _memory_limit_bytes=0,
         _glm_dsa_adaptive_prefill=None,
         model=lambda *args, **kwargs: events.append("model"),
+        _supports_skip_lm_head=lambda: False,
         _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
         _record_chunk_transient=MagicMock(),

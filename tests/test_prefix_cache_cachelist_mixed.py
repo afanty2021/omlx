@@ -243,7 +243,7 @@ def test_block_signature_stamps_sub_composition(tmp_path):
     _, meta = ssd.load_block_with_metadata(block.block_hash)
     assert meta is not None
     subtypes = _signature_cachelist_subtypes(meta.get("cache_signature", ""))
-    assert subtypes == {"0": ["KVCache", "ArraysCache:4"]}
+    assert subtypes == {"0": ["KVCache", "ArraysCache:4", "@pm"]}
     # The flat type list stays "CacheList" (dispatch strings unchanged).
     types = meta["layer_cache_types"]
     if isinstance(types, str):
@@ -258,7 +258,7 @@ def test_live_subtypes_descriptor_matches_block_stamp():
 
     live = [_build_mixed_cachelist(seq_len=4)]
     assert cachelist_subtypes_from_cache_list(live) == {
-        "0": ["KVCache", "ArraysCache:4"]
+        "0": ["KVCache", "ArraysCache:4", "@pm"]
     }
     # KVCache-only CacheList layers are not stamped (GLM/deepseek_v32
     # signatures stay byte-identical to the previous format).
@@ -290,7 +290,7 @@ def test_stale_sub_composition_swept(tmp_path):
     table2 = _store_blocks(cache2, num_blocks=1, request_id="req-match")
     changed = ssd2.set_expected_layer_signature(
         ["CacheList"],
-        cachelist_subtypes={"0": ["KVCache", "ArraysCache:4"]},
+        cachelist_subtypes={"0": ["KVCache", "ArraysCache:4", "@pm"]},
     )
     assert changed is True
     assert ssd2.invalidate_stale_layer_signature() == 0
@@ -321,6 +321,9 @@ def test_prefill_snapshot_decoupled_from_live_cache():
     stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
         stub, caches
     )
+    stub._extract_snapshot_cache_states = (
+        lambda caches: Scheduler._extract_snapshot_cache_states(stub, caches)
+    )
     stub._extract_prefill_snapshot_states = (
         lambda caches: Scheduler._extract_prefill_snapshot_states(stub, caches)
     )
@@ -345,10 +348,14 @@ def test_prefill_snapshot_decoupled_from_live_cache():
     assert isinstance(stored, tuple)
     assert stored[0] == Scheduler._PREFILL_SNAPSHOT_MARKER
     extracted = stored[1]
+    # Per-member filtering blanks the sliceable KV member — snapshots only
+    # need the non-sliceable state; the store path slices KV from the live
+    # cache. The conv slots remain the aliasing guard: they must hold the
+    # boundary's values even after the live cache moves on.
     kv_state = extracted[0]["state"][0]
-    assert kv_state[0].shape[2] == BLOCK_SIZE, (
-        "boundary snapshot follows the live cache (aliasing) — "
-        f"holds {kv_state[0].shape[2]} tokens instead of {BLOCK_SIZE}"
+    assert kv_state == (), (
+        "pm-eligible snapshot should blank the sliceable KV member, "
+        f"got {kv_state!r}"
     )
     conv_slot0 = extracted[0]["state"][1][0]
     assert mx.max(mx.abs(conv_slot0 - BLOCK_SIZE)).item() == 0.0

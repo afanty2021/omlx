@@ -62,6 +62,9 @@ class OutputParserFactory:
 
     kind: str
     create_session: Callable[[Any], OutputParserSession]
+    create_session_with_tools: (
+        Callable[[Any, list[dict] | None], OutputParserSession] | None
+    ) = None
     stop_token_ids: set[int] = field(default_factory=set)
     thinking_start_text: str | None = None
     thinking_start_output_text: str | None = None
@@ -211,6 +214,8 @@ _MINIMAX_TOOL_CALL_START = "]<]minimax[>[<tool_call>"
 _MINIMAX_TOOL_CALL_END = "]<]minimax[>[</tool_call>"
 _DEEPSEEK_V4_TOOL_CALL_START = "<｜DSML｜tool_calls>"
 _DEEPSEEK_V4_TOOL_CALL_END = "</｜DSML｜tool_calls>"
+_BAILING_HYBRID_MODEL_TYPE = "bailing_hybrid"
+_BAILING_ROLE_MARKERS = ("<role>", "</role>")
 
 
 def _is_deepseek_v4_model(
@@ -251,6 +256,136 @@ def _is_minimax_m3_model(
         return True
     lowered = model_name.lower()
     return "minimax" in lowered and "m3" in lowered
+
+
+class BailingHybridOutputParserSession:
+    """Suppress Ling role markers and XML tool-call protocol envelopes."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        marker_token_ids: set[int],
+        model_path: str | None = None,
+        tools: list[dict] | None = None,
+    ):
+        self._tokenizer = tokenizer
+        self._marker_token_ids = marker_token_ids
+        self._tools = tools
+        self._raw_text = ""
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+        try:
+            from ..api.tool_calling import ToolCallStreamFilter
+
+            self._stream_filter = ToolCallStreamFilter(tokenizer)
+            self._visible_filter = ToolCallStreamFilter(tokenizer)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Ling stream filter unavailable: %s", e)
+            self._stream_filter = None
+            self._visible_filter = None
+
+    def _decode_token(self, token_id: int) -> str:
+        if self._detokenizer is not None:
+            self._detokenizer.add_token(token_id)
+            return self._detokenizer.last_segment
+        try:
+            return self._tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+            )
+        except TypeError:
+            return self._tokenizer.decode([token_id])
+
+    @staticmethod
+    def _filtered_text(text: str, tool_filter: Any) -> str:
+        if not text:
+            return ""
+        if tool_filter is not None:
+            return tool_filter.feed(text)
+        return text
+
+    @staticmethod
+    def _finish_filtered_text(tool_filter: Any) -> str:
+        if tool_filter is None:
+            return ""
+        return tool_filter.finish()
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        if token_id in self._marker_token_ids:
+            return OutputParserTokenResult(record_token=True)
+
+        text = self._decode_token(token_id)
+        self._raw_text += text
+
+        return OutputParserTokenResult(
+            stream_text=self._filtered_text(text, self._stream_filter),
+            visible_text=self._filtered_text(text, self._visible_filter),
+            record_token=True,
+        )
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        stream_text = ""
+        visible_text = ""
+        if self._detokenizer is not None:
+            self._detokenizer.finalize()
+            final_text = self._detokenizer.last_segment
+            if final_text:
+                self._raw_text += final_text
+                stream_text += self._filtered_text(
+                    final_text,
+                    self._stream_filter,
+                )
+                visible_text += self._filtered_text(
+                    final_text,
+                    self._visible_filter,
+                )
+
+        stream_text += self._finish_filtered_text(self._stream_filter)
+        visible_text += self._finish_filtered_text(self._visible_filter)
+
+        tool_calls: list[dict[str, str]] = []
+        if self._tools:
+            try:
+                from ..api.tool_calling import parse_tool_calls
+
+                _, parsed_calls = parse_tool_calls(
+                    self._raw_text,
+                    self._tokenizer,
+                    self._tools,
+                )
+                valid_names = {
+                    function["name"]
+                    for tool in self._tools
+                    if isinstance(tool, dict)
+                    and isinstance((function := tool.get("function")), dict)
+                    and isinstance(function.get("name"), str)
+                    and function["name"]
+                }
+                for call in parsed_calls or []:
+                    if call.function.name not in valid_names:
+                        logger.warning(
+                            "Dropping unregistered Ling tool call %r",
+                            call.function.name,
+                        )
+                        continue
+                    tool_calls.append(
+                        {
+                            "id": getattr(call, "id", ""),
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        }
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Ling tool-call parse failed: %s", e)
+
+        return OutputParserFinalizeResult(
+            stream_text=stream_text,
+            visible_text=visible_text,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else None,
+        )
 
 
 class _MiniMaxM3ProtocolNormalizer:
@@ -614,6 +749,47 @@ def _is_inkling_model(
     return "inkling" in model_name.lower()
 
 
+def _is_muse_glimmer_model(
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+) -> bool:
+    model_type = model_config.get("model_type") if model_config else None
+    if model_type == "muse_glimmer":
+        return True
+    lowered = model_name.lower()
+    return "muse" in lowered and "glimmer" in lowered
+
+
+def _append_missing_json_object_closers(payload: str) -> str | None:
+    """Append missing object closers without counting braces in strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for char in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                return None
+            depth -= 1
+
+    if in_string or depth <= 0:
+        return None
+    return payload + "}" * depth
+
+
 class _InklingChannelSplitter:
     """Streaming splitter for inkling's channel protocol.
 
@@ -829,11 +1005,38 @@ class InklingOutputParserSession:
             try:
                 parsed = json.loads(payload)
             except (json.JSONDecodeError, ValueError):
-                logger.debug("Inkling tool-call payload not valid JSON")
-                continue
+                # Quantized checkpoints occasionally emit the payload with the
+                # final closing brace(s) missing (observed: a complete nested
+                # args object short exactly one "}" before <|end_message|>).
+                # Brace-balance repair only runs after strict parsing failed,
+                # so well-formed payloads are never touched.
+                repaired_payload = _append_missing_json_object_closers(payload)
+                if repaired_payload is not None:
+                    try:
+                        parsed = json.loads(repaired_payload)
+                    except (json.JSONDecodeError, ValueError):
+                        logger.debug("Inkling tool-call payload not valid JSON")
+                        continue
+                else:
+                    logger.debug("Inkling tool-call payload not valid JSON")
+                    continue
             if not isinstance(parsed, dict) or not parsed.get("name"):
                 continue
-            args = parsed.get("args", {})
+            # Accept both payload conventions: Inkling-native {"name", "args":
+            # {...}} and the OpenAI wire format {"name", "arguments": "<json>"}
+            # that quantized checkpoints sometimes emit (both are abundant in
+            # tool-call training data). A JSON-encoded string is decoded; only
+            # a non-object result falls back to {}.
+            args = parsed.get("args")
+            if args is None:
+                args = parsed.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = None
+            if not isinstance(args, dict):
+                args = {}
             tool_calls.append(
                 {
                     "name": str(parsed["name"]),
@@ -1006,6 +1209,36 @@ def detect_output_parser(
     """
     session_model_path = model_path or model_name
 
+    model_type = model_config.get("model_type") if model_config else None
+    if model_type == _BAILING_HYBRID_MODEL_TYPE:
+        marker_token_ids = {
+            token_id
+            for marker in _BAILING_ROLE_MARKERS
+            if (token_id := _token_id_for_text(tokenizer, marker)) is not None
+        }
+        if marker_token_ids:
+            return OutputParserFactory(
+                kind="bailing_hybrid",
+                create_session=lambda session_tokenizer: (
+                    BailingHybridOutputParserSession(
+                        session_tokenizer,
+                        marker_token_ids,
+                        model_path=session_model_path,
+                    )
+                ),
+                create_session_with_tools=lambda session_tokenizer, tools: (
+                    BailingHybridOutputParserSession(
+                        session_tokenizer,
+                        marker_token_ids,
+                        model_path=session_model_path,
+                        tools=tools,
+                    )
+                ),
+                thinking_start_text="<think>",
+                thinking_start_output_text="<think>\n",
+                protocol_marker_texts=_BAILING_ROLE_MARKERS,
+            )
+
     if is_harmony_model(model_name, model_config):
         temp_parser = HarmonyStreamingParser(tokenizer)
         return OutputParserFactory(
@@ -1106,6 +1339,47 @@ def detect_output_parser(
                 _INKLING_MESSAGE_MODEL + _INKLING_CONTENT_TEXT
             ),
             protocol_marker_texts=_INKLING_MARKERS,
+        )
+
+    if _is_muse_glimmer_model(model_name, model_config):
+        from .muse_glimmer import (
+            _MUSE_END_OF_TEXT,
+            _MUSE_EOM,
+            _MUSE_EOT,
+            _MUSE_MARKERS,
+            _MUSE_MESSAGE,
+            _MUSE_START,
+            MuseGlimmerOutputParserSession,
+        )
+
+        muse_stop_ids = set()
+        for stop_marker in (_MUSE_EOT, _MUSE_END_OF_TEXT):
+            stop_id = _token_id_for_text(tokenizer, stop_marker)
+            if stop_id is not None:
+                muse_stop_ids.add(stop_id)
+
+        return OutputParserFactory(
+            kind="muse_glimmer",
+            create_session=lambda session_tokenizer: MuseGlimmerOutputParserSession(
+                session_tokenizer,
+                model_path=session_model_path,
+            ),
+            create_session_with_tools=lambda session_tokenizer, tools: (
+                MuseGlimmerOutputParserSession(
+                    session_tokenizer,
+                    model_path=session_model_path,
+                    tools=tools,
+                )
+            ),
+            stop_token_ids=muse_stop_ids,
+            thinking_start_output_text="<think>\n",
+            # A forced thinking close ends the reasoning message and opens
+            # the visible-answer message.
+            thinking_end_text=_MUSE_EOM,
+            thinking_end_trailing_text=(
+                _MUSE_START + "assistant to=user" + _MUSE_MESSAGE
+            ),
+            protocol_marker_texts=_MUSE_MARKERS,
         )
 
     if _is_minimax_m3_model(model_name, model_config):

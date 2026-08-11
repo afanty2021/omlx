@@ -61,6 +61,12 @@
         'gemma4_unified_assistant',
         'qwen3_5_mtp',
     ]);
+    // DFlash drafters that carry no "dflash" name token. Meta ships the Muse
+    // Glimmer DFlash drafter as "-assistant", which oMLX's name heuristics
+    // would otherwise route to the MTP/spec-prefill buckets.
+    const DFLASH_DRAFTER_CONFIG_MODEL_TYPES = new Set([
+        'muse_glimmer_assistant',
+    ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
@@ -183,6 +189,7 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
 
@@ -1394,6 +1401,10 @@
             },
 
             isDflashDraftModel(model) {
+                const configType = String(model?.config_model_type || '').toLowerCase();
+                if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) {
+                    return true;
+                }
                 return /(^|[-_/\s])dflash($|[-_/\s])/i.test(this.draftModelSearchText(model));
             },
 
@@ -1962,6 +1973,30 @@
                     this.computeDrift();
                 }
                 this.showModelSettingsModal = true;
+            },
+
+            async importMtplxSidecar() {
+                if (!this.selectedModel || this.importingMtplx) return;
+                this.importingMtplx = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
+                        method: 'POST',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.mtplx_import_failed'));
+                        return;
+                    }
+                    if (data.message) alert(data.message);
+                    // Refresh so mtp_compatible flips and the toggle unlocks.
+                    await this.loadModels();
+                    const model = this.models.find(m => m.id === this.selectedModel.id);
+                    if (model) await this.openModelSettings(model);
+                } catch (e) {
+                    alert(window.t('js.error.mtplx_import_failed'));
+                } finally {
+                    this.importingMtplx = false;
+                }
             },
 
             async saveModelSettings() {

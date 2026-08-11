@@ -3,6 +3,7 @@
 
 import importlib
 import inspect
+import json
 import sys
 from types import SimpleNamespace
 
@@ -118,6 +119,82 @@ class TestUtilsPatch:
         loaded = _load_safetensors(str(path))
         assert "x" in loaded
         assert loaded["x"].shape == (4, 4)
+
+    def test_sub4_v4_disables_compressed_native_attention(self):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        assert (
+            _native_ratio128_attention_enabled(
+                {"model_type": "deepseek_v4", "quantization": {"bits": 2}}
+            )
+            is False
+        )
+        assert (
+            _native_ratio128_attention_enabled(
+                {
+                    "model_type": "deepseek_v4",
+                    "text_config": {"quantization_config": {"bits": 3.5}},
+                }
+            )
+            is False
+        )
+        assert (
+            _native_ratio128_attention_enabled(
+                {
+                    "model_type": "deepseek_v4",
+                    "quantization": {"bits": 4},
+                    "text_config": {"quantization_config": {"bits": 3.5}},
+                }
+            )
+            is False
+        )
+        assert (
+            _native_ratio128_attention_enabled(
+                {"model_type": "deepseek_v4", "quantization": {"bits": 4}}
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize(
+        ("bits", "expected_enabled"),
+        ((4, True), (2, False)),
+        ids=("four-bit-native", "sub-four-bit-reference"),
+    )
+    def test_load_model_propagates_ratio128_attention_policy_to_model_args(
+        self, tmp_path, applied_patch, bits, expected_enabled
+    ):
+        import mlx.nn as nn
+        from mlx_lm.utils import load_model
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        config = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 1,
+            "compress_ratios": [128],
+            "quantization": {
+                "bits": bits,
+                "group_size": 8,
+                "mode": "affine",
+            },
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+
+        class CapturingModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.args = args
+
+        model, loaded_config = load_model(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (CapturingModel, dsv4.ModelArgs),
+        )
+
+        assert model.args.use_native_ratio128_attention is expected_enabled
+        assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
 
 class TestGeneratePatch:
@@ -1057,6 +1134,211 @@ class TestDeepseekV4SwitchGLU:
         assert y.shape == (1, 8, 8, 16)
 
 
+class TestDeepseekV4CompressedNativeAttention:
+    @staticmethod
+    def _attention_config(dsv4):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[128],
+        )
+
+    def test_ratio128_dispatch_and_reference_fallbacks(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.CompressedAttention(self._attention_config(dsv4), 0)
+        sparse_calls = []
+        dense_masks = []
+
+        def sparse_spy(q, local_kv, pooled, pooled_indices, *args, **kwargs):
+            sparse_calls.append((local_kv.shape, pooled.shape, pooled_indices))
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        def dense_spy(q, key, value, *args, **kwargs):
+            dense_masks.append(kwargs["mask"])
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
+        monkeypatch.setattr(dsv4, "scaled_dot_product_attention", dense_spy)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+
+        x = mx.random.normal((1, 129, 16), dtype=mx.bfloat16)
+        y = layer(x, _standard_mask=True)
+        mx.eval(y, sparse_calls[0][2])
+
+        assert y.shape == (1, 129, 16)
+        assert sparse_calls[0][0] == (1, 1, 129, 8)
+        assert sparse_calls[0][1] == (1, 1, 8)
+        assert sparse_calls[0][2].tolist() == [[[0]] * 129]
+        assert dense_masks == []
+
+        monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+        layer(x, _standard_mask=True)
+        assert len(sparse_calls) == 1
+        assert len(dense_masks) == 1
+
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", lambda *a, **k: None)
+        layer(x, _standard_mask=True)
+        assert len(dense_masks) == 2
+        monkeypatch.setattr(dsv4, "_sparse_pooled_attention", sparse_spy)
+
+        monkeypatch.setattr(
+            dsv4.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: mx.zeros(
+                (x.shape[0], 1, self.head_dim), dtype=x.dtype
+            ),
+        )
+        layer(x[:, :1], _standard_mask=True)
+        assert len(sparse_calls) == 1
+        assert len(dense_masks) == 3
+
+        custom_mask = mx.tri(129, 129, dtype=mx.bool_)[None, None]
+        layer(x, mask=custom_mask)
+        assert len(sparse_calls) == 1
+        assert dense_masks[-1].shape == (1, 1, 129, 130)
+
+        low_bit_config = self._attention_config(dsv4)
+        low_bit_config.use_native_ratio128_attention = False
+        low_bit_layer = dsv4.CompressedAttention(low_bit_config, 0)
+        low_bit_layer(x, _standard_mask=True)
+        assert len(sparse_calls) == 1
+        assert len(dense_masks) == 5
+
+    def test_native_only_sparse_attention_rejects_unsupported_shape_without_gather(
+        self, applied_patch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        result = dsv4._sparse_pooled_attention(
+            mx.zeros((1, 2, 5, 8), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 5, 8), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 8), dtype=mx.bfloat16),
+            mx.zeros((1, 5, 1), dtype=mx.uint32),
+            None,
+            None,
+            8**-0.5,
+            mx.zeros((2,), dtype=mx.bfloat16),
+            q_offset=0,
+            compress_ratio=128,
+            local_window=128,
+            native_only=True,
+        )
+
+        assert result is None
+
+    @pytest.mark.parametrize(
+        ("dtype_name", "max_tolerance"),
+        (("float16", 0.004), ("bfloat16", 0.032)),
+    )
+    @pytest.mark.parametrize(
+        ("offset", "length"),
+        ((255, 17), (32_895, 17)),
+        ids=("two-pooled-rows", "257-pooled-rows"),
+    )
+    def test_ratio128_native_attention_matches_causal_reference_across_pool_tiles(
+        self, applied_patch, dtype_name, max_tolerance, offset, length
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        mx.random.seed(41)
+        dtype = getattr(mx, dtype_name)
+        local_window, compress_ratio = 128, 128
+        local_start = max(0, offset - local_window)
+        local_length = offset - local_start + length
+        pooled_length = (offset + length) // compress_ratio
+        q = mx.random.normal((1, 64, length, 512), dtype=dtype)
+        local_kv = mx.random.normal((1, 1, local_length, 512), dtype=dtype)
+        pooled = mx.random.normal((1, pooled_length, 512), dtype=dtype)
+        topk = mx.broadcast_to(
+            mx.arange(pooled_length, dtype=mx.uint32)[None, None],
+            (1, length, pooled_length),
+        )
+        sinks = mx.random.normal((64,), dtype=dtype)
+        query_rows = mx.arange(length)[:, None]
+        local_positions = mx.arange(local_length)[None]
+        local_end = local_length - length + query_rows + 1
+        local_start_rows = mx.maximum(0, local_end - local_window)
+        pooled_positions = (mx.arange(pooled_length)[None] + 1) * compress_ratio - 1
+        local_mask = (local_positions >= local_start_rows) & (
+            local_positions < local_end
+        )
+        pooled_mask = pooled_positions <= offset + query_rows
+        scale = 512**-0.5
+        if not fast.has_symbol("deepseek_v4_sparse_attention"):
+            pytest.skip("deepseek_v4_sparse_attention native kernel is unavailable")
+
+        previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+        try:
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
+            actual = dsv4._sparse_pooled_attention(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                local_mask,
+                pooled_mask,
+                scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=compress_ratio,
+                local_window=local_window,
+                native_only=True,
+            )
+            assert actual is not None
+            mx.eval(actual)
+            assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
+
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+            expected = dsv4._sparse_pooled_attention(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                local_mask,
+                pooled_mask,
+                scale,
+                sinks,
+            )
+            mx.eval(expected)
+        finally:
+            dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = previous
+
+        max_abs = mx.max(
+            mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
+        )
+        assert mx.allclose(actual, expected, atol=0.02, rtol=0.02).item()
+        assert float(max_abs.item()) <= max_tolerance
+
+
 class TestPreLoadDispatch:
     """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
 
@@ -1589,6 +1871,92 @@ class TestNaxMoEStockRouting:
         gated = linear._native_block_kind(decode_x, True)
         monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: False)
         assert gated == linear._native_block_kind(decode_x, True)
+
+
+class TestSparseCompressedAttentionIndexerSkip:
+    @staticmethod
+    def _config(dsv4):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[4],
+        )
+
+    def test_all_pooled_skips_scoring_and_preserves_indexer_cache(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.SparseCompressedAttention(self._config(dsv4), 0)
+        x = mx.random.normal((1, 10, 16), dtype=mx.bfloat16)
+
+        # The current full indexer is the reference for both selected rows and
+        # every public part of its compressor cache after a non-aligned chunk.
+        reference_cache = PoolingCache(4)
+        q_residual = layer.q_norm(layer.wq_a(x))
+        reference_topk = layer.indexer(
+            x,
+            q_residual,
+            layer.rope,
+            reference_cache,
+            0,
+        )
+        mx.eval(reference_topk, *(v for v in reference_cache.state if v is not None))
+        assert reference_topk.tolist() == [[[0, 1]] * 10]
+
+        original_compressor_call = dsv4.Compressor.__call__
+        indexer_compressor_calls = 0
+
+        def compressor_spy(compressor, *args, **kwargs):
+            nonlocal indexer_compressor_calls
+            if compressor is layer.indexer.compressor:
+                indexer_compressor_calls += 1
+            return original_compressor_call(compressor, *args, **kwargs)
+
+        def fail_full_indexer(*args, **kwargs):
+            raise AssertionError("all-pooled attention must skip indexer scoring")
+
+        monkeypatch.setattr(dsv4.Compressor, "__call__", compressor_spy)
+        monkeypatch.setattr(dsv4.Indexer, "__call__", fail_full_indexer)
+
+        comp_cache = PoolingCache(4)
+        index_cache = PoolingCache(4)
+        cache = CacheList(
+            RotatingKVCache(max_size=128),
+            comp_cache,
+            index_cache,
+        )
+        output = layer(x, cache=cache)
+        mx.eval(output, *(v for v in index_cache.state if v is not None))
+
+        assert output.shape == (1, 10, 16)
+        assert indexer_compressor_calls == 1
+        assert comp_cache.offset == index_cache.offset == reference_cache.offset == 2
+        assert index_cache.remainder == reference_cache.remainder == 2
+        for actual, expected in zip(index_cache.state, reference_cache.state):
+            assert (actual is None) == (expected is None)
+            if actual is not None:
+                assert mx.array_equal(actual, expected).item()
 
 
 class TestIndexerFallbackTiling:

@@ -170,16 +170,27 @@ def apply() -> bool:
                 _drop_mtp_batch_state(self, "batch-ineligible")
 
             if _is_mtp_eligible(self):
-                try:
-                    state = _prepare_mtp_state_for_next(self)
-                    if state is not None:
-                        return _mtp_next(self, state)
-                except _MtpStepFallback as exc:
-                    logger.debug("MTP next() fallback to standard step: %s", exc)
-                    active = getattr(self, "_omlx_mtp_state", None)
-                    if active is not None:
-                        _reconcile_mtp_to_standard(self, active)
-                    _drop_mtp_state(self, "step-fallback")
+                handed_off = False
+                if _singleton_mtp_handoff_ready(self):
+                    # A prefill is waiting on this batch generator; hand the
+                    # singleton back to the standard step at the drained-queue
+                    # boundary so the late join merges this very call (#2515).
+                    handed_off = _handoff_mtp_for_late_join(
+                        self, self._omlx_mtp_state
+                    )
+                if not handed_off:
+                    try:
+                        state = _prepare_mtp_state_for_next(self)
+                        if state is not None:
+                            return _mtp_next(self, state)
+                    except _MtpStepFallback as exc:
+                        logger.debug(
+                            "MTP next() fallback to standard step: %s", exc
+                        )
+                        active = getattr(self, "_omlx_mtp_state", None)
+                        if active is not None:
+                            _reconcile_mtp_to_standard(self, active)
+                        _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
             _log_multirow_mtp_inactive_once(self)
@@ -246,7 +257,9 @@ def apply() -> bool:
                 gen_batch._omlx_mtp_activation_safe = (
                     _batch_generator_allows_mtp_activation(self)
                 )
-            if _generation_batch_has_active_mtp(gen_batch):
+            if _generation_batch_has_active_mtp(
+                gen_batch
+            ) and not _singleton_mtp_handoff_ready(gen_batch):
                 old_completion_batch_size = getattr(
                     self,
                     "completion_batch_size",
@@ -322,7 +335,9 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
     pending prompt work into the same ``GenerationBatch`` via ``extend()``. That
     merge path forces MTP reconciliation, which can re-prefill a long streamed
     context outside the scheduler's guarded prefill path. Treat active MTP as
-    a temporary full generation batch so late-join requests wait instead.
+    a temporary full generation batch so late-join requests wait, except when
+    ``_singleton_mtp_handoff_ready`` says the singleton path can hand off to
+    the standard step this very call (#2515).
     """
     if gen_batch is None:
         return False
@@ -335,6 +350,29 @@ def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
         getattr(gen_batch, "_omlx_mtp_state", None) is not None
         or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
     )
+
+
+def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
+    """True when a pending late join should be admitted this call (#2515).
+
+    Requires pending prefill work (the activation-safe stamp is False), no
+    row-wise batch state (that opt-in path keeps the deferral), a valid
+    singleton MTP state, and a drained queue: with at most one committed
+    token left unstreamed the handoff to the standard step is exact and
+    (near-)zero cost, so ``patched_bg_next`` skips the completion pin and
+    ``patched_next`` performs the handoff in the same call. Deep queues keep
+    the pin — each call drains one token, bounded by depth + 1.
+    """
+    if gen_batch is None:
+        return False
+    if getattr(gen_batch, "_omlx_mtp_activation_safe", True):
+        return False
+    if getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None:
+        return False
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if not _mtp_state_valid_for_batch(gen_batch, state):
+        return False
+    return len(state.queue) <= 1
 
 
 def _mtp_common_eligible(gen_batch: Any) -> bool:
@@ -2415,16 +2453,15 @@ def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[A
     return responses
 
 
-def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
-    """Hand a parked sequence back to the standard pipelined decoder.
+def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Materialize ``state.next_main`` and sample its successor.
 
-    At a depth-0 cycle boundary the cache is committed-only and compact, so
-    unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
-    ``state.next_main`` (already streamed, not yet in the cache), sample its
-    successor as ``_next_tokens``, and drop the MTP state. The batch is
-    marked so eligibility never re-activates MTP — the controller already
-    proved speculation loses here, and the standard step's async pipelining
-    is what the parked cycles cannot match.
+    At a cycle boundary with an empty queue the cache is exactly one token
+    behind the streamed sequence: ``state.next_main`` (already streamed) has
+    no KV yet. Feed it through the backbone, sample ``_next_tokens`` from
+    the resulting logits, and leave the batch in the standard-resumable
+    state. Shared by the depth-0 park and the late-join handoff. Returns
+    False on failure with the batch untouched.
     """
     import mlx.core as mx
 
@@ -2446,13 +2483,61 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
     except Exception as exc:
-        logger.debug("MTP park-to-standard handoff failed: %s", exc)
+        logger.debug("MTP feed-to-standard handoff failed: %s", exc)
+        return False
+    _clear_rollback(gen_batch.prompt_cache)
+    return True
+
+
+def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Hand a parked sequence back to the standard pipelined decoder.
+
+    At a depth-0 cycle boundary the cache is committed-only and compact, so
+    unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
+    ``state.next_main`` (already streamed, not yet in the cache), sample its
+    successor as ``_next_tokens``, and drop the MTP state. The batch is
+    marked so eligibility never re-activates MTP — the controller already
+    proved speculation loses here, and the standard step's async pipelining
+    is what the parked cycles cannot match.
+    """
+    if not _feed_next_main_to_standard(gen_batch, state):
         return False
     gen_batch._omlx_mtp_parked_uid = state.uid
     if state.controller is not None:
         _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
     state._finish_reason = "parked"
     _drop_mtp_state(gen_batch, "parked-at-depth-0", log_stats=True)
+    return True
+
+
+def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
+    """Hand a singleton MTP decode to the standard step for a late join.
+
+    A pending prefill can only merge into this batch through mlx-lm's
+    promotion path, which the active-MTP completion pin blocks (#2515). At
+    the drained-queue boundary the handoff is exact and cheap: with one
+    queued token left it is the only committed token whose KV is absent
+    from the cache, so it becomes ``_next_tokens`` verbatim and its stored
+    logprobs keep the standard step's emission byte-identical; with an
+    empty queue the park-style 1-token forward re-derives the same state.
+    Unlike ``_park_mtp_to_standard`` this sets no parked uid and arms no
+    std-tax probe: the sequence is yielding to a batch merge, not losing to
+    standard decode, and must regain MTP once it is a compact singleton
+    again.
+    """
+    import mlx.core as mx
+
+    if len(state.queue) > 1:
+        return False
+    if len(state.queue) == 1:
+        token_id, logprobs_1d, _src = state.queue[0]
+        gen_batch._next_tokens = mx.array([int(token_id)], dtype=mx.uint32)
+        gen_batch._next_logprobs = [logprobs_1d]
+        _clear_rollback(gen_batch.prompt_cache)
+    elif not _feed_next_main_to_standard(gen_batch, state):
+        return False
+    state._finish_reason = "late-join-handoff"
+    _drop_mtp_state(gen_batch, "late-join-handoff", log_stats=True)
     return True
 
 

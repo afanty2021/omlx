@@ -16,6 +16,13 @@ mx::array dsa_indexer_scores(
     int unused_causal_prefix_topk = 0,
     bool skip_causal_future_store = false,
     int causal_q_offset = -1,
+    // Optional fused pooled-ratio causal mask (0 = disabled, the historical
+    // behavior). When mask_ratio > 0, pooled column c is masked for query row
+    // r iff c >= (mask_q_offset + r + 1) / mask_ratio, and masked positions
+    // are written as finfo(dtype).min in the kernel epilogue — bit-identical
+    // to the mx.where pass it replaces.
+    int mask_ratio = 0,
+    int mask_q_offset = 0,
     mx::StreamOrDevice s = {});
 
 mx::array dsa_topk_indices(

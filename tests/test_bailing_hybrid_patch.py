@@ -79,7 +79,7 @@ def test_apply_is_idempotent():
 def test_apply_prefers_upstream_module(monkeypatch):
     from omlx.patches import bailing_hybrid
 
-    upstream = object()
+    upstream = SimpleNamespace(_omlx_swiglu_clamp_native=True)
     models_pkg = SimpleNamespace()
 
     def fake_import(name):
@@ -99,6 +99,32 @@ def test_apply_prefers_upstream_module(monkeypatch):
 
     assert bailing_hybrid.apply_bailing_hybrid_patch() is False
     assert models_pkg.bailing_hybrid is upstream
+
+
+def test_apply_propagates_clamp_install_failure(monkeypatch):
+    from omlx.patches import bailing_hybrid
+
+    upstream = SimpleNamespace()
+    models_pkg = SimpleNamespace()
+
+    def fake_import(name):
+        if name == "mlx_lm.models.bailing_hybrid":
+            return upstream
+        if name == "mlx_lm.models":
+            return models_pkg
+        raise AssertionError(f"unexpected import: {name}")
+
+    def fail_install(_module):
+        raise RuntimeError("clamp install failed")
+
+    monkeypatch.setattr(bailing_hybrid, "_APPLIED", False)
+    monkeypatch.setattr(bailing_hybrid.importlib, "import_module", fake_import)
+    monkeypatch.setattr(bailing_hybrid, "ensure_swiglu_clamp", fail_install)
+
+    with pytest.raises(RuntimeError, match="clamp install failed"):
+        bailing_hybrid.apply_bailing_hybrid_patch()
+
+    assert bailing_hybrid.is_applied() is False
 
 
 def test_get_classes_resolves_bailing_hybrid():

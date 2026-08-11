@@ -32,7 +32,15 @@ class PoolingCache(_BaseCache):
         self.buf_gate = None
         self.remainder = 0
 
-        self.pooled = None
+        # Append-in-place pooled storage. ``_pool_buf`` is the backing
+        # allocation (capacity >= logical length); ``_pool_len`` is the
+        # logical row count that the old step-allocated ``pooled`` tensor
+        # reported as ``pooled.shape[1]``. Appends only ever write rows at
+        # [old_len, new_len), so a view captured before an append keeps
+        # reading the same bytes afterwards; regrowth allocates a fresh
+        # buffer and leaves any outstanding views on the old one intact.
+        self._pool_buf = None
+        self._pool_len = 0
         self._undo = None
         self._undo_chain = False
 
@@ -53,8 +61,48 @@ class PoolingCache(_BaseCache):
         self._mtp_cross_boundary_rollback = True
 
     @property
+    def pooled(self):
+        """Logical pooled tensor: a view of the backing buffer's first
+        ``_pool_len`` rows, with exactly the shape/contents the old
+        step-allocated ``self.pooled`` array had.
+
+        Long-lived consumers that must survive later appends must copy
+        (see ``state`` and ``BatchPoolingCache.extract``); rows below the
+        current logical length are never rewritten, so views used within
+        the current chunk/step graph stay correct.
+        """
+        if self._pool_buf is None:
+            return None
+        return self._pool_buf[:, : self._pool_len]
+
+    @pooled.setter
+    def pooled(self, v):
+        # Full-tensor rebinding (state restore, merge/extract targets,
+        # trim restore). Capacity collapses to the logical length; the next
+        # append regrows geometrically.
+        if v is None:
+            self._pool_buf = None
+            self._pool_len = 0
+        else:
+            self._pool_buf = v
+            self._pool_len = v.shape[1]
+
+    @property
     def offset(self):
-        return 0 if self.pooled is None else self.pooled.shape[1]
+        return self._pool_len
+
+    def _grow_pool(self, needed: int) -> None:
+        """Ensure backing capacity for ``needed`` rows (geometric growth).
+
+        Copies only the logical region; rows outside it were never visible
+        through ``pooled``. Outstanding views keep referencing the old
+        buffer, whose committed bytes stay valid.
+        """
+        old = self._pool_buf
+        capacity = max(needed, 2 * old.shape[1])
+        new = mx.zeros((old.shape[0], capacity, old.shape[2]), dtype=old.dtype)
+        new[:, : self._pool_len] = old[:, : self._pool_len]
+        self._pool_buf = new
 
     def accumulate_windows(self, kv: mx.array, gate: mx.array, offset):
         B, L, D1 = kv.shape
@@ -160,14 +208,22 @@ class PoolingCache(_BaseCache):
 
     def update_and_fetch(self, px: mx.array):
         if px.shape[1] == 0:
-            if self.pooled is None:
+            if self._pool_buf is None:
                 return mx.zeros((px.shape[0], 0, px.shape[-1]), dtype=px.dtype)
             return self.pooled
 
-        if self.pooled is None:
-            self.pooled = px
+        n = px.shape[1]
+        if self._pool_buf is None:
+            # First append: adopt the compressor output as the backing
+            # buffer (exact fit, no copy) — identical to the old
+            # ``self.pooled = px`` rebinding.
+            self._pool_buf = px
+            self._pool_len = n
         else:
-            self.pooled = mx.concatenate([self.pooled, px], axis=1)
+            if self._pool_len + n > self._pool_buf.shape[1]:
+                self._grow_pool(self._pool_len + n)
+            self._pool_buf[:, self._pool_len : self._pool_len + n] = px
+            self._pool_len += n
         return self.pooled
 
     def make_mask(self, L: int = 1, offset: int = 0):
@@ -253,7 +309,6 @@ class PoolingCache(_BaseCache):
         buf_kv, buf_gate, rem_prev, pooled_prev, kv, gate, prev_kv, prev_gate = (
             self._undo
         )
-        pooled_after = self.pooled
         self._undo = None
         self._undo_chain = False
         k = kv.shape[1] - n
@@ -266,13 +321,23 @@ class PoolingCache(_BaseCache):
         completed = prefix_kv.shape[1] // self.ratio
         previous_pooled = 0 if pooled_prev is None else pooled_prev.shape[1]
         if completed == 0:
-            self.pooled = pooled_prev
+            # Restore the pre-update logical length. The appended rows were
+            # only ever written at [previous_pooled, ...), so dropping the
+            # logical length discards exactly what the old
+            # ``self.pooled = pooled_prev`` rebinding discarded.
+            if previous_pooled == 0:
+                self._pool_buf = None
+                self._pool_len = 0
+            else:
+                self._pool_len = previous_pooled
             self.prev_win_kv = prev_kv
             self.prev_win_gate = prev_gate
         else:
             # The full verify already computed these prefix windows. Keep
             # their exact rows instead of recompressing them during rollback.
-            self.pooled = pooled_after[:, : previous_pooled + completed]
+            # Old code rebound ``self.pooled = pooled_after[:, :N]``; the
+            # buffer's first N rows are exactly that slice.
+            self._pool_len = previous_pooled + completed
             end = completed * self.ratio
             start = end - self.ratio
             self.prev_win_kv = prefix_kv[:, start:end, :][:, None]
@@ -306,18 +371,19 @@ class PoolingCache(_BaseCache):
         self.prev_win_gate = gate[:, -1:]
 
     def size(self):
-        return 0 if self.pooled is None else self.pooled.shape[1]
+        return self._pool_len
 
     def empty(self):
-        return self.pooled is None and self.remainder == 0
+        return self._pool_buf is None and self.remainder == 0
 
     @property
     def nbytes(self):
         total = 0
         if self.buf_kv is not None:
             total += self.buf_kv.nbytes + self.buf_gate.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
+        if self._pool_buf is not None:
+            # Resident allocation (capacity), not just the logical view.
+            total += self._pool_buf.nbytes
         if self.prev_win_kv is not None:
             total += self.prev_win_kv.nbytes + self.prev_win_gate.nbytes
         return total
@@ -342,7 +408,15 @@ class BatchPoolingCache(_BaseCache):
         self.buf_gate = None
         self.remainder = [0] * batch_size
 
-        self.pooled = None
+        # Append-in-place pooled storage (see PoolingCache). ``_pool_buf``
+        # is the backing allocation; ``_pool_lengths`` (already tracked for
+        # offset/mask bookkeeping) is the per-row logical length;
+        # ``_pool_extent`` reproduces the physical ``pooled.shape[1]`` the
+        # old code exposed, which could overshoot max(_pool_lengths) when
+        # the longest row and the row completing windows differed
+        # (old: max(lengths_before) + max_new).
+        self._pool_buf = None
+        self._pool_extent = 0
         self._pool_lengths = [0] * batch_size
 
         self._lengths = [2**31] * batch_size
@@ -362,6 +436,31 @@ class BatchPoolingCache(_BaseCache):
         self.prev_win_gate = None
         self._prev_valid = [False] * batch_size
         self._last_usable = [0] * batch_size
+
+    @property
+    def pooled(self):
+        """Logical pooled tensor: view of the backing buffer's first
+        ``_pool_extent`` columns, matching the old physical tensor's
+        shape/contents exactly (per-row validity lives in
+        ``_pool_lengths`` and is applied via ``make_mask``).
+
+        Rows/columns below the current extent are never rewritten, so
+        views used inside the current chunk/step graph stay correct;
+        long-lived consumers must copy.
+        """
+        if self._pool_buf is None:
+            return None
+        return self._pool_buf[:, : self._pool_extent]
+
+    @pooled.setter
+    def pooled(self, v):
+        # Full-tensor rebinding (state restore, filter/extend/merge).
+        if v is None:
+            self._pool_buf = None
+            self._pool_extent = 0
+        else:
+            self._pool_buf = v
+            self._pool_extent = v.shape[1]
 
     @property
     def offset(self):
@@ -512,7 +611,7 @@ class BatchPoolingCache(_BaseCache):
         B, N, D = px.shape
 
         if N == 0:
-            if self.pooled is None:
+            if self._pool_buf is None:
                 return mx.zeros((B, 0, D), dtype=px.dtype)
             return self.pooled
 
@@ -524,39 +623,34 @@ class BatchPoolingCache(_BaseCache):
         ]
         max_new = max(new_counts)
         if max_new == 0:
-            if self.pooled is None:
+            if self._pool_buf is None:
                 return mx.zeros((B, 0, D), dtype=px.dtype)
             return self.pooled
 
-        # The singleton path is the common decode/prefill case.  Build a
-        # fresh logical value instead of mutating a zero-filled allocation
-        # that the same lazy graph immediately consumes in attention.
-        if B == 1:
-            count = new_counts[0]
-            current = self._pool_lengths[0]
-            new_rows = px[:, :count]
-            if self.pooled is None or current == 0:
-                self.pooled = new_rows
-            else:
-                self.pooled = mx.concatenate(
-                    [self.pooled[:, :current], new_rows], axis=1
-                )
-            self._pool_lengths[0] = current + count
-            return self.pooled
-
+        # Physical extent exactly as the old code computed it, including the
+        # overshoot when the longest row is not the one completing windows.
         max_pool = max(self._pool_lengths) + max_new
 
-        if self.pooled is None:
-            self.pooled = mx.zeros((B, max_pool, D), dtype=px.dtype)
-        elif self.pooled.shape[1] < max_pool:
-            pad = mx.zeros((B, max_pool - self.pooled.shape[1], D), dtype=px.dtype)
-            self.pooled = mx.concatenate([self.pooled, pad], axis=1)
+        if self._pool_buf is None:
+            self._pool_buf = mx.zeros((B, max_pool, D), dtype=px.dtype)
+        elif self._pool_buf.shape[1] < max_pool:
+            # Geometric regrowth; copy only the visible region so columns
+            # beyond the extent stay zero-filled like the old pad path.
+            capacity = max(max_pool, 2 * self._pool_buf.shape[1])
+            new_buf = mx.zeros((B, capacity, D), dtype=px.dtype)
+            new_buf[:, : self._pool_extent] = self._pool_buf[:, : self._pool_extent]
+            self._pool_buf = new_buf
+        self._pool_extent = max(self._pool_extent, max_pool)
 
+        # Append in place. The old singleton path rebound
+        # ``self.pooled = concatenate([self.pooled[:, :current], new_rows])``;
+        # writing rows [pl, pl+nc) into the buffer is value-identical, and
+        # the B > 1 path already used exactly this in-place scheme.
         for i in range(B):
             nc = new_counts[i]
             if nc > 0:
                 pl = self._pool_lengths[i]
-                self.pooled[i, pl : pl + nc] = px[i, :nc]
+                self._pool_buf[i, pl : pl + nc] = px[i, :nc]
                 self._pool_lengths[i] = pl + nc
 
         return self.pooled
@@ -660,7 +754,6 @@ class BatchPoolingCache(_BaseCache):
             prev_valid,
         ) = self._undo
         if self._mtp_cross_boundary_rollback:
-            pooled_after = self.pooled
             self._undo = None
             self._undo_chain = False
             k = kv.shape[1] - n
@@ -674,9 +767,14 @@ class BatchPoolingCache(_BaseCache):
             )
             completed = prefix_kv.shape[1] // self.ratio
             next_pool_length = pool_lengths[0] + completed
-            self.pooled = (
-                pooled_after[:, :next_pool_length] if next_pool_length else None
-            )
+            # Old code rebound ``self.pooled = pooled_after[:, :N]``; the
+            # buffer's first N columns are exactly that slice (appends only
+            # wrote at [pool_lengths[0], ...)).
+            if next_pool_length:
+                self._pool_extent = next_pool_length
+            else:
+                self._pool_buf = None
+                self._pool_extent = 0
             self._pool_lengths = [next_pool_length]
             self._processed = [processed[0] + k]
 
@@ -734,11 +832,13 @@ class BatchPoolingCache(_BaseCache):
 
     def _truncate_pooled_tail(self):
         """Drop pooled rows written by a rejected speculative suffix."""
-        if self.pooled is None:
+        if self._pool_buf is None:
             return
         logical_size = max(self._pool_lengths, default=0)
-        if self.pooled.shape[1] > logical_size:
-            self.pooled = self.pooled[:, :logical_size]
+        if self._pool_extent > logical_size:
+            # Logical truncation only; the buffer's first logical_size
+            # columns are exactly the old ``pooled[:, :logical_size]``.
+            self._pool_extent = logical_size
 
     def prev_for_prepend(self):
         """Per-row previous window with invalid rows masked via -inf gates.
@@ -776,18 +876,19 @@ class BatchPoolingCache(_BaseCache):
         self._prev_valid = [v or n > 0 for v, n in zip(self._prev_valid, n_new)]
 
     def size(self):
-        return 0 if self.pooled is None else self.pooled.shape[1]
+        return 0 if self._pool_buf is None else self._pool_extent
 
     def empty(self):
-        return self.pooled is None and all(r == 0 for r in self.remainder)
+        return self._pool_buf is None and all(r == 0 for r in self.remainder)
 
     @property
     def nbytes(self):
         total = 0
         if self.buf_kv is not None:
             total += self.buf_kv.nbytes + self.buf_gate.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
+        if self._pool_buf is not None:
+            # Resident allocation (capacity), not just the logical view.
+            total += self._pool_buf.nbytes
         return total
 
     def filter(self, batch_indices):

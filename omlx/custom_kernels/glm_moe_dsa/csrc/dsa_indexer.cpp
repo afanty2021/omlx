@@ -54,13 +54,17 @@ class DSAIndexerScoresPrimitive : public Primitive {
       bool weights_lh,
       int unused_causal_prefix_topk,
       bool skip_causal_future_store,
-      int causal_q_offset)
+      int causal_q_offset,
+      int mask_ratio,
+      int mask_q_offset)
       : Primitive(stream),
         causal_(causal),
         weights_lh_(weights_lh),
         unused_causal_prefix_topk_(unused_causal_prefix_topk),
         skip_causal_future_store_(skip_causal_future_store),
-        causal_q_offset_(causal_q_offset) {}
+        causal_q_offset_(causal_q_offset),
+        mask_ratio_(mask_ratio),
+        mask_q_offset_(mask_q_offset) {}
 
   static bool unsupported(
       const array& q,
@@ -128,16 +132,26 @@ class DSAIndexerScoresPrimitive : public Primitive {
     out.set_data(allocator::malloc(out.nbytes()));
 
     constexpr int bm = 64;
-    constexpr int bn = 64;
     constexpr int bk = 16;
-    constexpr int wm = 2;
-    constexpr int wn = 2;
 
     const int B = q.shape(0);
     const int H = q.shape(1);
     const int M = q.shape(2);
     const int N = k.shape(2);
     const int D = q.shape(3);
+
+    // bm/bn/wm/wn do not enter the per-element K-reduction order (bk=16 and
+    // the MMA fragment K-layout are unchanged), so the tile config only
+    // affects scheduling. bn=128 (paired with wm=2,wn=4) was measured on
+    // M3 Ultra (L=2048, bf16, H=64): it ties bn=64 at P=25k but is ~9%
+    // slower at P=125k and ~11% slower at P=2.5k — the kernel is
+    // compute/barrier-bound (Q and pooled-K panels are largely
+    // L2-resident), so the traffic reduction does not pay. bn=64/wm2/wn2
+    // is the fixed configuration.
+    const int bn = 64;
+    const int wm = 2;
+    const int wn = 2;
+
     const int tiles_m = (M + bm - 1) / bm;
     const int tiles_n = (N + bn - 1) / bn;
 
@@ -203,6 +217,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
     compute_encoder.set_bytes(unused_causal_prefix_topk_, 6);
     compute_encoder.set_bytes(skip_causal_future_store_, 7);
     compute_encoder.set_bytes(causal_q_offset_, 8);
+    compute_encoder.set_bytes(mask_ratio_, 9);
+    compute_encoder.set_bytes(mask_q_offset_, 10);
 
     MTL::Size group_dims = MTL::Size(wm * wn * 32, 1, 1);
     MTL::Size grid_dims = MTL::Size(tiles_n, tiles_m, B);
@@ -216,7 +232,9 @@ class DSAIndexerScoresPrimitive : public Primitive {
     return causal_ == rhs.causal_ && weights_lh_ == rhs.weights_lh_ &&
         unused_causal_prefix_topk_ == rhs.unused_causal_prefix_topk_ &&
         skip_causal_future_store_ == rhs.skip_causal_future_store_ &&
-        causal_q_offset_ == rhs.causal_q_offset_;
+        causal_q_offset_ == rhs.causal_q_offset_ &&
+        mask_ratio_ == rhs.mask_ratio_ &&
+        mask_q_offset_ == rhs.mask_q_offset_;
   }
   auto state() const {
     return std::make_tuple(
@@ -224,7 +242,9 @@ class DSAIndexerScoresPrimitive : public Primitive {
         weights_lh_,
         unused_causal_prefix_topk_,
         skip_causal_future_store_,
-        causal_q_offset_);
+        causal_q_offset_,
+        mask_ratio_,
+        mask_q_offset_);
   }
 
  private:
@@ -233,6 +253,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int unused_causal_prefix_topk_;
   bool skip_causal_future_store_;
   int causal_q_offset_;
+  int mask_ratio_;
+  int mask_q_offset_;
 };
 
 class DSATopKIndicesPrimitive : public Primitive {
@@ -572,6 +594,8 @@ array dsa_indexer_scores(
     int unused_causal_prefix_topk,
     bool skip_causal_future_store,
     int causal_q_offset,
+    int mask_ratio,
+    int mask_q_offset,
     StreamOrDevice s) {
   if (queries.ndim() != 4 || keys.ndim() != 4 ||
       (weights.ndim() != 3 && weights.ndim() != 4)) {
@@ -625,6 +649,19 @@ array dsa_indexer_scores(
         << "-1 or non-negative, got " << causal_q_offset << ".";
     throw std::invalid_argument(msg.str());
   }
+  if (mask_ratio < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores] mask_ratio must be "
+        << "non-negative (0 disables the fused pooled-causal mask), got "
+        << mask_ratio << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (mask_ratio > 0 && mask_q_offset < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores] mask_q_offset must be "
+        << "non-negative when mask_ratio > 0, got " << mask_q_offset << ".";
+    throw std::invalid_argument(msg.str());
+  }
 
   auto stream = to_stream(s);
   auto q = ensure_row_contiguous(astype(queries, final_type, stream), stream);
@@ -647,7 +684,9 @@ array dsa_indexer_scores(
           weights_lh,
           unused_causal_prefix_topk,
           skip_causal_future_store,
-          causal_q_offset),
+          causal_q_offset,
+          mask_ratio,
+          mask_q_offset),
       std::move(inputs));
 }
 

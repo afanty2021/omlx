@@ -69,6 +69,84 @@ def test_prompt_boundary_store_fills_only_sliceable_snapshot_placeholders():
     )
 
 
+def test_prompt_boundary_store_refills_blanked_cachelist_members():
+    """Member-filtered snapshots (#2550 follow-up): a promoted CacheList
+    layer with a blanked sliceable sub must be refilled from the live
+    cache, keeping the snapshot's boundary state for the other members."""
+    scheduler = _scheduler()
+    prompt_tokens = list(range(10))
+    boundary_tokens = prompt_tokens[:8]
+    boundary_cache = [
+        {
+            "state": [(), ("conv-at-boundary",)],
+            "meta_state": (["KVCache", "ArraysCache"], [(), ()]),
+            "class_name": "CacheList",
+            "cache_type": "CacheList",
+        },
+    ]
+    live_cache = [
+        {
+            "state": [("kv-live-keys", "kv-live-values"), ("conv-live-tail",)],
+            "meta_state": (["KVCache", "ArraysCache"], [(), ()]),
+            "class_name": "CacheList",
+            "cache_type": "CacheList",
+        },
+    ]
+
+    scheduler._get_boundary_store_override = MagicMock(
+        return_value=(boundary_tokens, boundary_cache, None, {})
+    )
+    scheduler._extract_live_request_cache_for_store = MagicMock(
+        return_value=(live_cache, "live-config")
+    )
+
+    result = scheduler._prepare_prompt_boundary_cache_store(
+        "req-parser-stop",
+        _request(prompt_tokens),
+        uid=7,
+    )
+
+    assert result is not None
+    token_sequence, cache_to_store, model_config, _ = result
+    assert token_sequence == boundary_tokens
+    layer = cache_to_store[0]
+    assert layer["state"][0] == ("kv-live-keys", "kv-live-values")
+    assert layer["state"][1] == ("conv-at-boundary",)
+    assert model_config == "live-config"
+
+
+def test_prompt_boundary_store_skips_unfillable_blanked_members():
+    """When the live cache cannot supply a blanked CacheList member, the
+    store must be skipped instead of persisting a partial composite."""
+    scheduler = _scheduler()
+    prompt_tokens = list(range(10))
+    boundary_cache = [
+        {
+            "state": [(), ("conv-at-boundary",)],
+            "class_name": "CacheList",
+            "cache_type": "CacheList",
+        },
+    ]
+    live_cache = [
+        {"state": ("kv-live",), "class_name": "KVCache", "cache_type": "KVCache"},
+    ]
+
+    scheduler._get_boundary_store_override = MagicMock(
+        return_value=(prompt_tokens[:8], boundary_cache, None, {})
+    )
+    scheduler._extract_live_request_cache_for_store = MagicMock(
+        return_value=(live_cache, "live-config")
+    )
+
+    result = scheduler._prepare_prompt_boundary_cache_store(
+        "req-parser-stop",
+        _request(prompt_tokens),
+        uid=7,
+    )
+
+    assert result is None
+
+
 def test_prompt_boundary_store_skips_missing_snapshot_for_snapshot_models():
     scheduler = _scheduler()
     scheduler._get_boundary_store_override = MagicMock(return_value=None)

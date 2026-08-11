@@ -79,6 +79,20 @@ class DeepSeekV4Tokenizer(CohereTokenizer):
         return parse_tool_call(text, tools)
 
 
+class BailingHybridTokenizer(CohereTokenizer):
+    _token_ids = {
+        "<role>": 157151,
+        "</role>": 157152,
+    }
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self._token_ids.get(token, -1)
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        token_id = self._token_ids.get(text)
+        return [token_id] if token_id is not None else []
+
+
 class _FakeMelodyOptions:
     def cmd4(self):
         return self
@@ -176,6 +190,152 @@ class ByteFallbackTokenizer:
             return "\uc7a0"
         return "\ufffd" * sum(1 for token_id in token_ids if token_id != 0)
 
+
+class TestBailingHybridOutputParserSession:
+    def test_role_boundary_tokens_are_suppressed(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: "Now I have ",
+                2: "fixed it.",
+                157151: "<role>",
+                157152: "</role>",
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "bailing_hybrid"
+        session = factory.create_session(tokenizer)
+        results = [
+            session.process_token(token_id)
+            for token_id in (1, 157152, 2, 157151)
+        ]
+        final = session.finalize()
+
+        assert "".join(result.stream_text for result in results) == (
+            "Now I have fixed it."
+        )
+        assert "".join(result.visible_text for result in results) == (
+            "Now I have fixed it."
+        )
+        assert results[1].record_token is True
+        assert results[3].record_token is True
+        assert final.stream_text == ""
+        assert final.visible_text == ""
+
+    def test_fragmented_tool_protocol_is_hidden_and_parsed(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: "Before ",
+                2: "<to",
+                3: "ol_call>weather<arg_",
+                4: "key>city</arg_key><arg_value>Paris",
+                5: "</arg_value></tool_call>",
+                6: " after.",
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+
+        assert factory is not None
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        assert factory.create_session_with_tools is not None
+        session = factory.create_session_with_tools(tokenizer, tools)
+        results = [session.process_token(token_id) for token_id in range(1, 7)]
+        final = session.finalize()
+        streamed = "".join(result.stream_text for result in results)
+        visible = "".join(result.visible_text for result in results)
+
+        assert streamed + final.stream_text == "Before  after."
+        assert visible + final.visible_text == "Before  after."
+        assert all(
+            marker not in streamed + final.stream_text
+            for marker in ("<tool_call>", "<arg_key>", "<arg_value>")
+        )
+        assert final.finish_reason == "tool_calls"
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+    def test_tool_calls_use_request_schema_and_registered_names(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: (
+                    "<tool_call>weather<arg_key>code</arg_key>"
+                    "<arg_value>123</arg_value></tool_call>"
+                    "<tool_call>unknown<arg_key>x</arg_key>"
+                    "<arg_value>1</arg_value></tool_call>"
+                )
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+        assert factory is not None
+        assert factory.create_session_with_tools is not None
+        session = factory.create_session_with_tools(tokenizer, tools)
+        session.process_token(1)
+        final = session.finalize()
+
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"code": "123"}
+
+    def test_tool_protocol_without_request_tools_is_not_a_tool_call(self):
+        tokenizer = BailingHybridTokenizer(
+            {
+                1: (
+                    "<tool_call>weather<arg_key>city</arg_key>"
+                    "<arg_value>Paris</arg_value></tool_call>"
+                )
+            }
+        )
+        factory = detect_output_parser(
+            "Ling-3.0-flash-mxfp4",
+            tokenizer,
+            {"model_type": "bailing_hybrid"},
+        )
+
+        assert factory is not None
+        session = factory.create_session(tokenizer)
+        session.process_token(1)
+        final = session.finalize()
+
+        assert final.tool_calls == []
+        assert final.finish_reason is None
 
 class TestCohere2MoeOutputParserSession:
     def test_detects_cohere2_moe_from_model_config(self, monkeypatch):
@@ -906,6 +1066,19 @@ class TestInklingOutputParserSession:
         visible.append(final.visible_text)
         return "".join(stream), "".join(visible), stopped, final
 
+    def _parse_tool_call_payload(self, payload):
+        token_map = {
+            1: "<|content_invoke_tool_json|>",
+            2: payload,
+            3: "<|end_message|>",
+            4: "<|content_model_end_sampling|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        _, _, stopped, final = self._run(session, [1, 2, 3, 4])
+        assert stopped
+        return final
+
     def test_thinking_then_text(self):
         token_map = {
             1: "<|content_thinking|>",
@@ -953,6 +1126,54 @@ class TestInklingOutputParserSession:
         assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Seoul"}
         assert final.finish_reason == "tool_calls"
 
+    def test_tool_call_accepts_json_encoded_arguments(self):
+        arguments = {
+            "city": "Chicago",
+            "guests": {"adults": 2, "children": 1},
+        }
+        payload = json.dumps(
+            {
+                "name": "book_hotel",
+                "arguments": json.dumps(arguments, separators=(",", ":")),
+            },
+            separators=(",", ":"),
+        )
+
+        final = self._parse_tool_call_payload(payload)
+
+        assert final.tool_calls[0]["name"] == "book_hotel"
+        assert json.loads(final.tool_calls[0]["arguments"]) == arguments
+        assert final.finish_reason == "tool_calls"
+
+    def test_tool_call_repairs_missing_outer_brace(self):
+        arguments = {
+            "city": "Chicago",
+            "guests": {"adults": 2, "children": 1},
+        }
+        payload = json.dumps(
+            {"name": "book_hotel", "args": arguments},
+            separators=(",", ":"),
+        )[:-1]
+
+        final = self._parse_tool_call_payload(payload)
+
+        assert final.tool_calls[0]["name"] == "book_hotel"
+        assert json.loads(final.tool_calls[0]["arguments"]) == arguments
+        assert final.finish_reason == "tool_calls"
+
+    def test_truncated_tool_call_ignores_braces_inside_strings(self):
+        for text in ("open { brace", "close } brace", 'quoted "} brace'):
+            payload = json.dumps(
+                {"name": "write", "args": {"text": text}},
+                separators=(",", ":"),
+            )[:-1]
+
+            final = self._parse_tool_call_payload(payload)
+
+            assert len(final.tool_calls) == 1, text
+            assert json.loads(final.tool_calls[0]["arguments"]) == {"text": text}
+            assert final.finish_reason == "tool_calls"
+
     def test_partial_marker_across_tokens(self):
         token_map = {
             1: "<|content_",
@@ -982,6 +1203,307 @@ class TestInklingOutputParserSession:
 
     def test_non_inkling_models_unaffected(self):
         tokenizer = InklingTokenizer({0: "a", 1: "b"})
+        factory = detect_output_parser(
+            "llama-3-8b",
+            tokenizer,
+            {"model_type": "llama"},
+        )
+        assert factory is None
+
+
+class TestMuseGlimmerOutputParserSession:
+    """Muse Glimmer channel protocol: <|start|>role to=X<|message|>body."""
+
+    def _factory(self, token_map, model_config=None):
+        tokenizer = InklingTokenizer(token_map)
+        factory = detect_output_parser(
+            "Muse-Glimmer-30B",
+            tokenizer,
+            model_config or {"model_type": "muse_glimmer"},
+        )
+        assert factory is not None
+        assert factory.kind == "muse_glimmer"
+        return tokenizer, factory
+
+    def _run(self, session, token_ids):
+        stream, visible, stopped = [], [], False
+        for token_id in token_ids:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+            if result.is_stop:
+                stopped = True
+                break
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+        return "".join(stream), "".join(visible), stopped, final
+
+    def test_reasoning_then_answer(self):
+        token_map = {
+            1: " to=self",
+            2: "<|message|>",
+            3: "let me ",
+            4: "reason",
+            5: "<|eom|>",
+            6: "<|start|>",
+            7: "assistant to=user",
+            8: "<|message|>",
+            9: "Paris.",
+            10: "<|eot|>",
+            11: "<|end_of_text|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(
+            session, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        )
+
+        assert stream == "<think>let me reason</think>Paris."
+        assert visible == stream
+        assert stopped
+        assert final.tool_calls == []
+        assert 10 in factory.stop_token_ids
+        assert 11 in factory.stop_token_ids
+
+    def test_bare_answer_without_recipient(self):
+        token_map = {
+            1: "<|message|>",
+            2: "Hello",
+            3: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2, 3])
+
+        assert stream == "Hello"
+        assert visible == "Hello"
+        assert stopped
+        assert final.tool_calls == []
+
+    def test_tool_call_suppressed_and_parsed(self):
+        token_map = {
+            1: " to=self",
+            2: "<|message|>",
+            3: "need weather",
+            4: "<|eom|>",
+            5: "<|start|>",
+            6: "assistant to=get_weather",
+            7: "<|message|>",
+            8: (
+                '<atem:function_calls>\n<atem:invoke name="get_weather">\n'
+                '<atem:parameter name="city">Seoul</atem:parameter>\n'
+                '<atem:parameter name="days">3</atem:parameter>\n'
+                "</atem:invoke>\n</atem:function_calls>"
+            ),
+            9: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(
+            session, [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        )
+
+        assert stream == "<think>need weather</think>"
+        assert visible == stream
+        assert stopped
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "get_weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {
+            "city": "Seoul",
+            "days": 3,
+        }
+        assert final.finish_reason == "tool_calls"
+
+    def test_multiple_tool_calls_across_messages(self):
+        token_map = {
+            1: " to=alpha",
+            2: "<|message|>",
+            3: (
+                '<atem:function_calls>\n<atem:invoke name="alpha">\n'
+                '<atem:parameter name="x">1</atem:parameter>\n'
+                "</atem:invoke>\n</atem:function_calls>"
+            ),
+            4: "<|eom|>",
+            5: "<|start|>",
+            6: "assistant to=beta",
+            7: "<|message|>",
+            8: (
+                '<atem:function_calls>\n<atem:invoke name="beta">\n'
+                '<atem:parameter name="y">2</atem:parameter>\n'
+                "</atem:invoke>\n</atem:function_calls>"
+            ),
+            9: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(
+            session, [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        )
+
+        assert stream == ""
+        assert visible == ""
+        assert stopped
+        assert [c["name"] for c in final.tool_calls] == ["alpha", "beta"]
+
+    def test_atem_value_typing_without_schema(self):
+        token_map = {
+            1: " to=fn",
+            2: "<|message|>",
+            3: (
+                '<atem:function_calls>\n<atem:invoke name="fn">\n'
+                '<atem:parameter name="count">42</atem:parameter>\n'
+                '<atem:parameter name="flag">true</atem:parameter>\n'
+                '<atem:parameter name="nothing">null</atem:parameter>\n'
+                '<atem:parameter name="obj">{"a": 1}</atem:parameter>\n'
+                '<atem:parameter name="text">multi\nline "quoted"\n</atem:parameter>\n'
+                "</atem:invoke>\n</atem:function_calls>"
+            ),
+            4: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        _, _, stopped, final = self._run(session, [1, 2, 3, 4])
+
+        assert stopped
+        args = json.loads(final.tool_calls[0]["arguments"])
+        assert args["count"] == 42
+        assert args["flag"] is True
+        assert args["nothing"] is None
+        assert args["obj"] == {"a": 1}
+        assert args["text"] == 'multi\nline "quoted"\n'
+
+    def test_atem_schema_keeps_numeric_strings(self):
+        token_map = {
+            1: " to=get_weather",
+            2: "<|message|>",
+            3: (
+                '<atem:function_calls>\n<atem:invoke name="get_weather">\n'
+                '<atem:parameter name="zip">04524</atem:parameter>\n'
+                '<atem:parameter name="days">3</atem:parameter>\n'
+                "</atem:invoke>\n</atem:function_calls>"
+            ),
+            4: "<|eot|>",
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "zip": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+        tokenizer, factory = self._factory(token_map)
+        assert factory.create_session_with_tools is not None
+        session = factory.create_session_with_tools(tokenizer, tools)
+        _, _, stopped, final = self._run(session, [1, 2, 3, 4])
+
+        assert stopped
+        args = json.loads(final.tool_calls[0]["arguments"])
+        assert args["zip"] == "04524"
+        assert args["days"] == 3
+
+    def test_marker_split_across_tokens(self):
+        token_map = {
+            1: " to=self",
+            2: "<|message|>",
+            3: "thinking",
+            4: "<|eo",
+            5: "m|>",
+            6: "<|start|>",
+            7: "assistant to=user",
+            8: "<|message|>",
+            9: "done",
+            10: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(
+            session, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        )
+
+        assert stream == "<think>thinking</think>done"
+        assert visible == stream
+        assert stopped
+
+    def test_unterminated_thinking_closed_at_finalize(self):
+        token_map = {
+            1: " to=self",
+            2: "<|message|>",
+            3: "still going",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2, 3])
+
+        assert stream == "<think>still going</think>"
+        assert visible == stream
+        assert not stopped
+
+    def test_namespaced_recipient_is_tool(self):
+        token_map = {
+            1: " to=browser.search",
+            2: "<|message|>",
+            3: (
+                '<atem:function_calls>\n<atem:invoke name="browser.search">\n'
+                '<atem:parameter name="query">weather</atem:parameter>\n'
+                "</atem:invoke>\n</atem:function_calls>"
+            ),
+            4: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2, 3, 4])
+
+        assert stream == ""
+        assert visible == ""
+        assert final.tool_calls[0]["name"] == "browser.search"
+
+    def test_atem_example_in_reasoning_not_parsed(self):
+        token_map = {
+            1: " to=self",
+            2: "<|message|>",
+            3: (
+                "I could call it like "
+                '<atem:function_calls><atem:invoke name="fake">'
+                '<atem:parameter name="a">1</atem:parameter>'
+                "</atem:invoke></atem:function_calls> but I will answer."
+            ),
+            4: "<|eom|>",
+            5: "<|start|>",
+            6: "assistant to=user",
+            7: "<|message|>",
+            8: "No tool needed.",
+            9: "<|eot|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        _, _, stopped, final = self._run(session, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+        assert stopped
+        assert final.tool_calls == []
+
+    def test_off_protocol_text_flushes_after_head_limit(self):
+        long_text = "word " * 30  # 150 chars, no markers at all
+        token_map = {1: long_text, 2: "more text"}
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2])
+
+        combined = stream
+        assert long_text.strip()[:20] in combined
+        assert "more text" in combined
+        assert not stopped
+
+    def test_non_muse_model_not_claimed(self):
+        tokenizer = InklingTokenizer({})
         factory = detect_output_parser(
             "llama-3-8b",
             tokenizer,

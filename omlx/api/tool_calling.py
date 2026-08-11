@@ -23,7 +23,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import regex
 from jsonschema import ValidationError, validate
@@ -339,6 +339,236 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     return val
 
 
+# Shared decoder for locating payload boundaries. ``strict=False`` matches the
+# tolerance already used when parsing tool-call JSON elsewhere in this module,
+# so boundary detection never rejects a payload the parser would have accepted.
+_TOOL_CALL_JSON_DECODER = json.JSONDecoder(strict=False)
+
+# Boundary detection is a hint, not the real parse, so it is cheap to bound.
+# Same rationale as _GEMMA4_MAX_ARGS_LEN below: model output is untrusted and
+# attacker-influenceable, so exceeding the bound must degrade to the historical
+# behaviour rather than burn time on a payload we are only measuring.
+_TOOL_CALL_MAX_BOUNDARY_SCAN = 262_144
+
+
+def _json_value_end(text: str, start: int) -> Optional[int]:
+    """Index just past the complete JSON value beginning at/after ``start``.
+
+    Returns ``None`` when the text does not begin a JSON object/array there, or
+    when that value is still incomplete.  Only ``{``/``[`` openers are treated
+    as JSON: tool-call payloads in the non-JSON dialects (GLM
+    ``<arg_key>``/``<arg_value>``, Qwen ``<function=...>``) must keep their
+    historical handling, and a bare scalar would let ``raw_decode`` claim a
+    prefix of some other markup.
+
+    Never raises. ``RecursionError`` is caught alongside ``ValueError`` because
+    ``raw_decode`` recurses per nesting level, so deeply nested model output
+    (``"[" * 100000``) blows the stack rather than returning a decode error.
+    A boundary hint must never turn into an exception escaping the parse chain.
+    """
+    idx = start
+    while idx < len(text) and text[idx] in " \t\r\n":
+        idx += 1
+    if idx >= len(text) or text[idx] not in "{[":
+        return None
+    if len(text) - idx > _TOOL_CALL_MAX_BOUNDARY_SCAN:
+        return None
+    try:
+        _, end = _TOOL_CALL_JSON_DECODER.raw_decode(text, idx)
+    except (ValueError, RecursionError):
+        return None
+    return end
+
+
+_XML_FUNCTION_OPEN = "<function="
+_XML_FUNCTION_CLOSE = "</function>"
+_XML_PARAMETER_OPEN = "<parameter="
+_XML_PARAMETER_CLOSE = "</parameter>"
+# Candidate envelope ends examined before giving up. Each candidate costs a
+# balance count over the payload, so this keeps hostile output linear.
+_XML_MAX_END_CANDIDATES = 32
+# Trailing payload context the stream filter keeps so a `</function>` split
+# across chunks is still visible when the close marker arrives.
+_XML_TAIL_KEEP = 64
+
+
+def _skip_ws(text: str, idx: int) -> int:
+    """First index at/after ``idx`` that is not ASCII whitespace."""
+    while idx < len(text) and text[idx] in " \t\r\n":
+        idx += 1
+    return idx
+
+
+def _xml_function_payload_end(
+    text: str, payload_start: int, end_marker: str
+) -> Optional[int]:
+    """Index just past the ``</function>`` closing a qwen3_coder payload.
+
+    The ``qwen3_coder`` parser (Qwen3.5/3.6 builds) wraps XML rather than JSON
+    in the envelope::
+
+        <tool_call><function=name><parameter=k>value</parameter></function></tool_call>
+
+    so ``_json_value_end`` cannot bound it and a literal close marker inside a
+    parameter value truncates the payload the same way (#2507).
+
+    The structural anchor is that a real envelope ends with ``</function>``
+    followed by the close marker, and that its parameter elements balance.
+    Requiring both skips copies embedded in values, including a value that
+    contains the whole ``</function>`` + close-marker sequence, while still
+    ending at the FIRST call when several are concatenated.
+
+    Returns ``None`` when the payload is not this dialect or has no such pair,
+    which leaves the caller on the historical first-match behaviour.
+    """
+    idx = _skip_ws(text, payload_start)
+    if not text.startswith(_XML_FUNCTION_OPEN, idx):
+        return None
+    search = idx
+    # Bounded so a value stuffed with fake terminators cannot make the balance
+    # check quadratic; past the cap we simply decline to bound the payload.
+    for _ in range(_XML_MAX_END_CANDIDATES):
+        close = text.find(_XML_FUNCTION_CLOSE, search)
+        if close < 0:
+            return None
+        after = close + len(_XML_FUNCTION_CLOSE)
+        if text.startswith(end_marker, _skip_ws(text, after)):
+            payload = text[idx:close]
+            if payload.count(_XML_PARAMETER_OPEN) == payload.count(
+                _XML_PARAMETER_CLOSE
+            ):
+                return after
+        search = after
+    return None
+
+
+def _xml_element_value_end(text: str, start: int, close_tag: str, next_open: str) -> int:
+    """End index of an XML value, tolerating ``close_tag`` inside the value.
+
+    The value really ends at the ``close_tag`` whose next non-space token is
+    either ``next_open`` (another sibling element) or the end of the enclosing
+    text. Copies sitting inside the value are followed by neither, so they are
+    skipped. Falls back to the first ``close_tag`` when nothing matches, which
+    is the historical behaviour, and to ``len(text)`` when there is none.
+    """
+    search = start
+    while True:
+        close = text.find(close_tag, search)
+        if close < 0:
+            first = text.find(close_tag, start)
+            return first if first >= 0 else len(text)
+        after = _skip_ws(text, close + len(close_tag))
+        if after >= len(text) or text.startswith(next_open, after):
+            return close
+        search = close + len(close_tag)
+
+
+_XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=(\w+)>")
+
+
+def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(key, value)`` for each ``<parameter=k>v</parameter>`` element.
+
+    Scanning advances past each value rather than using ``finditer`` over the
+    open tag alone, so a literal ``<parameter=`` sitting inside a value cannot
+    start a spurious element, and a literal ``</parameter>`` cannot end one
+    early (#2507).
+    """
+    pos = 0
+    while True:
+        match = _XML_PARAMETER_OPEN_RE.search(params_text, pos)
+        if not match:
+            return
+        value_end = _xml_element_value_end(
+            params_text, match.end(), _XML_PARAMETER_CLOSE, _XML_PARAMETER_OPEN
+        )
+        yield match.group(1), params_text[match.end() : value_end].strip()
+        pos = value_end + len(_XML_PARAMETER_CLOSE)
+
+
+def _find_marker_span_end(
+    text: str, payload_start: int, end_marker: str
+) -> Optional[Tuple[int, int]]:
+    """Locate the close marker that actually terminates a tool-call payload.
+
+    Returns ``(payload_end, span_end)`` or ``None`` when no close marker
+    follows at all.
+
+    Why this exists instead of a plain ``start(.*?)end`` regex: the non-greedy
+    match stops at the FIRST close marker, so a tool call whose argument
+    contains a literal copy of that marker is cut mid-JSON, fails to parse and
+    is dropped silently (#2507).  When the payload is JSON, ``raw_decode``
+    reports where the value really ends, which is authoritative and ignores
+    marker text sitting inside a string.
+
+    Two payload shapes can be bounded structurally: JSON, via ``raw_decode``,
+    and the ``qwen3_coder`` XML dialect, via its ``</function>`` close.
+
+    Deliberately conservative: a boundary is used *only* when it proves the
+    payload extends past the first close marker AND a later close marker
+    exists.  Every other case falls back to the historical first-match
+    behaviour, so this can only change outputs that are broken today.
+    """
+    plain = text.find(end_marker, payload_start)
+    if plain < 0:
+        return None
+    boundary = _json_value_end(text, payload_start)
+    if boundary is None:
+        boundary = _xml_function_payload_end(text, payload_start, end_marker)
+    if boundary is not None and boundary > plain:
+        later = text.find(end_marker, boundary)
+        if later >= 0:
+            return later, later + len(end_marker)
+    return plain, plain + len(end_marker)
+
+
+def _iter_marker_spans(
+    text: str, start_marker: str, end_marker: str
+) -> Iterator[Tuple[int, int, str]]:
+    """Yield ``(span_start, span_end, payload)`` for each marker-delimited call.
+
+    ``span_start`` indexes the start marker and ``span_end`` is just past the
+    close marker, so callers can both parse the payload and excise the whole
+    span. Unterminated trailing envelopes are not yielded, matching the regex
+    behaviour this replaces.
+    """
+    pos = 0
+    while True:
+        start = text.find(start_marker, pos)
+        if start < 0:
+            return
+        payload_start = start + len(start_marker)
+        found = _find_marker_span_end(text, payload_start, end_marker)
+        if found is None:
+            return
+        payload_end, span_end = found
+        yield start, span_end, text[payload_start:payload_end]
+        pos = span_end
+
+
+def _marker_payloads(text: str, start_marker: str, end_marker: str) -> List[str]:
+    """Payloads of every complete marker-delimited tool call, in order."""
+    return [payload for _s, _e, payload in _iter_marker_spans(text, start_marker, end_marker)]
+
+
+def _strip_marker_spans(text: str, start_marker: str, end_marker: str) -> str:
+    """Remove every complete marker-delimited span, keeping surrounding prose.
+
+    Span-based rather than ``re.sub`` with a non-greedy pattern so that a call
+    containing a literal close marker is removed whole instead of leaving its
+    tail behind as visible content (#2507).
+    """
+    out: List[str] = []
+    last = 0
+    for span_start, span_end, _payload in _iter_marker_spans(
+        text, start_marker, end_marker
+    ):
+        out.append(text[last:span_start])
+        last = span_end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _parse_xml_tool_calls(
     text: str, tools: Optional[List] = None
 ) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -357,8 +587,7 @@ def _parse_xml_tool_calls(
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    pattern = r"<tool_call>(.*?)</tool_call>"
-    matches = re.findall(pattern, text, re.DOTALL)
+    matches = _marker_payloads(text, "<tool_call>", "</tool_call>")
 
     for match in matches:
         content = match.strip()
@@ -382,17 +611,17 @@ def _parse_xml_tool_calls(
             pass
 
         # Qwen/Llama format: <function=name><parameter=key>value</parameter></function>
-        func_match = re.match(r"<function=(\w+)>(.*?)</function>", content, re.DOTALL)
-        if func_match:
-            func_name = func_match.group(1)
-            params_text = func_match.group(2)
+        # Bounded by rfind rather than a non-greedy match: the payload is already
+        # delimited, so the element closes at the LAST </function>, and a literal
+        # copy inside a parameter value must not end it early (#2507).
+        func_open = re.match(r"<function=(\w+)>", content)
+        func_close = content.rfind(_XML_FUNCTION_CLOSE)
+        if func_open and func_close >= func_open.end():
+            func_name = func_open.group(1)
+            params_text = content[func_open.end() : func_close]
             props = _tool_param_properties(func_name, tools)
             arguments = {}
-            for pm in re.finditer(
-                r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", params_text, re.DOTALL
-            ):
-                key = pm.group(1)
-                val = pm.group(2).strip()
+            for key, val in _iter_xml_parameters(params_text):
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
             tool_calls.append(
                 ToolCall(
@@ -436,7 +665,7 @@ def _parse_xml_tool_calls(
         return text, None
 
     # Remove tool call tags from text
-    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
+    cleaned = _strip_marker_spans(text, "<tool_call>", "</tool_call>").strip()
     return cleaned, tool_calls
 
 
@@ -512,8 +741,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    pattern = r"<\|tool_call_start\|>(.*?)<\|tool_call_end\|>"
-    matches = re.findall(pattern, text, re.DOTALL)
+    matches = _marker_payloads(text, "<|tool_call_start|>", "<|tool_call_end|>")
 
     for match in matches:
         content = match.strip()
@@ -581,7 +809,9 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     if not tool_calls:
         return text, None
 
-    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    cleaned = _strip_marker_spans(
+        text, "<|tool_call_start|>", "<|tool_call_end|>"
+    ).strip()
     return cleaned, tool_calls
 
 
@@ -1339,10 +1569,10 @@ def _parse_tool_calls_impl(
             start_escaped = re.escape(tool_call_start)
 
             if tool_call_end:
-                # Paired markers (e.g. <tool_call>...</tool_call>)
-                end_escaped = re.escape(tool_call_end)
-                pattern = rf"{start_escaped}(.*?){end_escaped}"
-                matches = re.findall(pattern, text, re.DOTALL)
+                # Paired markers (e.g. <tool_call>...</tool_call>).  Span-based
+                # rather than a non-greedy regex so an argument containing a
+                # literal close marker does not truncate the payload (#2507).
+                matches = _marker_payloads(text, tool_call_start, tool_call_end)
             else:
                 # One-sided marker (e.g. Mistral/Devstral "[TOOL_CALLS]"):
                 # split on the start marker and parse each segment.
@@ -1444,11 +1674,8 @@ def _parse_tool_calls_impl(
 
             if tool_calls:
                 if tool_call_end:
-                    cleaned_text = re.sub(
-                        rf"{start_escaped}.*?{re.escape(tool_call_end)}",
-                        "",
-                        cleaned_text,
-                        flags=re.DOTALL,
+                    cleaned_text = _strip_marker_spans(
+                        cleaned_text, tool_call_start, tool_call_end
                     ).strip()
                 else:
                     # One-sided: everything from first marker to end is tool calls
@@ -1486,20 +1713,14 @@ def _parse_tool_calls_impl(
         _start = getattr(tokenizer, "tool_call_start", None)
         _end = getattr(tokenizer, "tool_call_end", None)
         if _start and _end:
-            s_esc = re.escape(_start)
-            e_esc = re.escape(_end)
-            stripped = re.findall(
-                rf"{s_esc}(.*?){e_esc}", cleaned_text, flags=re.DOTALL
-            )
+            stripped = _marker_payloads(cleaned_text, _start, _end)
             if stripped:
                 logger.warning(
                     "Tool call markers found but parsing failed, "
                     "stripping markers. Raw content: %s",
                     stripped,
                 )
-            cleaned_text = re.sub(
-                rf"{s_esc}.*?{e_esc}", "", cleaned_text, flags=re.DOTALL
-            ).strip()
+            cleaned_text = _strip_marker_spans(cleaned_text, _start, _end).strip()
         elif _start:
             idx = cleaned_text.find(_start)
             if idx >= 0:
@@ -1512,11 +1733,8 @@ def _parse_tool_calls_impl(
 
     # Strip Hermes markers if still present (models without has_tool_calling)
     if "<|tool_call_start|>" in cleaned_text:
-        cleaned_text = re.sub(
-            r"<\|tool_call_start\|>.*?<\|tool_call_end\|>",
-            "",
-            cleaned_text,
-            flags=re.DOTALL,
+        cleaned_text = _strip_marker_spans(
+            cleaned_text, "<|tool_call_start|>", "<|tool_call_end|>"
         ).strip()
 
     return cleaned_text, None
@@ -1703,6 +1921,7 @@ class ToolCallStreamFilter:
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
+        self._reset_json_scan()
 
     @staticmethod
     def _is_xml_close_marker(marker: str) -> bool:
@@ -1727,50 +1946,297 @@ class ToolCallStreamFilter:
     def _clear_pending_envelope(self) -> None:
         self._pending_envelope_parts = []
         self._pending_start_marker = None
+        self._reset_json_scan()
+
+    # -- Incremental JSON scan over a suppressed payload (#2507) ------------
+    #
+    # A close marker inside a JSON string argument must not end the envelope,
+    # or the rest of the tool call is emitted as visible content mid-stream.
+    # Deciding that needs to know where the JSON value really ends, but
+    # re-decoding the accumulated payload on every chunk would be quadratic on
+    # long tool calls. Model output is untrusted and attacker-influenceable, so
+    # this module's rule is that parsing stays linear (see the bounds above
+    # _GEMMA4_MAX_ARGS_LEN). This scanner therefore examines each character
+    # exactly once, carrying bracket/string state across chunks. It covers
+    # object payloads and ``[{...}]`` array payloads, matching the shapes the
+    # non-streaming parser accepts from ``_json_value_end``.
+
+    def _reset_json_scan(self) -> None:
+        self._json_state = "undecided"
+        self._json_depth = 0
+        self._json_in_string = False
+        self._json_escaped = False
+        self._json_scan_off = 0
+        self._json_complete_off = 0
+        # Tail of already-consumed payload, kept so a `</function>` straddling
+        # the pending/buffer boundary is still visible to the xml check.
+        self._xml_prev_tail = ""
+        # First payload characters, accumulated across buffer drains purely to
+        # decide which dialect the payload is.
+        self._payload_head = ""
+
+    def _shift_json_scan(self, dropped: int, moved: str = "") -> None:
+        """Rebase scan offsets after ``dropped`` chars leave the buffer front."""
+        self._json_scan_off = max(0, self._json_scan_off - dropped)
+        self._json_complete_off = max(0, self._json_complete_off - dropped)
+        if moved:
+            self._xml_prev_tail = (self._xml_prev_tail + moved)[-_XML_TAIL_KEEP:]
+
+    def _advance_json_scan(self, buffer: str) -> None:
+        """Consume buffer chars not yet seen, updating JSON-completion state."""
+        i = self._json_scan_off
+        n = len(buffer)
+
+        if self._json_state == "undecided":
+            # `{` settles JSON from a single character, but `<function=` needs
+            # ten, and the buffer is drained into the pending envelope between
+            # chunks, so those ten never coexist in it. Accumulate a small
+            # persistent head to decide the dialect across drains.
+            head_chunk: Optional[str] = None
+            if self._payload_head:
+                head_chunk = buffer[i:n]
+            else:
+                while i < n and buffer[i] in " \t\r\n":
+                    i += 1
+                if i >= n:
+                    self._json_scan_off = i
+                    return
+                if buffer[i] == "{":
+                    self._json_state = "scanning"
+                elif buffer[i] == "[":
+                    # A leading '[' is either a JSON array of calls ("[{")
+                    # or the Hermes bracket dialect ([execute_code(...)]),
+                    # which never parses as JSON and must not be treated as
+                    # an unfinished value or the envelope is suppressed
+                    # forever. The next non-space character settles it.
+                    self._json_state = "array_head"
+                    self._json_depth = 1
+                    i += 1
+                else:
+                    head_chunk = buffer[i:n]
+
+            if head_chunk is not None:
+                self._payload_head = (self._payload_head + head_chunk)[
+                    : len(_XML_FUNCTION_OPEN)
+                ]
+                self._json_scan_off = n
+                head = self._payload_head
+                if len(head) < len(_XML_FUNCTION_OPEN):
+                    if _XML_FUNCTION_OPEN.startswith(head):
+                        return  # still ambiguous, wait for more
+                    self._json_state = "not_json"
+                else:
+                    self._json_state = (
+                        "xml" if head == _XML_FUNCTION_OPEN else "not_json"
+                    )
+
+        if self._json_state == "array_head":
+            while i < n and buffer[i] in " \t\r\n":
+                i += 1
+            if i >= n:
+                self._json_scan_off = i
+                return
+            # The scan loop consumes the '{' itself, raising the depth above
+            # the pending '[' so the array completes on its closing ']'.
+            self._json_state = "scanning" if buffer[i] == "{" else "not_json"
+
+        if self._json_state != "scanning":
+            self._json_scan_off = n
+            return
+
+        while i < n:
+            ch = buffer[i]
+            if self._json_in_string:
+                if self._json_escaped:
+                    self._json_escaped = False
+                elif ch == "\\":
+                    self._json_escaped = True
+                elif ch == '"':
+                    self._json_in_string = False
+            elif ch == '"':
+                self._json_in_string = True
+            elif ch in "{[":
+                self._json_depth += 1
+            elif ch in "}]":
+                self._json_depth -= 1
+                if self._json_depth == 0:
+                    self._json_state = "complete"
+                    self._json_complete_off = i + 1
+                    i += 1
+                    break
+            i += 1
+        self._json_scan_off = i
+
+    def _find_suppression_end(self, buffer: str) -> int:
+        """Index in ``buffer`` of the close marker that really ends the envelope.
+
+        Streaming counterpart of ``_find_marker_span_end`` (#2507): a close
+        marker sitting inside a JSON string argument must not end the
+        envelope, or the rest of the tool call is emitted as visible content
+        mid-stream.
+
+        Decodes the accumulated payload at most ONCE per call rather than
+        testing each candidate close marker.  Model output is untrusted, and a
+        per-candidate loop would re-decode the payload for every embedded
+        marker, which is quadratic on output that repeats the marker (the
+        superlinear-work-on-model-output trap from #1854/#1905).  One decode
+        settles where the JSON value ends; the real close marker is simply the
+        first one at or after that point.
+
+        Returns -1 to mean "no close marker yet", which makes the caller wait
+        for more input.  An envelope whose JSON never completes stays
+        suppressed and is handled at EOF by the existing unterminated-envelope
+        recovery, rather than leaking its tail as content.
+        """
+        marker = self._suppressing_until
+        if not marker:
+            return -1
+
+        self._advance_json_scan(buffer)
+
+        if self._json_state == "xml":
+            # qwen3_coder dialect: the envelope ends with </function> right
+            # before the close marker, so a marker inside a parameter value is
+            # not preceded by one. This is a local O(1) test per candidate,
+            # unlike the non-streaming path which can also balance parameter
+            # elements because it has the whole payload at once.
+            search = 0
+            while True:
+                idx = buffer.find(marker, search)
+                if idx < 0:
+                    return -1
+                # Only the characters immediately before the marker matter, so
+                # look at a fixed window instead of slicing the whole buffer:
+                # a per-candidate full slice would be quadratic when one chunk
+                # carries many markers.
+                window_start = idx - _XML_TAIL_KEEP
+                if window_start <= 0:
+                    seen = self._xml_prev_tail + buffer[:idx]
+                else:
+                    seen = buffer[window_start:idx]
+                if seen.rstrip(" \t\r\n").endswith(_XML_FUNCTION_CLOSE):
+                    return idx
+                search = idx + len(marker)
+
+        if self._json_state == "not_json":
+            # Hermes brackets, GLM arg_key/arg_value, prose: historical
+            # first-match behaviour, unchanged.
+            return buffer.find(marker)
+        if self._json_state != "complete":
+            # Still undecided or mid-object: any close marker visible now sits
+            # inside the payload, so wait for more input instead of closing
+            # early. An envelope whose JSON never completes stays suppressed
+            # and is handled at EOF by the unterminated-envelope recovery.
+            return -1
+
+        # The JSON object is closed, so its end is authoritative and markers
+        # embedded inside it are ignored.
+        return buffer.find(marker, self._json_complete_off)
 
     def _find_start_envelope(
-        self, text: str
+        self,
+        text: str,
+        start: int = 0,
+        cache: Optional[Dict[Any, Any]] = None,
     ) -> Optional[Tuple[int, int, Optional[str]]]:
-        """Find earliest complete opening envelope.
+        """Find earliest complete opening envelope at or after ``start``.
 
         Returns:
             tuple(index, consume_len, close_marker_or_none)
             - close_marker_or_none is a close marker to wait for, or ``None``
               when the whole envelope is already contained in consume_len.
+
+        ``cache`` is used by the EOF unwind, whose ``start`` only moves
+        forward over one fixed string: a cached hit at or after ``start`` is
+        reused, a cached miss is permanent, and a hit that ``start`` has
+        passed is recomputed from ``start``. That keeps repeated calls linear
+        overall instead of rescanning the tail once per envelope.
         """
+        miss = object()
+
+        def lookup(key: Any, compute: Any) -> Optional[Tuple[int, int, Optional[str]]]:
+            if cache is None:
+                return compute()
+            hit = cache.get(key, miss)
+            if hit is miss or (hit is not None and hit[0] < start):
+                hit = compute()
+                cache[key] = hit
+            return hit
+
         starts: List[Tuple[int, int, Optional[str]]] = []
 
         for marker, close in self._marker_pairs:
-            idx = text.find(marker)
-            if idx >= 0:
-                starts.append((idx, len(marker), close))
+
+            def compute_pair(
+                marker: str = marker, close: str = close
+            ) -> Optional[Tuple[int, int, Optional[str]]]:
+                idx = text.find(marker, start)
+                return None if idx < 0 else (idx, len(marker), close)
+
+            hit = lookup(("pair", marker), compute_pair)
+            if hit is not None:
+                starts.append(hit)
 
         for close in self._orphan_close_markers:
-            close_idx = text.find(close)
-            if close_idx >= 0:
-                starts.append((close_idx, len(close), None))
 
-        ns_match = self._namespaced_open_re.search(text)
-        if ns_match:
+            def compute_orphan(
+                close: str = close,
+            ) -> Optional[Tuple[int, int, Optional[str]]]:
+                close_idx = text.find(close, start)
+                return None if close_idx < 0 else (close_idx, len(close), None)
+
+            hit = lookup(("orphan", close), compute_orphan)
+            if hit is not None:
+                starts.append(hit)
+
+        def compute_ns() -> Optional[Tuple[int, int, Optional[str]]]:
+            ns_match = self._namespaced_open_re.search(text, start)
+            if not ns_match:
+                return None
             ns = ns_match.group(1)
-            starts.append(
-                (ns_match.start(), len(ns_match.group(0)), f"</{ns}:tool_call>")
+            return (
+                ns_match.start(),
+                len(ns_match.group(0)),
+                f"</{ns}:tool_call>",
             )
 
-        for bp in self._bracket_prefixes:
-            bracket_idx = text.find(bp)
-            while bracket_idx >= 0:
-                bracket_candidate = text[bracket_idx:]
-                bracket_match = self._bracket_call_re.match(bracket_candidate)
-                if bracket_match:
-                    starts.append((bracket_idx, bracket_match.end(), None))
-                bracket_idx = text.find(bp, bracket_idx + 1)
+        hit = lookup("ns", compute_ns)
+        if hit is not None:
+            starts.append(hit)
+
+        def compute_bracket() -> Optional[Tuple[int, int, Optional[str]]]:
+            best: Optional[Tuple[int, int, Optional[str]]] = None
+            for bp in self._bracket_prefixes:
+                bracket_idx = text.find(bp, start)
+                while bracket_idx >= 0:
+                    if best is not None and bracket_idx >= best[0]:
+                        break
+                    bracket_candidate = text[bracket_idx:]
+                    bracket_match = self._bracket_call_re.match(bracket_candidate)
+                    if bracket_match:
+                        best = (bracket_idx, bracket_match.end(), None)
+                        break
+                    bracket_idx = text.find(bp, bracket_idx + 1)
+            return best
+
+        hit = lookup("bracket", compute_bracket)
+        if hit is not None:
+            starts.append(hit)
 
         # One-sided markers: suppress from start marker to end of buffer.
         for sa_marker in self._suppress_after_markers:
-            idx = text.find(sa_marker)
-            if idx >= 0:
-                starts.append((idx, len(text) - idx, "__suppress_permanently__"))
+
+            def compute_sa(
+                sa_marker: str = sa_marker,
+            ) -> Optional[Tuple[int, int, Optional[str]]]:
+                idx = text.find(sa_marker, start)
+                if idx < 0:
+                    return None
+                return (idx, len(text) - idx, "__suppress_permanently__")
+
+            hit = lookup(("sa", sa_marker), compute_sa)
+            if hit is not None:
+                starts.append(hit)
 
         if not starts:
             return None
@@ -1930,6 +2396,87 @@ class ToolCallStreamFilter:
 
         return "".join(out)
 
+    def _unwind_withheld_at_eof(
+        self, candidate: str, marker: str, start_marker: str
+    ) -> str:
+        """Single pass over text withheld at end of stream, first-marker split.
+
+        ``candidate`` starts with the opening marker of an envelope whose
+        payload scan never confirmed a structural end.  For such malformed
+        payloads there is no reliable way to tell an embedded close marker
+        from the real one, so match the historical (pre-#2507) behaviour:
+        the FIRST close marker ends the envelope, which preserves prose the
+        model resumed afterwards, including any later literal marker text.
+
+        Runs as one forward scan with monotone offsets rather than re-feeding
+        tails through ``feed``: a re-feed loop re-copies the remaining text
+        once per malformed envelope, which is quadratic when output repeats
+        the marker (the superlinear-work-on-model-output trap from
+        #1854/#1905).
+
+        Trailing prose after the last envelope is staged in ``self._buffer``
+        so the caller's end-of-stream tail rules still apply to it.
+        """
+        out: List[str] = []
+        cache: Dict[Any, Any] = {}
+        # The close search must not match inside the opening marker itself.
+        pos = min(len(start_marker), len(candidate))
+        env_start = 0
+        while True:
+            if marker == "__suppress_permanently__":
+                self._suppressing = True
+                break
+            # Same span primitive as the non-streaming parser: a valid JSON or
+            # XML payload ends at its structural boundary (so an embedded
+            # close marker cannot cut it, #2507), and a malformed payload
+            # falls back to the historical first close marker.  Keeping the
+            # two paths identical means the content shown at EOF always
+            # matches what the final parse extracts.
+            found = _find_marker_span_end(candidate, pos, marker)
+            if found is None:
+                withheld = candidate[env_start:]
+                if withheld:
+                    self._recovery_candidate = withheld
+                    logger.warning(
+                        "Unclosed tool-call envelope at end of stream; "
+                        "withheld %d characters are available for content "
+                        "recovery (start_marker=%.80r)",
+                        len(withheld),
+                        candidate[env_start : env_start + 80],
+                    )
+                break
+            pos = found[1]
+            # Between envelopes now: emit prose until the next opening
+            # envelope, swallowing self-contained ones (bracket calls,
+            # orphan closes) along the way.
+            entered_envelope = False
+            while True:
+                nxt = self._find_start_envelope(candidate, pos, cache)
+                if nxt is None:
+                    self._buffer = candidate[pos:]
+                    break
+                idx, consume_len, close = nxt
+                if idx > pos:
+                    out.append(
+                        self._sanitize_prefix_before_suppression(
+                            candidate[pos:idx]
+                        )
+                    )
+                env_start = idx
+                pos = idx + consume_len
+                if close is not None:
+                    marker = close
+                    entered_envelope = True
+                    break
+            if not entered_envelope:
+                break
+
+        result = "".join(out)
+        for close in self._stray_close_markers:
+            if close in result:
+                result = result.replace(close, "")
+        return result
+
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
         if self._suppressing or not text:
@@ -1948,16 +2495,22 @@ class ToolCallStreamFilter:
                 break
 
             if self._suppressing_until is not None:
-                end_idx = self._buffer.find(self._suppressing_until)
+                end_idx = self._find_suppression_end(self._buffer)
                 if end_idx < 0:
                     keep = self._partial_prefix_len(
                         self._buffer, self._suppressing_until
                     )
                     if keep:
-                        self._pending_envelope_parts.append(self._buffer[:-keep])
+                        moved = self._buffer[:-keep]
+                        self._pending_envelope_parts.append(moved)
+                        # Rebase the JSON scan: those chars left the buffer
+                        # front but were already consumed by the scanner.
+                        self._shift_json_scan(len(moved), moved)
                         self._buffer = self._buffer[-keep:]
                     else:
-                        self._pending_envelope_parts.append(self._buffer)
+                        moved = self._buffer
+                        self._pending_envelope_parts.append(moved)
+                        self._shift_json_scan(len(moved), moved)
                         self._buffer = ""
                     break
                 self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
@@ -1981,6 +2534,8 @@ class ToolCallStreamFilter:
                         # namespace markers, if the matching close never arrives.
                         self._pending_envelope_parts = [opening_marker]
                         self._pending_start_marker = opening_marker
+                        # Fresh envelope: start the payload scan from scratch.
+                        self._reset_json_scan()
                 continue
 
             keep = self._partial_suffix_len(self._buffer)
@@ -2011,31 +2566,31 @@ class ToolCallStreamFilter:
             self._clear_pending_envelope()
             return ""
 
+        # An envelope still suppressing at EOF means the payload scan never
+        # confirmed where the value ends.  A literal close marker is then the
+        # best evidence available, so trust it rather than withholding to EOF:
+        # prose the model resumed after the envelope survives, as it did before
+        # the #2507 span scanning.
+        recovered = ""
         if self._suppressing_until is not None:
+            marker = self._suppressing_until
             self._pending_envelope_parts.append(self._buffer)
             candidate = "".join(self._pending_envelope_parts)
-            start_marker = self._pending_start_marker or "<unknown>"
+            start_marker = self._pending_start_marker or ""
             self._buffer = ""
             self._suppressing_until = None
             self._clear_pending_envelope()
-            if candidate:
-                self._recovery_candidate = candidate
-                logger.warning(
-                    "Unclosed tool-call envelope at end of stream; "
-                    "withheld %d characters are available for content recovery "
-                    "(start_marker=%.80r)",
-                    len(candidate),
-                    start_marker,
-                )
-            return ""
+            recovered = self._unwind_withheld_at_eof(candidate, marker, start_marker)
+            if self._suppressing:
+                return recovered
 
         keep = self._partial_suffix_len(self._buffer)
         if keep >= len(self._buffer):
             tail = self._buffer
             self._buffer = ""
             if self._should_drop_tail_at_finish(tail):
-                return ""
-            return tail
+                return recovered
+            return recovered + tail
 
         if keep:
             buf = self._buffer[:-keep]
@@ -2048,7 +2603,7 @@ class ToolCallStreamFilter:
         for close in self._stray_close_markers:
             if close in buf:
                 buf = buf.replace(close, "")
-        return buf
+        return recovered + buf
 
 
 def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:

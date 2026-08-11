@@ -18,6 +18,8 @@ import logging
 import sys
 from pathlib import Path
 
+from .swiglu_clamp import ensure_swiglu_clamp
+
 logger = logging.getLogger(__name__)
 
 BRANCH_HEAD_SHA = "d719464ff754e65d9dec496ef3fea27bddefd79c"
@@ -75,7 +77,15 @@ def apply_bailing_hybrid_patch() -> bool:
         models_pkg.bailing_hybrid = module
         applied = False
 
+    # Whichever build ended up live, make sure Ling's trained SwiGLU clamp is
+    # in force. The vendored copy implements it in-source; an mlx-lm build
+    # that already ships bailing_hybrid does not.
+    module = importlib.import_module(_MODULE_NAME)
+    if ensure_swiglu_clamp(module):
+        logger.info("Ling SwiGLU clamp installed on %s", _MODULE_NAME)
+
     _APPLIED = True
+
     if applied:
         logger.info(
             "Ling 3.0 Flash mlx-lm patch applied (branch head %s)",

@@ -129,6 +129,37 @@ def _register_model_type_aliases() -> None:
         sys.modules.setdefault("mlx_lm.models.deepseek_v4_mtp", base_module)
 
 
+def _probe_native_indexer_kernels() -> None:
+    """One-time startup probe for the native indexer kernels.
+
+    The per-chunk gate in ``Indexer.__call__`` only warns the first time a
+    native-eligible chunk actually hits the fallback, which can be minutes
+    into a long prefill. Surface availability (and the rebuild fix) once at
+    patch time instead.
+    """
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        have = glm_fast.has_symbol("dsa_indexer_scores") and glm_fast.has_symbol(
+            "dsa_topk_indices"
+        )
+    except Exception:
+        have = False
+    if have:
+        logger.info(
+            "deepseek_v4: native indexer kernels available "
+            "(dsa_indexer_scores/dsa_topk_indices)"
+        )
+    else:
+        logger.warning(
+            "deepseek_v4: native indexer kernels dsa_indexer_scores/"
+            "dsa_topk_indices unavailable (glm_moe_dsa extension not built); "
+            "the indexer will use the MLX fallback and long-context prefill "
+            "will be several times slower. Rebuild with "
+            "OMLX_WITH_CUSTOM_KERNEL=1."
+        )
+
+
 def apply_deepseek_v4_patch() -> bool:
     """Apply the DeepSeek V4 patch to mlx-lm. Idempotent.
 
@@ -183,6 +214,9 @@ def apply_deepseek_v4_patch() -> bool:
 
     # 8. Register omlx-side cache handlers.
     _register_cache_handlers()
+
+    # 9. One-time native indexer kernel probe (INFO/WARNING only).
+    _probe_native_indexer_kernels()
 
     _APPLIED = True
     logger.info("DeepSeek V4 patch applied (PR 1192 head %s)", PR_HEAD_SHA[:8])
