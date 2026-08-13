@@ -1143,7 +1143,7 @@ except ImportError:
 _original_ppb_prompt = PromptProcessingBatch.prompt
 
 
-def _patched_ppb_prompt(self, tokens):
+def _prepare_mrope_prompt(self):
     model = self.model
     if (
         getattr(model, "_uses_mrope", False)
@@ -1152,9 +1152,16 @@ def _patched_ppb_prompt(self, tokens):
     ):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
+
+
+def _patched_ppb_prompt(self, tokens):
+    _prepare_mrope_prompt(self)
     return _original_ppb_prompt(self, tokens)
 
 
+PromptProcessingBatch._omlx_base_prompt = _original_ppb_prompt
+PromptProcessingBatch._omlx_before_prompt = _prepare_mrope_prompt
+PromptProcessingBatch._omlx_prompt_wrapper = _patched_ppb_prompt
 PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 

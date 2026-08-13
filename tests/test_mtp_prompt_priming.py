@@ -112,6 +112,17 @@ def model():
     return _make_tiny_model()
 
 
+@pytest.fixture()
+def strict_model():
+    """Build and run the strict chunk/seam oracle with CPU reductions."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield _make_tiny_model()
+    finally:
+        mx.set_default_device(previous)
+
+
 def _chunked_prefill(model, cache, tokens, chunks):
     """Drive the patched TextModel.__call__ chunk by chunk (capture rides it)."""
     start = 0
@@ -152,7 +163,8 @@ class TestCaptureFold:
         _chunked_prefill(model, cache, tokens, [4, 3, 1])
         assert prompt_priming.prime_ctx_stats(model) == n - 1
 
-    def test_take_primed_completes_seam(self, model):
+    def test_take_primed_completes_seam(self, strict_model):
+        model = strict_model
         n = 9
         tokens = _tokens(n, seed=2)
         main_tok = _tokens(1, seed=3)

@@ -267,6 +267,9 @@ class ServerState:
     # /health returns 503 with status "loading" until it flips to True so
     # port watchdogs see liveness instead of a closed port (#2184).
     pinned_preload_complete: bool = True
+    # Snapshot at init_server(). Settings may be edited while this process is
+    # running, but routes, navigation, and Bonjour switch together on restart.
+    distributed_inference_enabled: bool = False
 
 
 # Global server state instance
@@ -334,6 +337,20 @@ async def verify_api_key(
     return True
 
 
+def distributed_inference_enabled() -> bool:
+    """Whether the experimental distributed surface is exposed this run."""
+
+    return _server_state.distributed_inference_enabled
+
+
+async def require_distributed_inference_enabled() -> bool:
+    """Hide the experimental cluster surface until explicitly enabled."""
+
+    if not distributed_inference_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    return True
+
+
 def _reset_boundary_snapshots_for_server() -> None:
     """Reset ephemeral boundary snapshots at server lifecycle boundaries."""
     engine_pool = _server_state.engine_pool
@@ -356,6 +373,10 @@ def _reset_boundary_snapshots_for_server() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
+    from .cluster.discovery import BonjourPublisher
+
+    bonjour_publisher = None
+    bonjour_task = None
     # Startup: Auto-populate server aliases for the admin dashboard
     # so users get sensible hostname/IP options for API URL hints
     # without manual configuration. Only runs when the persisted list
@@ -384,6 +405,31 @@ async def lifespan(app: FastAPI):
             logger.warning("Server alias auto-detection failed: %s", exc)
 
     _reset_boundary_snapshots_for_server()
+
+    # Advertise this oMLX instance so another Mac can identify it by hostname
+    # and API port without asking the user to type an SSH target. Publication
+    # is best-effort: inference remains available if Bonjour is disabled.
+    if (
+        _server_state.global_settings is not None
+        and distributed_inference_enabled()
+        and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        bonjour_publisher = BonjourPublisher(
+            port=_server_state.global_settings.server.port,
+            version=__version__,
+        )
+        bonjour_publisher.start()
+
+        async def _bonjour_supervisor() -> None:
+            while True:
+                try:
+                    bonjour_publisher.ensure_running()
+                    await asyncio.sleep(5.0)
+                except asyncio.CancelledError:
+                    break
+
+        bonjour_task = asyncio.create_task(_bonjour_supervisor())
 
     # Start process memory enforcer if configured
     if (
@@ -480,6 +526,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    if bonjour_task is not None:
+        bonjour_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await bonjour_task
+    if bonjour_publisher is not None:
+        bonjour_publisher.stop()
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -527,21 +579,33 @@ from .api.mcp_routes import set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
+# Include web search routes (chat UI built-in web_search / fetch_url tools)
+from .api.websearch_routes import router as websearch_router
+from .api.websearch_routes import set_global_settings_getter as _set_websearch_settings
+
+_set_websearch_settings(lambda: _server_state.global_settings)
+app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
+
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
 # would always import successfully — we need an explicit mlx-audio check.
 try:
     import mlx_audio as _  # noqa: F401
 
+    from .api.audio_routes import realtime_router as audio_realtime_router
     from .api.audio_routes import router as audio_router
 
     app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
+    # The realtime WebSocket router authenticates in-band (first message):
+    # verify_api_key is an HTTP-only dependency and browsers cannot set an
+    # Authorization header on WebSocket connections.
+    app.include_router(audio_realtime_router)
     del _
 except ImportError:
     pass
 
 # Include admin routes
-from .admin.auth import _RedirectToLogin
+from .admin.auth import _RedirectToLogin, require_admin
 from .admin.routes import router as admin_router
 from .admin.routes import set_admin_getters
 
@@ -552,6 +616,36 @@ set_admin_getters(
     lambda: _server_state.global_settings,
 )
 app.include_router(admin_router)
+
+_cluster_routes_registered = False
+
+
+def _register_cluster_routes() -> None:
+    """Register experimental routes only for an opted-in server process."""
+
+    global _cluster_routes_registered
+    if _cluster_routes_registered:
+        return
+    from .cluster.routes import join_router as cluster_join_router
+    from .cluster.routes import router as cluster_router
+    from .cluster.routes import set_cluster_getters
+
+    set_cluster_getters(get_engine_pool)
+    app.include_router(
+        cluster_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+    # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
+    # command. Claim/source/complete authenticate with one-time enrollment
+    # credentials, not the browser's admin cookie.
+    app.include_router(
+        cluster_join_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    _cluster_routes_registered = True
 
 
 @app.exception_handler(_RedirectToLogin)
@@ -803,6 +897,19 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
     return JSONResponse(status_code=500, content=content)
 
 
+_TEXTUAL_BODY_CONTENT_TYPES = (
+    "application/json",
+    "application/x-www-form-urlencoded",
+    "text/",
+)
+
+
+def _is_textual_body(content_type: str) -> bool:
+    """True when a request body is safe to dump into the log as text."""
+    ct = content_type.split(";", 1)[0].strip().lower()
+    return ct.startswith(_TEXTUAL_BODY_CONTENT_TYPES) or ct.endswith("+json")
+
+
 class DebugRequestLoggingMiddleware:
     """Pure ASGI middleware for trace-level request body logging.
 
@@ -820,6 +927,27 @@ class DebugRequestLoggingMiddleware:
             or not logger.isEnabledFor(5)
             or scope.get("method") != "POST"
         ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        content_type = headers.get("content-type", "")
+        if not _is_textual_body(content_type):
+            # Multipart / binary uploads (audio files can be 100 MB):
+            # dumping the raw bytes garbles the terminal and buffering
+            # the whole body just for logging wastes memory — log a
+            # summary and stream the body through untouched.
+            logger.log(
+                5,
+                "Incoming %s %s — body: <%s, %s bytes omitted>",
+                scope["method"],
+                scope["path"],
+                content_type or "unknown content-type",
+                headers.get("content-length", "?"),
+            )
             await self.app(scope, receive, send)
             return
 
@@ -1681,6 +1809,11 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    from .cluster.exposure import distributed_inference_enabled as is_enabled
+
+    _server_state.distributed_inference_enabled = is_enabled(global_settings)
+    if _server_state.distributed_inference_enabled:
+        _register_cluster_routes()
     response_state_dir = None
     if global_settings:
         response_state_dir = (
@@ -1771,6 +1904,13 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
+    from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.registry import configure_cluster_registry
+    from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
+
+    _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
+    configure_cluster_enrollment(base_path)
+    configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
@@ -2000,6 +2140,21 @@ async def _with_sse_keepalive(
     ait = generator.__aiter__()
     task = None
     keepalive_elapsed = 0.0
+    next_disconnect_check = (
+        time.monotonic() + disconnect_poll if http_request is not None else None
+    )
+
+    async def client_disconnected() -> bool:
+        try:
+            disconnected = await http_request.is_disconnected()
+        except Exception as e:
+            logger.debug(f"is_disconnected() check failed: {e}")
+            return False  # is_disconnected() can fail if scope is already closed
+        if disconnected:
+            logger.info(
+                "Client disconnected during streaming (is_disconnected), cancelling"
+            )
+        return disconnected
 
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
@@ -2008,6 +2163,16 @@ async def _with_sse_keepalive(
 
     try:
         while True:
+            # A continuously-ready token stream never enters the timeout branch
+            # below. Probe on elapsed wall time as well so aborting a fast client
+            # still closes the upstream generator and its inference request.
+            if (
+                next_disconnect_check is not None
+                and time.monotonic() >= next_disconnect_check
+            ):
+                next_disconnect_check = time.monotonic() + disconnect_poll
+                if await client_disconnected():
+                    return
             task = asyncio.ensure_future(_safe_anext(ait))
             keepalive_elapsed = 0.0
             while not task.done():
@@ -2019,21 +2184,14 @@ async def _with_sse_keepalive(
                     break
                 # Check for client disconnect
                 if http_request is not None:
-                    try:
-                        disconnected = await http_request.is_disconnected()
-                        if disconnected:
-                            logger.info(
-                                "Client disconnected during streaming (is_disconnected), cancelling"
-                            )
-                            task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, StopAsyncIteration):
-                                pass
-                            return
-                    except Exception as e:
-                        logger.debug(f"is_disconnected() check failed: {e}")
-                        pass  # is_disconnected() can fail if scope is already closed
+                    next_disconnect_check = time.monotonic() + disconnect_poll
+                    if await client_disconnected():
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                        return
                 # Send keepalive at the configured interval
                 keepalive_elapsed += wait_time
                 if keepalive_elapsed >= interval:
@@ -2672,6 +2830,8 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         if is_markitdown_model(model_id):
             m["max_context_window"] = None
             m["max_tokens"] = None
+            m["is_favorite"] = False
+            m["is_hidden"] = False
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
@@ -2691,8 +2851,13 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             base_ms = sm.get_settings(source_model_id)
             if base_ms and base_ms.model_alias and source_model_id == model_id:
                 m["model_alias"] = base_ms.model_alias
+            m["is_favorite"] = base_ms is not None and base_ms.is_favorite
+            m["is_hidden"] = base_ms is not None and base_ms.is_hidden
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
+        else:
+            m["is_favorite"] = False
+            m["is_hidden"] = False
         m["max_tokens"] = max_tokens
     return status
 

@@ -174,6 +174,7 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    distributed_inference_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -193,6 +194,10 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            distributed_inference_enabled=data.get(
+                "distributed_inference_enabled",
+                False,
+            ),
         )
 
 
@@ -746,6 +751,15 @@ class IntegrationSettings:
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
+    # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
+    web_search_provider: str = "ddgs"
+    web_search_brave_api_key: str = ""
+    web_search_searxng_url: str = ""
+    web_search_ddgs_backends: str = ""  # comma-separated, used by ddgs_custom
+    web_search_max_results: int = 3  # 1..10
+    web_search_content_mode: str = "snippet"  # "snippet" | "full"
+    web_search_content_truncate: bool = True
+    web_search_content_max_chars: int = 20000
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -762,6 +776,14 @@ class IntegrationSettings:
             "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
+            "web_search_provider": self.web_search_provider,
+            "web_search_brave_api_key": self.web_search_brave_api_key,
+            "web_search_searxng_url": self.web_search_searxng_url,
+            "web_search_ddgs_backends": self.web_search_ddgs_backends,
+            "web_search_max_results": self.web_search_max_results,
+            "web_search_content_mode": self.web_search_content_mode,
+            "web_search_content_truncate": self.web_search_content_truncate,
+            "web_search_content_max_chars": self.web_search_content_max_chars,
         }
 
     @classmethod
@@ -783,6 +805,18 @@ class IntegrationSettings:
             ),
             markitdown_pdf_processing_engine=data.get(
                 "markitdown_pdf_processing_engine", "markitdown"
+            ),
+            web_search_provider=data.get("web_search_provider", "ddgs"),
+            web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
+            web_search_searxng_url=data.get("web_search_searxng_url", ""),
+            web_search_ddgs_backends=data.get("web_search_ddgs_backends", ""),
+            web_search_max_results=data.get("web_search_max_results", 3),
+            web_search_content_mode=data.get("web_search_content_mode", "snippet"),
+            web_search_content_truncate=data.get(
+                "web_search_content_truncate", True
+            ),
+            web_search_content_max_chars=data.get(
+                "web_search_content_max_chars", 20000
             ),
         )
 

@@ -166,6 +166,20 @@ Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, 
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
 </p>
 
+### Experimental Multi-Mac Inference
+
+Source builds can split one downloaded language model across unequal-memory Macs
+using MLX pipeline ranks over Ring or Thunderbolt RDMA/JACCL. The Cluster
+dashboard handles read-only peer discovery, strict SSH/runtime verification,
+byte-aware unequal shard planning, measured compute/link rebalancing,
+headroom-aware execution tuning, activation, and a live shard/performance map
+on both Macs. Interactive, balanced, and throughput profiles expose coalesced
+batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
+and a capability-gated experimental token-only output path. See
+[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
+security boundaries, current limitations, and the physical-hardware validation
+checklist.
+
 ### Vision-Language Models
 
 Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.

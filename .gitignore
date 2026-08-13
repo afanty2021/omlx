@@ -144,3 +144,9 @@ graphify-out/
 .graphify_python
 GITHUB_ISSUE_TEMPLATE.md
 hfd.sh
+
+# Local working notes and session tooling — never part of a PR
+.audit/
+.claude/
+issues.md
+clusterPlan.md

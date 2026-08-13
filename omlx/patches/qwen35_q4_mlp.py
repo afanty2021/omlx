@@ -591,3 +591,137 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             q8_min_tokens,
         )
     return patched
+
+
+_MUSE_PATCHED = False
+
+
+def _make_patched_muse_attention(
+    orig_call: Callable[..., mx.array],
+    variant: int,
+    min_tokens: int,
+    q8_min_tokens: int,
+):
+    def patched(self, x, mask=None, cache=None):
+        # Decode fast path first (issue #2132: per-call gate overhead).
+        if x.ndim < 3 or x.shape[-2] < min_tokens:
+            return orig_call(self, x, mask=mask, cache=cache)
+        if os.environ.get("OMLX_QWEN35_Q4_MLP", "1") == "0":
+            return orig_call(self, x, mask=mask, cache=cache)
+        if not all(
+            _can_route_affine_linear(proj, x, min_tokens, q8_min_tokens)
+            for proj in (self.q_proj, self.k_proj, self.v_proj, self.gate_proj)
+        ) or not _can_route_affine_linear_shape(
+            self.o_proj,
+            x.dtype,
+            x.ndim,
+            x.shape[-2],
+            self.n_heads * self.head_dim,
+            min_tokens,
+            q8_min_tokens,
+        ):
+            return orig_call(self, x, mask=mask, cache=cache)
+
+        # Mirrors the vendored muse_glimmer Attention.__call__ body with the
+        # projections routed through the native qmm tile. The vendor file
+        # lives in this repo (patches/mlx_vlm_muse_glimmer_compat), so body
+        # drift is caught by the bit-exact parity test, not a pin bump.
+        from mlx_vlm.models.muse_glimmer import language as muse_language
+
+        batch, length, _ = x.shape
+        queries = _linear_qmm(self.q_proj, x, variant).reshape(
+            batch, length, self.n_heads, self.head_dim
+        )
+        keys = _linear_qmm(self.k_proj, x, variant).reshape(
+            batch, length, self.n_kv_heads, self.head_dim
+        )
+        values = _linear_qmm(self.v_proj, x, variant).reshape(
+            batch, length, self.n_kv_heads, self.head_dim
+        )
+
+        queries = (self.qk_norm(queries) * self.qk_scale_factor).transpose(0, 2, 1, 3)
+        keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
+        values = values.transpose(0, 2, 1, 3)
+
+        if self.use_rope:
+            offset = cache.offset if cache is not None else 0
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        output = muse_language.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        output = output * mx.sigmoid(_linear_qmm(self.gate_proj, x, variant))
+        return _linear_qmm(self.o_proj, output, variant)
+
+    return patched
+
+
+def apply_muse_glimmer_q4_prefill_patch() -> bool:
+    """Route Muse Glimmer prefill GEMMs through the native affine qmm tile.
+
+    Muse prefill is ~87% quantized-GEMM-bound (MLP 6656->19968->6656 plus
+    the q/gate/o attention projections); the native tile measured 6.4-6.9%
+    faster than mx.quantized_matmul at every muse shape, bit-exact. Covers
+    the MLP via the shared class patch and the attention projections via a
+    mirrored forward. Decode and short sequences fall through unchanged.
+    """
+    global _MUSE_PATCHED
+    if _MUSE_PATCHED:
+        return True
+    if os.environ.get("OMLX_QWEN35_Q4_MLP", "1") == "0":
+        return False
+    if not _has_native_qmm():
+        logger.debug("Muse native qmm unavailable; patch skipped")
+        return False
+
+    variant = int(os.environ.get("OMLX_QWEN35_Q4_MLP_VARIANT", "8"))
+    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_MLP_MIN_TOKENS", "2048"))
+    q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_MLP_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+
+    patched = _patch_class(
+        "mlx_vlm.models.muse_glimmer.language",
+        "MLP",
+        variant,
+        min_tokens,
+        q8_min_tokens,
+    )
+
+    try:
+        module = importlib.import_module("mlx_vlm.models.muse_glimmer.language")
+    except Exception:
+        module = None
+    if module is not None:
+        attn_cls = getattr(module, "Attention", None)
+        if attn_cls is not None and not getattr(
+            attn_cls, "_omlx_q4_muse_attn_patched", False
+        ):
+            orig = attn_cls.__call__
+            attn_cls.__call__ = _make_patched_muse_attention(
+                orig, variant, min_tokens, q8_min_tokens
+            )
+            attn_cls._omlx_q4_muse_attn_patched = True
+            attn_cls._omlx_q4_muse_attn_original_call = orig
+            patched = True
+
+    _MUSE_PATCHED = patched
+    if patched:
+        logger.info(
+            "Muse Glimmer quantized prefill patch applied "
+            "(variant=%d, min_tokens=%d, q8_min_tokens=%d)",
+            variant,
+            min_tokens,
+            q8_min_tokens,
+        )
+    return patched

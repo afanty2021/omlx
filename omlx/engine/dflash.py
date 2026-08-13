@@ -1196,11 +1196,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             return 0
         return max(0, int(getattr(prefix_flow, "hit_tokens", 0) or 0))
 
+    def _create_output_parser_session(self, tools: list[dict] | None) -> Any | None:
+        """Create a request-local parser, including its tool schemas."""
+        factory = self._output_parser_factory
+        if factory is None:
+            return None
+        create_with_tools = getattr(factory, "create_session_with_tools", None)
+        if create_with_tools is not None:
+            return create_with_tools(self._executor_tokenizer, tools)
+        return factory.create_session(self._executor_tokenizer)
+
     def _run_generate_streaming(
         self,
         prompt_tokens: list[int],
         max_tokens: int,
         temperature: float,
+        tools: list[dict] | None,
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
@@ -1229,11 +1240,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # harmony channels → <think>/visible split). When active it owns
             # detokenization too, so the standard streaming detokenizer is
             # only created when no parser is available.
-            parser_session = (
-                self._output_parser_factory.create_session(self._executor_tokenizer)
-                if self._output_parser_factory is not None
-                else None
-            )
+            parser_session = self._create_output_parser_session(tools)
             detokenizer = None
             if parser_session is None:
                 detokenizer = create_streaming_detokenizer(
@@ -1275,9 +1282,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     # Flush any buffered tail from the parser (e.g. close an
                     # unterminated <think> block) before the metrics chunk so
                     # the client sees a well-formed final delta.
+                    parser_final = None
                     if parser_session is not None:
-                        final = parser_session.finalize()
-                        tail = final.stream_text
+                        parser_final = parser_session.finalize()
+                        tail = parser_final.stream_text
                         if tail:
                             asyncio.run_coroutine_threadsafe(
                                 queue.put((tail, [], False, None)), loop
@@ -1302,7 +1310,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"{', fallback=AR' if fallback else ''}"
                         f"{phase_summary}"
                     )
-                    metrics = {
+                    metrics: dict[str, Any] = {
                         "prompt_tokens": int(event.prompt_token_count),
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
@@ -1311,6 +1319,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         # (usage) chunk so the API reports cached_tokens (#1441).
                         "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
+                    if parser_final is not None:
+                        if parser_final.tool_calls:
+                            metrics["tool_calls"] = parser_final.tool_calls
+                        if parser_final.finish_reason:
+                            metrics["finish_reason"] = parser_final.finish_reason
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
                     )
@@ -1406,6 +1419,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 **kwargs,
             )
 
+        tools = kwargs.pop("tools", None)
+
         from ..engine_core import get_mlx_executor
 
         loop = asyncio.get_running_loop()
@@ -1422,11 +1437,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # Per-request parser session (gemma4 channel markers, harmony
             # channels). Lives only inside the executor thread so the parser
             # state cannot leak across requests.
-            parser_session = (
-                self._output_parser_factory.create_session(self._executor_tokenizer)
-                if self._output_parser_factory is not None
-                else None
-            )
+            parser_session = self._create_output_parser_session(tools)
             try:
                 self._record_prefill_guard_active_memory()
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
@@ -1439,6 +1450,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
                 first_token_at: float | None = None
+                parser_final = None
                 for event in event_iter:
                     if stop_event.is_set():
                         logger.info("DFlash generation aborted by client")
@@ -1459,13 +1471,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         summary = event
                         self._record_speculation_summary(event)
                 if parser_session is not None:
-                    final = parser_session.finalize()
-                    if final.visible_text:
-                        parsed_visible_parts.append(final.visible_text)
+                    parser_final = parser_session.finalize()
+                    if parser_final.visible_text:
+                        parsed_visible_parts.append(parser_final.visible_text)
                 return (
                     summary,
                     tokens,
                     parser_session,
+                    parser_final,
                     parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
@@ -1490,6 +1503,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     summary,
                     generated,
                     parser_session,
+                    parser_final,
                     parsed_visible_parts,
                     prefix_flow,
                     first_token_at,
@@ -1545,7 +1559,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
             cached_tokens=self._cached_tokens_from_flow(prefix_flow),
-            finish_reason="stop",
+            finish_reason=(
+                parser_final.finish_reason
+                if parser_final is not None and parser_final.finish_reason
+                else "stop"
+            ),
+            tool_calls=(
+                parser_final.tool_calls
+                if parser_final is not None and parser_final.tool_calls
+                else None
+            ),
             first_token_at=first_token_at,
         )
 
@@ -1608,6 +1631,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 yield output
             return
 
+        tools = kwargs.pop("tools", None)
+
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -1639,6 +1664,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             prompt_tokens,
             max_tokens,
             temperature,
+            tools,
             queue,
             loop,
             stop_event,
@@ -1662,9 +1688,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
                 finish_reason = None
                 if finished:
-                    finish_reason = "stop"
+                    if metrics and metrics.get("completion_tokens") is not None:
+                        total_completion = int(metrics["completion_tokens"])
                     if metrics and metrics.get("error"):
                         finish_reason = "error"
+                    else:
+                        finish_reason = (metrics or {}).get("finish_reason", "stop")
                     finished_normally = True
 
                 yield GenerationOutput(
@@ -1678,6 +1707,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     cached_tokens=(metrics or {}).get("cached_tokens", 0),
                     finished=finished,
                     finish_reason=finish_reason,
+                    tool_calls=(metrics or {}).get("tool_calls"),
                 )
 
                 if finished:
@@ -1776,6 +1806,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            tools=tools,
             **kwargs,
         )
 
@@ -1855,6 +1886,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            tools=tools,
             **kwargs,
         ):
             yield output

@@ -42,6 +42,18 @@
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
                     {{ t('navbar.tab.status') }}
                 </button>
+                <button
+                    x-show="globalSettings.server.distributed_inference_active"
+                    x-cloak
+                    @click="setMainTab('cluster')"
+                    :class="mainTab === 'cluster'
+                        ? 'bg-white text-neutral-900 shadow-sm'
+                        : 'text-neutral-600 hover:text-neutral-900'"
+                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                >
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.cluster') }}
+                </button>
                 <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
                     <button
                         @click="setMainTab('models')"
@@ -324,6 +336,14 @@
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
                     {{ t('navbar.tab.status') }}
+                </button>
+                <button x-show="globalSettings.server.distributed_inference_active"
+                        x-cloak
+                        @click="setMainTab('cluster'); mobileMenuOpen = false"
+                        :class="mainTab === 'cluster' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.cluster') }}
                 </button>
                 <button @click="setMainTab('models'); mobileMenuOpen = false"
                         :class="mainTab === 'models' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"

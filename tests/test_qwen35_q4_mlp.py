@@ -496,3 +496,110 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
                 setattr(cls, attr, value)
             elif hasattr(cls, attr):
                 delattr(cls, attr)
+
+
+def _muse_applied():
+    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
+        apply_mlx_vlm_muse_glimmer_compat_patch,
+    )
+    from omlx.patches.qwen35_q4_mlp import apply_muse_glimmer_q4_prefill_patch
+
+    apply_mlx_vlm_muse_glimmer_compat_patch()
+    if not apply_muse_glimmer_q4_prefill_patch():
+        pytest.skip("muse q4 prefill patch unavailable (native kernel missing)")
+
+
+def _tiny_muse_text_config():
+    from mlx_vlm.models.muse_glimmer.config import TextConfig
+
+    return TextConfig(
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=4096,
+        sliding_window=64,
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[10000.0, 0],
+    )
+
+
+def _quantize_module_linears(module, names, bits=4):
+    for name in names:
+        linear = getattr(module, name)
+        setattr(
+            module,
+            name,
+            nn.QuantizedLinear.from_linear(
+                linear, group_size=64, bits=bits, mode="affine"
+            ),
+        )
+
+
+def test_muse_glimmer_q4_mlp_patch_bit_exact():
+    _muse_applied()
+    from mlx_vlm.models.muse_glimmer.language import MLP
+
+    mx.random.seed(0)
+    mlp = MLP(_tiny_muse_text_config())
+    _quantize_module_linears(mlp, ("gate_proj", "up_proj", "down_proj"))
+    orig_call = type(mlp)._omlx_q4_mlp_original_call
+
+    prefill = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
+    decode = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+    for x in (prefill, decode):
+        patched_out = mlp(x)
+        orig_out = orig_call(mlp, x)
+        mx.eval(patched_out, orig_out)
+        assert bool(mx.array_equal(patched_out, orig_out))
+
+
+def test_muse_glimmer_q4_attention_patch_bit_exact():
+    _muse_applied()
+    from mlx_vlm.models.muse_glimmer.language import Attention
+
+    mx.random.seed(0)
+    config = _tiny_muse_text_config()
+    for layer_idx in (0, 1):  # sliding+rope and full+NoPE
+        attn = Attention(config, layer_idx)
+        _quantize_module_linears(
+            attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
+        )
+        orig_call = type(attn)._omlx_q4_muse_attn_original_call
+
+        prefill = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
+        decode = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+        for x in (prefill, decode):
+            patched_out = attn(x, mask=None, cache=None)
+            orig_out = orig_call(attn, x, mask=None, cache=None)
+            mx.eval(patched_out, orig_out)
+            assert bool(mx.array_equal(patched_out, orig_out))
+
+
+def test_muse_glimmer_q4_attention_patch_with_cache_and_mask():
+    _muse_applied()
+    from mlx_lm.models.base import create_attention_mask
+    from mlx_vlm.models.cache import RotatingKVCache
+    from mlx_vlm.models.muse_glimmer.language import Attention
+
+    mx.random.seed(0)
+    config = _tiny_muse_text_config()
+    attn = Attention(config, 0)  # sliding layer
+    _quantize_module_linears(
+        attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
+    )
+    orig_call = type(attn)._omlx_q4_muse_attn_original_call
+
+    x = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
+    cache_a = RotatingKVCache(max_size=64)
+    cache_b = RotatingKVCache(max_size=64)
+    mask = create_attention_mask(x, cache_a, window_size=64)
+
+    patched_out = attn(x, mask=mask, cache=cache_a)
+    orig_out = orig_call(attn, x, mask=mask, cache=cache_b)
+    mx.eval(patched_out, orig_out)
+    assert bool(mx.array_equal(patched_out, orig_out))
+    assert cache_a.offset == cache_b.offset

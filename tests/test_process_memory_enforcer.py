@@ -1922,6 +1922,23 @@ class TestUnresolvableSchedulerWarning:
         ]
         assert warnings == []
 
+    def test_externally_managed_guard_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """Distributed coordinators delegate the guard to rank processes."""
+        engine = MagicMock(spec=["_prefill_memory_guard_managed_externally"])
+        engine._prefill_memory_guard_managed_externally = True
+        entry = _make_entry("model-distributed", engine=engine)
+        enforcer._engine_pool._entries = {"model-distributed": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
     def test_non_streaming_engine_without_scheduler_does_not_warn(
         self, enforcer, caplog
     ):

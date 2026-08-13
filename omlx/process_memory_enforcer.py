@@ -1168,6 +1168,14 @@ class ProcessMemoryEnforcer:
                     # teardown window after its scheduler has been released.
                     # Treat that like an unloaded entry, not a wrapper break.
                     continue
+                if getattr(
+                    engine, "_prefill_memory_guard_managed_externally", False
+                ):
+                    # DistributedBatchedEngine is a coordinator-side proxy.
+                    # Its rank processes own the schedulers and receive their
+                    # guard budgets from the signed deployment, so there is no
+                    # coordinator scheduler for this enforcer to update.
+                    continue
                 if (
                     type(engine).__name__ == "DFlashEngine"
                     and getattr(engine, "_fallback_engine", None) is None

@@ -1909,6 +1909,33 @@ class PagedSSDCacheManager(CacheManager):
         except Exception:
             pass  # Promotion failure is non-critical
 
+    def _promote_pending_write_to_hot_cache(
+        self,
+        block_hash: bytes,
+        entry: dict[str, Any],
+    ) -> None:
+        """Retain a pending-write read in the hot tier when requested.
+
+        A write-through block can be read while its background SSD write is
+        still pending.  Treat that read the same as a disk read: otherwise
+        whether it is promoted depends on a race with the writer thread.
+        Keep the promoted copy dirty until its atomic SSD file is visible so
+        an early eviction still preserves the block.
+        """
+        if not self._hot_cache_enabled:
+            return
+        try:
+            promoted_entry = dict(entry)
+            block_metadata = promoted_entry.get("block_metadata")
+            file_path = getattr(block_metadata, "file_path", None)
+            promoted_entry["dirty"] = not (
+                isinstance(file_path, Path) and file_path.exists()
+            )
+            self._hot_cache_put(block_hash, promoted_entry)
+            self._stats["hot_cache_promotions"] += 1
+        except Exception:
+            pass  # Promotion failure is non-critical
+
     def _init_directories(self) -> None:
         """Create cache directory structure."""
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2714,6 +2741,13 @@ class PagedSSDCacheManager(CacheManager):
         if remove_hot_cache:
             self._hot_cache_remove(block_hash)
 
+    def _mark_hot_cache_clean(self, block_hash: bytes) -> None:
+        """Mark a retained hot entry durable after its SSD write commits."""
+        with self._hot_cache_lock:
+            entry = self._hot_cache.get(block_hash)
+            if entry is not None:
+                entry["dirty"] = False
+
     def _writer_loop(self) -> None:
         """Background writer that drains the write queue.
 
@@ -2740,9 +2774,11 @@ class PagedSSDCacheManager(CacheManager):
 
             block_hash, tensors_raw, metadata, file_path = item
             try:
-                self._write_block_file(
+                write_succeeded = self._write_block_file(
                     block_hash, tensors_raw, metadata, file_path, source="background"
                 )
+                if write_succeeded:
+                    self._mark_hot_cache_clean(block_hash)
                 self._clear_pending_write(
                     block_hash, remove_hot_cache=not self._hot_cache_enabled
                 )
@@ -3427,6 +3463,7 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["loads"] += 1
                 self._stats["hits"] += 1
                 self._stats["hot_cache_hits"] += 1
+                self._promote_pending_write_to_hot_cache(block_hash, entry)
                 logger.debug(
                     f"Loaded block from pending write buffer: "
                     f"{block_hash.hex()[:16]}..."
@@ -3619,6 +3656,8 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["loads"] += 1
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
+            if promote_to_hot_cache:
+                self._promote_pending_write_to_hot_cache(block_hash, entry)
             logger.debug(
                 f"Loaded block with metadata from pending write buffer: "
                 f"{block_hash.hex()[:16]}..."

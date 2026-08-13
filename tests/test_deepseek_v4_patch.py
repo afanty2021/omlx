@@ -6,6 +6,7 @@ import inspect
 import json
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -850,6 +851,26 @@ class TestPatchedLoadModelTrustRemoteCode:
             trust_remote_code=True,
         )
         assert (tmp_path / "executed.txt").read_text() == "yes"
+
+    def test_untrusted_model_file_is_rejected_before_safetensors_open(
+        self, tmp_path, applied_patch, monkeypatch
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "custom", "model_file": "custom_arch.py"}'
+        )
+        (tmp_path / "model.safetensors").write_bytes(b"not opened")
+
+        from mlx_lm import utils
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        load_weights = MagicMock(side_effect=AssertionError("weights were opened"))
+        monkeypatch.setattr(utils_patch, "_load_safetensors", load_weights)
+
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            utils.load_model(tmp_path, lazy=True)
+
+        load_weights.assert_not_called()
 
 
 class TestCacheHandlerRegistration:

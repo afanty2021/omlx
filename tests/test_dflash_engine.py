@@ -1166,6 +1166,134 @@ class TestDFlashOutputParserWiring:
         )
         assert factory is None
 
+    def test_parser_without_tool_factory_uses_default_session(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._executor_tokenizer = object()
+        parser_session = object()
+        create_session = MagicMock(return_value=parser_session)
+        engine._output_parser_factory = SimpleNamespace(
+            create_session=create_session,
+            create_session_with_tools=None,
+        )
+
+        assert engine._create_output_parser_session(None) is parser_session
+        create_session.assert_called_once_with(engine._executor_tokenizer)
+
+    def _tool_parser_engine(self):
+        events = pytest.importorskip("dflash_mlx.engine.events")
+
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(),
+        )
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda text: [1, 2],
+            decode=lambda tokens, **kwargs: "",
+        )
+        engine._executor_tokenizer = object()
+        engine._should_fallback = lambda tokens: False
+        engine._detect_needs_think_prefix = lambda tokens: False
+        engine._apply_chat_template = MagicMock(return_value="prompt")
+
+        tool_calls = [
+            {
+                "name": "internal_search",
+                "arguments": '{"query":"maintenance contract"}',
+            }
+        ]
+        parser_session = MagicMock()
+        parser_session.process_token.return_value = SimpleNamespace(
+            stream_text="", visible_text=""
+        )
+        parser_session.finalize.return_value = SimpleNamespace(
+            stream_text="",
+            visible_text="",
+            tool_calls=tool_calls,
+            finish_reason="tool_calls",
+        )
+        create_with_tools = MagicMock(return_value=parser_session)
+        engine._output_parser_factory = SimpleNamespace(
+            create_session=MagicMock(),
+            create_session_with_tools=create_with_tools,
+        )
+
+        token = events.TokenEvent(
+            token_id=7,
+            generated_tokens=1,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+        )
+        summary = events.SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=2,
+            generated_token_ids=(7,),
+            generation_tokens=1,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+        engine._stream_dflash_events = MagicMock(
+            return_value=(
+                iter([token, summary]),
+                SimpleNamespace(hit_tokens=0),
+                [],
+            )
+        )
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "internal_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        return engine, create_with_tools, tools, tool_calls
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_propagates_parser_tool_calls(self):
+        engine, create_with_tools, tools, tool_calls = self._tool_parser_engine()
+
+        output = await engine.chat([{"role": "user", "content": "search"}], tools=tools)
+
+        create_with_tools.assert_called_once_with(engine._executor_tokenizer, tools)
+        assert output.text == ""
+        assert output.tool_calls == tool_calls
+        assert output.finish_reason == "tool_calls"
+        assert output.completion_tokens == 1
+
+    @pytest.mark.asyncio
+    async def test_streaming_propagates_parser_tool_calls(self):
+        engine, create_with_tools, tools, tool_calls = self._tool_parser_engine()
+
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "search"}], tools=tools
+            )
+        ]
+
+        create_with_tools.assert_called_once_with(engine._executor_tokenizer, tools)
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert outputs[0].tool_calls == tool_calls
+        assert outputs[0].finish_reason == "tool_calls"
+        assert outputs[0].completion_tokens == 1
+
 
 class TestDFlashCachedTokens:
     """#1441: DFlash must surface prefix-cache hits as cached_tokens.
