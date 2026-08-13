@@ -79,9 +79,16 @@ def _install(module: Any) -> None:
 
         module.ClampedSwiGLU = ClampedSwiGLU
 
-    mlp_cls = module.MLP
+    mlp_cls = getattr(module, "MLP", None) or getattr(module, "BailingMLP", None)
+    if mlp_cls is None:
+        raise AttributeError(
+            "bailing_hybrid module has neither MLP nor BailingMLP; "
+            "cannot install SwiGLU clamp"
+        )
     if not getattr(mlp_cls.__dict__.get("__call__"), "_omlx_clamp", False):
-        stock_swiglu = module.swiglu
+        stock_swiglu = getattr(module, "swiglu", None)
+        if stock_swiglu is None:
+            from mlx_lm.models.activations import swiglu as stock_swiglu
 
         def patched_call(self, x):
             gate = self.gate_proj(x)
