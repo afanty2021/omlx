@@ -2,65 +2,97 @@
   "Ling-3.0-tiny": [
     {
       "benchmark": "mmlu",
-      "accuracy": 0.52,
-      "avg_tok_s": 16.782524999443307,
-      "correct": 26
+      "accuracy": 0.56,
+      "avg_tok_s": 15.333605806717232,
+      "correct": 28
     },
     {
       "benchmark": "hellaswag",
       "accuracy": 0.58,
-      "avg_tok_s": 17.782963513826175,
+      "avg_tok_s": 16.081688049299974,
       "correct": 29
     },
     {
       "benchmark": "gsm8k",
       "accuracy": 0.18,
-      "avg_tok_s": 17.98500708894689,
+      "avg_tok_s": 16.72964704183979,
       "correct": 9
     },
     {
       "benchmark": "humaneval",
-      "accuracy": 0.94,
-      "avg_tok_s": 17.989551696195406,
-      "correct": 47
+      "accuracy": 0.96,
+      "avg_tok_s": 17.65514742421669,
+      "correct": 48
     },
     {
       "benchmark": "truthfulqa",
-      "accuracy": 0.5,
-      "avg_tok_s": 16.904194799784033,
-      "correct": 25
+      "accuracy": 0.48,
+      "avg_tok_s": 17.0102646104565,
+      "correct": 24
     }
   ],
   "Ling-3.0-tiny-MLX-8bit": [
     {
       "benchmark": "mmlu",
-      "accuracy": 0.52,
-      "avg_tok_s": 41.94834224972325,
-      "correct": 26
+      "accuracy": 0.6,
+      "avg_tok_s": 41.86812431947235,
+      "correct": 30
     },
     {
       "benchmark": "hellaswag",
-      "accuracy": 0.62,
-      "avg_tok_s": 45.21512286274683,
-      "correct": 31
+      "accuracy": 0.54,
+      "avg_tok_s": 42.20853858787284,
+      "correct": 27
     },
     {
       "benchmark": "gsm8k",
       "accuracy": 0.18,
-      "avg_tok_s": 46.51987854953617,
+      "avg_tok_s": 45.22004542775636,
       "correct": 9
     },
     {
       "benchmark": "humaneval",
-      "accuracy": 0.92,
-      "avg_tok_s": 45.456667699827086,
-      "correct": 46
+      "accuracy": 0.9,
+      "avg_tok_s": 44.85094040734437,
+      "correct": 45
     },
     {
       "benchmark": "truthfulqa",
       "accuracy": 0.5,
-      "avg_tok_s": 42.46889630062751,
+      "avg_tok_s": 41.36202421451393,
       "correct": 25
+    }
+  ],
+  "Ling-3.0-tiny-MLX-4bit": [
+    {
+      "benchmark": "mmlu",
+      "accuracy": 0.56,
+      "avg_tok_s": 57.545501613723935,
+      "correct": 28
+    },
+    {
+      "benchmark": "hellaswag",
+      "accuracy": 0.48,
+      "avg_tok_s": 61.81083426336857,
+      "correct": 24
+    },
+    {
+      "benchmark": "gsm8k",
+      "accuracy": 0.3,
+      "avg_tok_s": 63.94255254171441,
+      "correct": 15
+    },
+    {
+      "benchmark": "humaneval",
+      "accuracy": 0.96,
+      "avg_tok_s": 62.29240928501834,
+      "correct": 48
+    },
+    {
+      "benchmark": "truthfulqa",
+      "accuracy": 0.58,
+      "avg_tok_s": 59.157500749764225,
+      "correct": 29
     }
   ]
 }

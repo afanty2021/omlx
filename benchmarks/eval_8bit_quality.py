@@ -13,7 +13,7 @@ API_BASE = "http://localhost:8001/v1"
 DATASET_DIR = Path(__file__).parent.parent / "omlx" / "eval" / "data"
 SEED = 42
 SAMPLE_SIZE = 50
-MODELS = ["Ling-3.0-tiny", "Ling-3.0-tiny-MLX-8bit"]
+MODELS = ["Ling-3.0-tiny", "Ling-3.0-tiny-MLX-8bit", "Ling-3.0-tiny-MLX-4bit"]
 BENCHMARKS = ["mmlu", "hellaswag", "gsm8k", "humaneval", "truthfulqa"]
 
 
@@ -149,10 +149,10 @@ async def main():
     print("="*65)
 
     header = f"{'Benchmark':<14}"
+    labels = {"Ling-3.0-tiny": "BF16", "Ling-3.0-tiny-MLX-8bit": "8bit", "Ling-3.0-tiny-MLX-4bit": "4bit"}
     for m in MODELS:
-        label = "BF16" if "8bit" not in m else "8bit"
-        header += f" | {label:<18}"
-    header += " | 质量变化"
+        header += f" | {labels.get(m, m):<18}"
+    header += " | 8bit vs BF16 | 4bit vs BF16"
     print(header)
     print("-" * len(header))
 
@@ -167,9 +167,10 @@ async def main():
             else:
                 row += f" | {'N/A':<18}"
                 scores.append(0)
-        if len(scores) == 2 and scores[0] > 0:
-            delta = (scores[1] - scores[0]) * 100
-            row += f" | {delta:+.1f}pp"
+        bf16 = scores[0] if scores else 0
+        d8 = (scores[1] - bf16) * 100 if len(scores) > 1 else 0
+        d4 = (scores[2] - bf16) * 100 if len(scores) > 2 else 0
+        row += f" | {d8:+.1f}pp       | {d4:+.1f}pp"
         print(row)
 
     print(f"\n{'─'*65}")
@@ -179,8 +180,12 @@ async def main():
         for m in MODELS:
             r = next((x for x in all_results[m] if x["benchmark"] == bench), None)
             speeds.append(r["avg_tok_s"] if r else 0)
-        ratio = speeds[1] / speeds[0] if speeds[0] > 0 else 0
-        print(f"  {bench:<14}: BF16 {speeds[0]:.1f} → 8bit {speeds[1]:.1f} tok/s ({ratio:.2f}x)")
+        parts = [f"BF16 {speeds[0]:.1f}"]
+        if len(speeds) > 1 and speeds[0] > 0:
+            parts.append(f"8bit {speeds[1]:.1f} ({speeds[1]/speeds[0]:.2f}x)")
+        if len(speeds) > 2 and speeds[0] > 0:
+            parts.append(f"4bit {speeds[2]:.1f} ({speeds[2]/speeds[0]:.2f}x)")
+        print(f"  {bench:<14}: {' → '.join(parts)} tok/s")
 
     output = Path(__file__).parent / "eval_8bit_results.json"
     with open(output, "w") as f:
