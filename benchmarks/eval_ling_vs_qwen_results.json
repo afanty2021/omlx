@@ -1,0 +1,92 @@
+{
+  "Ling-3.0-tiny": [
+    {
+      "benchmark": "mmlu",
+      "accuracy": 0.56,
+      "correct": 28,
+      "count": 50,
+      "time": 1054.6447491645813,
+      "avg_tok_s": 16.855887981951298
+    },
+    {
+      "benchmark": "hellaswag",
+      "accuracy": 0.56,
+      "correct": 28,
+      "count": 50,
+      "time": 1266.0380070209503,
+      "avg_tok_s": 17.655279492578817
+    },
+    {
+      "benchmark": "gsm8k",
+      "accuracy": 0.18,
+      "correct": 9,
+      "count": 50,
+      "time": 1448.955806016922,
+      "avg_tok_s": 17.536118898254553,
+      "total_tokens": 24353
+    },
+    {
+      "benchmark": "humaneval",
+      "accuracy": 0.9,
+      "correct": 45,
+      "count": 50,
+      "time": 1429.2606551647186,
+      "avg_tok_s": 17.863435463520126,
+      "total_tokens": 25045
+    },
+    {
+      "benchmark": "truthfulqa",
+      "accuracy": 0.28,
+      "correct": 14,
+      "count": 50,
+      "time": 366.74270725250244,
+      "avg_tok_s": 16.313711681685653,
+      "total_tokens": 5940
+    }
+  ],
+  "Qwen3.6-35B-A3B-4bit": [
+    {
+      "benchmark": "mmlu",
+      "accuracy": 0.64,
+      "correct": 32,
+      "count": 50,
+      "time": 921.408252954483,
+      "avg_tok_s": 27.054187539591254
+    },
+    {
+      "benchmark": "hellaswag",
+      "accuracy": 0.6,
+      "correct": 30,
+      "count": 50,
+      "time": 950.2712194919586,
+      "avg_tok_s": 27.213000331598067
+    },
+    {
+      "benchmark": "gsm8k",
+      "accuracy": 0.02,
+      "correct": 1,
+      "count": 50,
+      "time": 928.931601524353,
+      "avg_tok_s": 28.099853953392437,
+      "total_tokens": 25600
+    },
+    {
+      "benchmark": "humaneval",
+      "accuracy": 0.7,
+      "correct": 35,
+      "count": 50,
+      "time": 977.0948278903961,
+      "avg_tok_s": 26.67029504486809,
+      "total_tokens": 25531
+    },
+    {
+      "benchmark": "truthfulqa",
+      "accuracy": 0.12,
+      "correct": 6,
+      "count": 50,
+      "time": 267.58416867256165,
+      "avg_tok_s": 24.302528741945608,
+      "total_tokens": 6400
+    }
+  ]
+}

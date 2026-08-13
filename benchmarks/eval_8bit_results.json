@@ -1,0 +1,66 @@
+{
+  "Ling-3.0-tiny": [
+    {
+      "benchmark": "mmlu",
+      "accuracy": 0.52,
+      "avg_tok_s": 16.782524999443307,
+      "correct": 26
+    },
+    {
+      "benchmark": "hellaswag",
+      "accuracy": 0.58,
+      "avg_tok_s": 17.782963513826175,
+      "correct": 29
+    },
+    {
+      "benchmark": "gsm8k",
+      "accuracy": 0.18,
+      "avg_tok_s": 17.98500708894689,
+      "correct": 9
+    },
+    {
+      "benchmark": "humaneval",
+      "accuracy": 0.94,
+      "avg_tok_s": 17.989551696195406,
+      "correct": 47
+    },
+    {
+      "benchmark": "truthfulqa",
+      "accuracy": 0.5,
+      "avg_tok_s": 16.904194799784033,
+      "correct": 25
+    }
+  ],
+  "Ling-3.0-tiny-MLX-8bit": [
+    {
+      "benchmark": "mmlu",
+      "accuracy": 0.52,
+      "avg_tok_s": 41.94834224972325,
+      "correct": 26
+    },
+    {
+      "benchmark": "hellaswag",
+      "accuracy": 0.62,
+      "avg_tok_s": 45.21512286274683,
+      "correct": 31
+    },
+    {
+      "benchmark": "gsm8k",
+      "accuracy": 0.18,
+      "avg_tok_s": 46.51987854953617,
+      "correct": 9
+    },
+    {
+      "benchmark": "humaneval",
+      "accuracy": 0.92,
+      "avg_tok_s": 45.456667699827086,
+      "correct": 46
+    },
+    {
+      "benchmark": "truthfulqa",
+      "accuracy": 0.5,
+      "avg_tok_s": 42.46889630062751,
+      "correct": 25
+    }
+  ]
+}

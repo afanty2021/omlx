@@ -1,0 +1,198 @@
+{
+  "Ling-3.0-tiny": [
+    {
+      "correct": true,
+      "time": 1.2633147239685059,
+      "detail": "工具=True, 参数=True ",
+      "id": "single_weather",
+      "category": "单工具调用",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": false,
+      "time": 1.0433740615844727,
+      "detail": "工具=True, 参数=False 期望 {'city': '纽约', 'unit': 'fahrenheit'}, 实际 {'city': 'New York', 'unit': 'fahrenheit'}",
+      "id": "single_weather_fahrenheit",
+      "category": "单工具调用",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 1.0028963088989258,
+      "detail": "工具=True, 参数=True ",
+      "id": "multi_calc",
+      "category": "多工具选择",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 1.0127360820770264,
+      "detail": "工具=True, 参数=True ",
+      "id": "multi_search",
+      "category": "多工具选择",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 1.534221887588501,
+      "detail": "调用 2 次, 工具=True, 参数=True ",
+      "id": "multi_weather",
+      "category": "多工具选择",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 3.5891168117523193,
+      "detail": "正确：未调用工具",
+      "id": "no_tool_chat",
+      "category": "无需工具",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 1.6973659992218018,
+      "detail": "正确：未调用工具",
+      "id": "no_tool_knowledge",
+      "category": "无需工具",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 1.6154518127441406,
+      "detail": "工具=True, 参数=True ",
+      "id": "email_complex",
+      "category": "复杂参数提取",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 0.948239803314209,
+      "detail": "工具=True, 参数=True ",
+      "id": "time_query",
+      "category": "多工具选择",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 3.6095080375671387,
+      "detail": "正确：未调用工具",
+      "id": "multi_turn",
+      "category": "多轮对话",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 0.9096691608428955,
+      "detail": "工具=True, 参数=True ",
+      "id": "calc_variant",
+      "category": "参数提取",
+      "model": "Ling-3.0-tiny"
+    },
+    {
+      "correct": true,
+      "time": 0.818547248840332,
+      "detail": "工具=True, 参数=True ",
+      "id": "weather_implicit",
+      "category": "参数提取",
+      "model": "Ling-3.0-tiny"
+    }
+  ],
+  "Qwen3.6-35B-A3B-4bit": [
+    {
+      "correct": true,
+      "time": 9.203991889953613,
+      "detail": "工具=True, 参数=True ",
+      "id": "single_weather",
+      "category": "单工具调用",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 7.2217888832092285,
+      "detail": "工具=True, 参数=True ",
+      "id": "single_weather_fahrenheit",
+      "category": "单工具调用",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 9.64362096786499,
+      "detail": "工具=True, 参数=True ",
+      "id": "multi_calc",
+      "category": "多工具选择",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 8.280229091644287,
+      "detail": "工具=True, 参数=True ",
+      "id": "multi_search",
+      "category": "多工具选择",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 9.092116832733154,
+      "detail": "调用 2 次, 工具=True, 参数=True ",
+      "id": "multi_weather",
+      "category": "多工具选择",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 10.125025033950806,
+      "detail": "正确：未调用工具",
+      "id": "no_tool_chat",
+      "category": "无需工具",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 12.235514879226685,
+      "detail": "正确：未调用工具",
+      "id": "no_tool_knowledge",
+      "category": "无需工具",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 5.175465106964111,
+      "detail": "工具=True, 参数=True ",
+      "id": "email_complex",
+      "category": "复杂参数提取",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 7.23570704460144,
+      "detail": "工具=True, 参数=True ",
+      "id": "time_query",
+      "category": "多工具选择",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 8.765086889266968,
+      "detail": "正确：未调用工具",
+      "id": "multi_turn",
+      "category": "多轮对话",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 1.5598819255828857,
+      "detail": "工具=True, 参数=True ",
+      "id": "calc_variant",
+      "category": "参数提取",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    },
+    {
+      "correct": true,
+      "time": 9.931717872619629,
+      "detail": "工具=True, 参数=True ",
+      "id": "weather_implicit",
+      "category": "参数提取",
+      "model": "Qwen3.6-35B-A3B-4bit"
+    }
+  ]
+}
