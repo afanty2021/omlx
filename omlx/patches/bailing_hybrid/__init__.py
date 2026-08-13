@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ling 3.0 Flash support for the pinned mlx-lm dependency.
+"""Ling 3.0 (bailing_hybrid) support for the pinned mlx-lm dependency.
 
-Vendors ``mlx_lm.models.bailing_hybrid`` from scaryrawr/mlx-lm's
-``ling-3.0-flash`` branch without changing oMLX's official mlx-lm pin. The
-branch is based on that exact pinned revision and adds the mixed MLA/KDA model
-used by Ling 3.0 Flash.
+Provides two MLA implementations selectable via ``bailing_mla_mode`` model
+setting:
+
+* ``"auto"`` (default): use upstream ``mlx_lm.models.bailing_hybrid`` when
+  available (standard per-head KV cache — faster for short context).
+* ``"latent"``: force the vendored module (compressed latent KV cache —
+  ~9x smaller MLA cache, faster for long context >4K).
+
+The vendored copy also implements Ling's SwiGLU clamp natively and handles
+both original and upstream-sanitized checkpoint weight layouts.
 
 MLX-LM resolves architectures by importing modules under its own namespace.
-Register the vendored implementation there only while upstream lacks it.
+The selected module is registered there before mlx-lm resolves its classes.
 """
 
 from __future__ import annotations
@@ -30,12 +36,11 @@ SOURCE_URL = (
 
 _MODULE_NAME = "mlx_lm.models.bailing_hybrid"
 _APPLIED = False
+_APPLIED_MODE: str | None = None
 
 
-def _register_module() -> None:
-    if _MODULE_NAME in sys.modules:
-        return
-
+def _register_vendored() -> None:
+    """Register the vendored bailing_hybrid module (latent MLA)."""
     file_path = Path(__file__).parent / "bailing_hybrid_model.py"
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, str(file_path))
     if spec is None or spec.loader is None:
@@ -43,6 +48,7 @@ def _register_module() -> None:
 
     module = importlib.util.module_from_spec(spec)
     module.__package__ = "mlx_lm.models"
+    # Replace any prior registration (upstream or stale vendored)
     sys.modules[_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
@@ -53,48 +59,76 @@ def _register_module() -> None:
             sys.modules.pop(_MODULE_NAME)
         raise
 
-    logger.info("Registered %s from %s", _MODULE_NAME, file_path.name)
+    logger.info("Registered vendored %s (latent MLA) from %s", _MODULE_NAME, file_path.name)
 
 
-def apply_bailing_hybrid_patch() -> bool:
-    """Register Ling's ``bailing_hybrid`` model when upstream lacks it."""
-    global _APPLIED
-    if _APPLIED:
-        return False
+def _ensure_upstream() -> None:
+    """Ensure upstream bailing_hybrid is importable and registered."""
+    module = importlib.import_module(_MODULE_NAME)
+    models_pkg = importlib.import_module("mlx_lm.models")
+    models_pkg.bailing_hybrid = module
+
+
+def apply_bailing_hybrid_patch(force_vendored: bool = False) -> bool:
+    """Register the appropriate bailing_hybrid module.
+
+    Args:
+        force_vendored: If True, use the vendored latent-MLA module
+            (long-context optimised KV cache). If False, prefer upstream.
+
+    Returns:
+        True if the vendored module was registered, False for upstream.
+    """
+    global _APPLIED, _APPLIED_MODE
+    mode = "latent" if force_vendored else "auto"
+
+    if _APPLIED and _APPLIED_MODE == mode:
+        return force_vendored
+    if _APPLIED and _APPLIED_MODE != mode:
+        # Mode switch: must re-register. Reset state so the next load
+        # picks up the new module. The actual swap happens below.
+        logger.info(
+            "bailing_hybrid MLA mode switch: %s → %s", _APPLIED_MODE, mode
+        )
+        _APPLIED = False
+        _APPLIED_MODE = None
 
     try:
-        module = importlib.import_module(_MODULE_NAME)
-    except ModuleNotFoundError as error:
-        if error.name == "mlx_lm":
-            logger.debug("mlx_lm not importable - bailing_hybrid patch skipped")
-            return False
-        if error.name != _MODULE_NAME:
-            raise
-        _register_module()
-        applied = True
-    else:
-        models_pkg = importlib.import_module("mlx_lm.models")
-        models_pkg.bailing_hybrid = module
-        applied = False
+        importlib.import_module("mlx_lm")
+    except ModuleNotFoundError:
+        logger.debug("mlx_lm not importable - bailing_hybrid patch skipped")
+        return False
 
-    # Whichever build ended up live, make sure Ling's trained SwiGLU clamp is
-    # in force. The vendored copy implements it in-source; an mlx-lm build
-    # that already ships bailing_hybrid does not.
+    if force_vendored:
+        _register_vendored()
+    else:
+        try:
+            _ensure_upstream()
+        except ModuleNotFoundError:
+            # Upstream lacks bailing_hybrid — fall back to vendored
+            logger.info(
+                "upstream mlx_lm has no bailing_hybrid; using vendored module"
+            )
+            _register_vendored()
+            force_vendored = True  # report accurately
+
+    # Install SwiGLU clamp on whichever module is live.
     module = importlib.import_module(_MODULE_NAME)
     if ensure_swiglu_clamp(module):
         logger.info("Ling SwiGLU clamp installed on %s", _MODULE_NAME)
 
     _APPLIED = True
+    _APPLIED_MODE = mode
 
-    if applied:
+    if force_vendored:
         logger.info(
-            "Ling 3.0 Flash mlx-lm patch applied (branch head %s)",
-            BRANCH_HEAD_SHA[:8],
+            "Ling bailing_hybrid vendored module registered "
+            "(branch head %s, latent MLA cache)", BRANCH_HEAD_SHA[:8]
         )
-        return True
+    else:
+        logger.debug("mlx_lm.models.bailing_hybrid using upstream build")
 
-    logger.debug("mlx_lm.models.bailing_hybrid already available upstream")
-    return False
+    return force_vendored
 
 
 def is_applied() -> bool:

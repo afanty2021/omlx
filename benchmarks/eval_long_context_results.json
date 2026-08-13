@@ -1,0 +1,82 @@
+[
+  {
+    "target": 500,
+    "prompt_tokens": 991,
+    "completion_tokens": 64,
+    "elapsed": 3.774376153945923,
+    "prefill_time": 2.6543761539459227,
+    "decode_time": 1.12,
+    "prefill_tps": 373.3457289114079,
+    "decode_tps": 57.14285714285714
+  },
+  {
+    "target": 1000,
+    "prompt_tokens": 2011,
+    "completion_tokens": 64,
+    "elapsed": 1.4571938514709473,
+    "prefill_time": 0.01,
+    "decode_time": 1.45,
+    "prefill_tps": 201100.0,
+    "decode_tps": 44.13793103448276
+  },
+  {
+    "target": 2000,
+    "prompt_tokens": 3991,
+    "completion_tokens": 64,
+    "elapsed": 2.3552350997924805,
+    "prefill_time": 0.01,
+    "decode_time": 2.35,
+    "prefill_tps": 399100.0,
+    "decode_tps": 27.23404255319149
+  },
+  {
+    "target": 4000,
+    "prompt_tokens": 8011,
+    "completion_tokens": 64,
+    "elapsed": 4.304873943328857,
+    "prefill_time": 0.014873943328857386,
+    "decode_time": 4.29,
+    "prefill_tps": 538592.8817180322,
+    "decode_tps": 14.918414918414918
+  },
+  {
+    "target": 8000,
+    "prompt_tokens": 15991,
+    "completion_tokens": 64,
+    "elapsed": 6.030711889266968,
+    "prefill_time": 0.020711889266967987,
+    "decode_time": 6.01,
+    "prefill_tps": 772068.6313972806,
+    "decode_tps": 10.648918469217971
+  },
+  {
+    "target": 16000,
+    "prompt_tokens": 32011,
+    "completion_tokens": 64,
+    "elapsed": 12.656621217727661,
+    "prefill_time": 0.0466212177276617,
+    "decode_time": 12.61,
+    "prefill_tps": 686618.7019608233,
+    "decode_tps": 5.075337034099921
+  },
+  {
+    "target": 32000,
+    "prompt_tokens": 63991,
+    "completion_tokens": 64,
+    "elapsed": 32.83030891418457,
+    "prefill_time": 0.09030891418456832,
+    "decode_time": 32.74,
+    "prefill_tps": 708578.9988485385,
+    "decode_tps": 1.9547953573610262
+  },
+  {
+    "target": 64000,
+    "prompt_tokens": 128011,
+    "completion_tokens": 64,
+    "elapsed": 109.1054630279541,
+    "prefill_time": 0.19546302795410497,
+    "decode_time": 108.91,
+    "prefill_tps": 654911.5776005331,
+    "decode_tps": 0.587641171609586
+  }
+]

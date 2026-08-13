@@ -737,6 +737,32 @@ class Model(nn.Module):
     def sanitize(self, weights):
         n_layers = self.args.num_hidden_layers
 
+        # Compat: undo upstream mlx-lm's conv1d renaming for checkpoints
+        # already sanitized by the upstream bailing_hybrid module.
+        # upstream renames q_conv1d.weight → q_conv1d.conv.weight and
+        # transposes from (C,1,K) to (C,K,1); our DepthwiseConv1d expects
+        # (C,1,K). Undo both.
+        for k in list(weights):
+            if k.endswith("_conv1d.conv.weight"):
+                base = k[: -len(".conv.weight")] + ".weight"
+                w = weights.pop(k)
+                if w.ndim == 3 and w.shape[1] != 1:
+                    w = w.swapaxes(1, 2)
+                weights[base] = w
+
+        # Compat: upstream stacks experts at mlp.experts.{proj} (already
+        # stacked into a single tensor), while our SwitchGLU expects
+        # mlp.switch_mlp.{proj}. Rename the already-stacked tensors.
+        for k in list(weights):
+            if ".mlp.experts." in k and ".mlp.experts.0." not in k:
+                # Already stacked by upstream: experts.gate_proj.weight → switch_mlp.gate_proj.weight
+                new_k = k.replace(".mlp.experts.", ".mlp.switch_mlp.")
+                weights[new_k] = weights.pop(k)
+            elif ".mlp.gate.weight" in k:
+                # upstream keeps gate at mlp.gate.weight; our Gate uses mlp.gate.gate_proj
+                new_k = k.replace(".mlp.gate.weight", ".mlp.gate.gate_proj.weight")
+                weights[new_k] = weights.pop(k)
+
         # Drop MTP and any extra non-base layers (Ling 2.6 has 1 MTP layer
         # appended after num_hidden_layers; deletes weights for those).
         weights = {
@@ -783,8 +809,16 @@ class Model(nn.Module):
 
             # MLA kv_b_proj split for global attention layers.
             kv_b_key = f"{prefix}.attention.kv_b_proj.weight"
+            kv_b_scales = f"{prefix}.attention.kv_b_proj.scales"
             if kv_b_key in weights:
                 v = weights.pop(kv_b_key)
+                # Dequantize if needed — quantized kv_b_proj can't be reshaped
+                # directly. Only 6 MLA layers, so bf16 overhead is negligible.
+                if kv_b_scales in weights:
+                    biases_key = f"{prefix}.attention.kv_b_proj.biases"
+                    scales = weights.pop(kv_b_scales)
+                    biases = weights.pop(biases_key, mx.zeros_like(scales))
+                    v = mx.dequantize(v, scales, biases, group_size=64, bits=8)
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
                 num_heads = self.args.num_attention_heads
                 v = v.reshape(num_heads, head_dim, -1)

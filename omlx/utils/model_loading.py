@@ -491,8 +491,16 @@ def maybe_apply_pre_load_patches(
     if model_type == "bailing_hybrid":
         from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
 
-        if apply_bailing_hybrid_patch():
-            logger.info("Ling 3.0 Flash pre-load patch applied for %s", model_name)
+        mla_mode = (
+            getattr(model_settings, "bailing_mla_mode", "auto")
+            if model_settings is not None
+            else "auto"
+        )
+        if apply_bailing_hybrid_patch(force_vendored=(mla_mode == "latent")):
+            logger.info(
+                "Ling bailing_hybrid pre-load patch applied for %s (mla_mode=%s)",
+                model_name, mla_mode,
+            )
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
