@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import threading
 import time
 from collections.abc import Iterator
@@ -629,12 +630,25 @@ def install_server_telemetry(
     assignment: PipelineAssignment | None = None,
     prefill_guard: Any | None = None,
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
+    ssd_cache_dir: str | None = None,
+    ssd_max_entries: int = 64,
+    prefill_step_size: int = 2048,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
 
     Also starts the idle heartbeat for as long as the rank is serving, so a
     marker that has stopped ageing means the rank has stopped, not that nobody
     has asked it anything.
+
+    When ``ssd_cache_dir`` is set, both generation paths additionally snapshot
+    the prompt cache to SSD at prefill boundaries (the batched generator as its
+    per-uid progress crosses each aligned boundary, the sequential path through
+    a chained progress callback) and restore from it on an in-memory miss, so a
+    model whose per-layer state cannot be sliced still reuses a long prefix
+    instead of recomputing it. The restore boundary is agreed across ranks so a
+    disk write that failed on one rank cannot desync the pipeline. The snapshot
+    directory is process-lifetime: the store starts it clean and this context's
+    teardown removes it.
     """
 
     import mlx.core as mx
@@ -651,6 +665,51 @@ def install_server_telemetry(
         assignment=assignment,
         heartbeat_interval=heartbeat_interval,
     )
+
+    snapshot_ctx = threading.local()
+    snapshot_step = max(1, int(prefill_step_size))
+    ssd_store = None
+    if ssd_cache_dir:
+        from .prompt_snapshot_cache import (
+            SSDPromptSnapshotStore,
+            agreed_boundary,
+            candidate_boundaries,
+        )
+
+        ssd_store = SSDPromptSnapshotStore(
+            ssd_cache_dir, step=snapshot_step, max_entries=ssd_max_entries
+        )
+    try:
+        world_size = int(mx.distributed.init().size())
+    except Exception:
+        world_size = 1
+
+    def agree_ssd_boundary(model: Any, tokens: list[int]) -> int:
+        """Longest prefix boundary every rank can restore for ``tokens``, or 0.
+
+        Each rank votes the boundaries it holds on disk; a boundary is taken
+        only when the whole group has it, so a rank whose snapshot write failed
+        simply drops that boundary rather than reading a prefix the others
+        recompute. This is the same collective-agreement shape the prefill guard
+        already uses, and it runs only on the sequential path where every rank
+        reaches it in lockstep.
+        """
+
+        # Capped at len - 1: the pinned batched server cannot insert a request
+        # whose segments were all consumed (insert_segments indexes seq[-1])
+        # and the sequential generate_step rejects an empty prompt, so a full
+        # hit must leave the last token unprocessed. The cap is computed from
+        # the broadcast prompt length, so it is identical on every rank.
+        local = set(ssd_store.present_boundaries(model, tokens))
+        candidates = candidate_boundaries(len(tokens) - 1, snapshot_step)
+        if not candidates:
+            return 0
+        if world_size <= 1:
+            usable = local.intersection(candidates)
+            return max(usable) if usable else 0
+        vote = mx.array([1 if c in local else 0 for c in candidates], dtype=mx.int32)
+        agreed = mx.distributed.all_sum(vote).tolist()
+        return agreed_boundary(candidates, agreed, world_size)
 
     class TelemetryBatchGenerator(original_batch_generator):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -669,15 +728,67 @@ def install_server_telemetry(
                 if execution.max_kv_size is not None:
                     kwargs.setdefault("max_kv_size", execution.max_kv_size)
             super().__init__(*args, **kwargs)
+            # Full token sequence per in-flight uid, so a boundary snapshot can
+            # be keyed while the batched prefill is still running.
+            self._omlx_tokens: dict[Any, list[int]] = {}
 
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
             telemetry.bind_pending_uid(uids)
+            if ssd_store is not None:
+                segments = kwargs.get("segments")
+                all_tokens = kwargs.get("all_tokens")
+                if isinstance(segments, list):
+                    for index, uid in enumerate(uids):
+                        prefix = (
+                            list(all_tokens[index])
+                            if isinstance(all_tokens, list)
+                            and index < len(all_tokens)
+                            and all_tokens[index]
+                            else []
+                        )
+                        body = [
+                            token for segment in segments[index] for token in segment
+                        ]
+                        self._omlx_tokens[uid] = prefix + body
             return uids
 
         def remove(self, uids: Any) -> Any:
             telemetry.cancel_uids(uids)
+            for uid in uids:
+                self._omlx_tokens.pop(uid, None)
             return super().remove(uids)
+
+        def _omlx_snapshot_boundary(self, response: Any) -> None:
+            """Save the batched prompt cache when prefill crosses a boundary.
+
+            The batched prefill advances by ``prefill_step_size``, so a report at
+            an aligned position is exactly a reusable prefix. The cache is pulled
+            out per uid (a copy) and keyed by the tokens it now holds.
+            """
+
+            uid = getattr(response, "uid", None)
+            full = self._omlx_tokens.get(uid)
+            progress = getattr(response, "progress", None)
+            if (
+                full is None
+                or not isinstance(progress, (tuple, list))
+                or len(progress) != 2
+            ):
+                return
+            processed, total = int(progress[0]), int(progress[1])
+            absolute = len(full) - total + processed
+            if absolute > 0 and absolute % snapshot_step == 0:
+                model = getattr(snapshot_ctx, "model", None)
+                if model is not None:
+                    try:
+                        extracted = self.extract_cache([uid]).get(uid)
+                    except Exception:
+                        extracted = None
+                    if extracted is not None:
+                        ssd_store.put(model, full[:absolute], extracted[0])
+            if getattr(response, "end_of_prompt", False):
+                self._omlx_tokens.pop(uid, None)
 
         def next(self) -> Any:
             started = time.perf_counter()
@@ -697,6 +808,8 @@ def install_server_telemetry(
                     processed_tokens=progress[0],
                     total_tokens=progress[1],
                 )
+                if ssd_store is not None:
+                    self._omlx_snapshot_boundary(response)
             telemetry.observe_batch_step(
                 prompt_responses=len(prompt_responses),
                 generation_responses=len(generation_responses),
@@ -715,10 +828,47 @@ def install_server_telemetry(
             )
             return cache, rest
 
+        def _lookup(self, model: Any, tokens: list[int]) -> Any:
+            cache, rest = self._fetch_observed(model, tokens)
+            if cache is not None and not rest and tokens:
+                # MLX-LM's exact-hit branch returns an empty rest, unlike its
+                # shorter/longer branches which cap the prefix at len - 1. The
+                # pinned batched server dies inserting a fully consumed
+                # request (insert_segments indexes seq[-1]) and the sequential
+                # generate_step rejects an empty prompt, so hand back the last
+                # token: trimmed off the hit when the cache supports it,
+                # recomputed from scratch when it does not.
+                from mlx_lm.models.cache import (
+                    can_trim_prompt_cache,
+                    trim_prompt_cache,
+                )
+
+                if can_trim_prompt_cache(cache):
+                    trim_prompt_cache(cache, 1)
+                    rest = list(tokens[-1:])
+                else:
+                    cache, rest = None, list(tokens)
+            # Record the full prompt so the boundary-snapshot callback can key
+            # its writes; it runs later on this same generation thread.
+            snapshot_ctx.model = model
+            snapshot_ctx.prompt = list(tokens)
+            if ssd_store is not None:
+                # The collective is taken on every request, hit or miss, so all
+                # ranks reach it the same number of times regardless of their
+                # in-memory state; the agreed boundary is only used when the
+                # in-memory tier missed. This is what lets SSD serve the batched
+                # path, whose byte-based eviction can diverge across ranks.
+                boundary = agree_ssd_boundary(model, tokens)
+                if cache is None and boundary > 0:
+                    loaded = ssd_store.load(model, tokens, boundary)
+                    if loaded is not None:
+                        cache, rest = loaded, list(tokens[boundary:])
+            return cache, rest
+
         def prefetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
             """Look up once during caught preflight, then hand it to MLX-LM."""
 
-            result = self._fetch_observed(model, tokens)
+            result = self._lookup(model, tokens)
             self._omlx_prefetched: Any = ((model, tuple(tokens)), result)
             return result
 
@@ -726,12 +876,17 @@ def install_server_telemetry(
             self._omlx_prefetched = None
 
         def fetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
+            # This is the entry MLX-LM itself always calls, on both the batched
+            # and the sequential path. The preflight lookup only happens when a
+            # prefill guard is installed, so the SSD tier and the snapshot
+            # context must live here too or a guardless deployment would
+            # silently lose the whole feature.
             key = (model, tuple(tokens))
             prefetched = getattr(self, "_omlx_prefetched", None)
             self._omlx_prefetched = None
             if prefetched is not None and prefetched[0] == key:
                 return prefetched[1]
-            return self._fetch_observed(model, tokens)
+            return self._lookup(model, tokens)
 
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super().insert_cache(*args, **kwargs)
@@ -808,10 +963,53 @@ def install_server_telemetry(
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous
 
+    original_stream_generate = mlx_server.stream_generate
+
+    def snapshotting_stream_generate(*args: Any, **kwargs: Any) -> Any:
+        """Deposit a snapshot at each prefill boundary before it is overwritten.
+
+        A ``RotatingKVCache`` window and a recurrent gated-delta-net state are
+        gone once prefill moves past a boundary, so the whole cache is saved the
+        moment the boundary is reached rather than at the end. The callback is
+        chained onto whatever MLX-LM passed, so progress reporting is unchanged.
+        """
+
+        prompt_cache = kwargs.get("prompt_cache")
+        rest = kwargs.get("prompt")
+        model = getattr(snapshot_ctx, "model", None)
+        full = getattr(snapshot_ctx, "prompt", None)
+        if (
+            ssd_store is None
+            or prompt_cache is None
+            or not isinstance(rest, list)
+            or model is None
+            or full is None
+        ):
+            yield from original_stream_generate(*args, **kwargs)
+            return
+
+        base = len(full) - len(rest)
+        user_callback = kwargs.get("prompt_progress_callback")
+
+        def _snapshot(processed: int, total: int) -> None:
+            absolute = base + int(processed)
+            # Only aligned boundaries are reusable: an unaligned base leaves the
+            # next request's prefill off the grid, so those writes would never be
+            # found and are skipped.
+            if absolute > 0 and absolute % snapshot_step == 0:
+                ssd_store.put(model, full[:absolute], prompt_cache)
+            if user_callback is not None:
+                user_callback(processed, total)
+
+        kwargs["prompt_progress_callback"] = _snapshot
+        yield from original_stream_generate(*args, **kwargs)
+
     mlx_server.BatchGenerator = TelemetryBatchGenerator
     mlx_server.ResponseGenerator = TelemetryResponseGenerator
     mlx_server.LRUPromptCache = TelemetryPromptCache
     mlx_server.GenerationContext = CoordinatedGenerationContext
+    if ssd_store is not None:
+        mlx_server.stream_generate = snapshotting_stream_generate
     # Started here rather than by the caller: this block is exactly the span
     # during which a rank is alive and expected to look alive, and a heartbeat
     # a caller can forget to start is a heartbeat that will be forgotten.
@@ -824,3 +1022,8 @@ def install_server_telemetry(
         mlx_server.BatchGenerator = original_batch_generator
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
+        mlx_server.stream_generate = original_stream_generate
+        if ssd_store is not None:
+            # Snapshots are process-lifetime; a hard crash skips this and the
+            # next store on the same directory reclaims the leftovers instead.
+            shutil.rmtree(ssd_store.directory, ignore_errors=True)

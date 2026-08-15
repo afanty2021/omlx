@@ -330,6 +330,8 @@ def build_mlx_launch_argv(
         argv.extend(["--max-kv-size", str(deployment.execution.max_kv_size)])
     if deployment.execution.cache_affinity:
         argv.append("--cache-affinity")
+    if deployment.execution.prompt_cache_ssd:
+        argv.append("--prompt-cache-ssd")
     if deployment.execution.auto_tune:
         argv.append("--auto-tune")
     if deployment.execution.sampling_rank_only:

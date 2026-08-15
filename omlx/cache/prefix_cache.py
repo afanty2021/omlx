@@ -91,6 +91,33 @@ logger = logging.getLogger(__name__)
 # Each entry is two 32-byte hashes; the cap only guards against unbounded
 # growth from many distinct conversation chains over a long-lived process.
 _TIP_LINEAGE_MAX_ENTRIES = 4096
+
+# Cap for the per-session set of dedup'd block hashes whose payloads were
+# already inspected for boundary-snapshot backfill (see
+# _maybe_backfill_dedup_block_payload). Cleared on overflow, like the tip
+# lineage map.
+_BACKFILL_CHECKED_MAX_ENTRIES = 4096
+
+
+def _wrap_cachelist_sub_marker(
+    sub_idx: int,
+    elements: list[Any],
+    sub_class_names: list[str],
+    storage_class_name: str | None = None,
+) -> tuple[Any, ...]:
+    """Wrap one CacheList sub-state for block storage.
+
+    Length-2 element lists round-trip as legacy ``(keys, values)`` so
+    existing callers (prefix cache reconstruct, tests) keep their shape.
+    Real N-tuple sub-states (PoolingCache, BatchKVCache) surface as
+    ``__nstate__`` markers.
+    """
+    if len(elements) == 2:
+        return (elements[0], elements[1])
+    name = storage_class_name
+    if name is None and sub_idx < len(sub_class_names):
+        name = sub_class_names[sub_idx]
+    return ("__nstate__", name, list(elements))
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 
@@ -181,6 +208,7 @@ class BlockAwarePrefixCache(CacheManager):
         self.paged_ssd_cache = paged_ssd_cache_manager
         self.block_size = paged_cache_manager.block_size
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
+        self._gdn_split_fallback_reported = False
         self._gdn_checkpoint_loader: Callable[[Any], list[dict[str, Any]] | None] | None = None
 
         # Expected number of layers for cache validation
@@ -207,6 +235,18 @@ class BlockAwarePrefixCache(CacheManager):
         # previous tip is kept intact as the walk-back fallback.
         self._rotating_tip_lineage: dict[bytes, bytes] = {}
 
+        # Hashes this session stored as tip blocks. A lineage entry is only
+        # recorded when the block preceding the new blocks really was a tip:
+        # for a store that diverged from an existing chain, that block is a
+        # shared-prefix interior block (often a boundary-snapshot block) and
+        # stripping it would destroy partial-match walk-back restores.
+        self._store_tip_hashes: set[bytes] = set()
+
+        # Dedup'd block hashes whose payloads were conclusively inspected
+        # for boundary-snapshot backfill this session (real state found or
+        # rewrite saved). Each hash is inspected at most once per run.
+        self._backfill_checked_hashes: set[bytes] = set()
+
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
         self._cold_restore_callback: Callable[[int, bytes], bool] | None = None
@@ -229,30 +269,63 @@ class BlockAwarePrefixCache(CacheManager):
         self._gdn_checkpoint_loads = 0
         self._gdn_checkpoint_walkbacks = 0
         self._last_gdn_restore: dict[str, Any] | None = None
+        self._gdn_dequantization_counter: Callable[[], int] | None = None
 
     def set_gdn_checkpoint_loader(
         self,
         loader: Callable[[Any], list[dict[str, Any]] | None] | None,
+        dequantization_counter: Callable[[], int] | None = None,
     ) -> None:
         """Attach the scheduler-owned recurrent checkpoint deserializer."""
         self._gdn_checkpoint_loader = loader
+        self._gdn_dequantization_counter = dequantization_counter
+
+    def _gdn_dequantization_count(self) -> int | None:
+        """Read the store counter without making restore depend on metrics."""
+        if self._gdn_dequantization_counter is None:
+            return None
+        try:
+            return int(self._gdn_dequantization_counter())
+        except Exception:
+            logger.debug("Failed to read GDN dequantization counter", exc_info=True)
+            return None
 
     def _gdn_split_layout_supported(
         self, layer_cache_types: list[str] | tuple[str, ...] | None
     ) -> bool:
-        """Return whether top-level ArraysCache sidecars are safe to use."""
+        """Return whether the current layout is safe for external GDN state.
+
+        V1 intentionally supports only top-level ArraysCache mixed with
+        block-sliceable attention caches. Composite CacheList, pooling, and
+        rotating families stay on the legacy embedded-snapshot path.
+        """
         if not self._gdn_ssd_split_enabled or not layer_cache_types:
             return False
-        saw_arrays = False
+        saw_arrays = any(
+            CacheTypeRegistry.is_arrays_family(type_name)
+            for type_name in layer_cache_types
+        )
         for type_name in layer_cache_types:
             if CacheTypeRegistry.is_arrays_family(type_name):
-                saw_arrays = True
                 continue
             if type_name == "CacheList" or CacheTypeRegistry.is_rotating_family(type_name):
+                if saw_arrays and not self._gdn_split_fallback_reported:
+                    logger.info(
+                        "GDN SSD sidecar is unsupported for layout %s; "
+                        "falling back to embedded GDN snapshots",
+                        list(layer_cache_types),
+                    )
+                    self._gdn_split_fallback_reported = True
                 return False
-            if not CacheTypeRegistry.get_handler_by_class_name(
-                type_name
-            ).supports_block_slicing:
+            handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+            if not handler.supports_block_slicing:
+                if saw_arrays and not self._gdn_split_fallback_reported:
+                    logger.info(
+                        "GDN SSD sidecar is unsupported for layout %s; "
+                        "falling back to embedded GDN snapshots",
+                        list(layer_cache_types),
+                    )
+                    self._gdn_split_fallback_reported = True
                 return False
         return saw_arrays
 
@@ -291,7 +364,9 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> bool:
         """Return whether a recurrent sidecar exists for this exact layout."""
         manager = self.paged_ssd_cache
-        signature_builder = getattr(manager, "cache_signature_for", None)
+        signature_builder = getattr(manager, "gdn_cache_signature_for", None)
+        if not callable(signature_builder):
+            signature_builder = getattr(manager, "cache_signature_for", None)
         checkpoint_checker = getattr(manager, "has_gdn_checkpoint", None)
         if not callable(signature_builder) or not callable(checkpoint_checker):
             return False
@@ -919,6 +994,40 @@ class BlockAwarePrefixCache(CacheManager):
                                 global_start,
                             )
                             break
+                    # Dedup'd blocks are never rewritten, so a block first
+                    # stored without snapshot coverage keeps placeholder
+                    # non-sliceable payloads forever. When this store carries
+                    # a boundary snapshot for the block, repair the payload
+                    # so partial-match walk-back can restore here again.
+                    if (
+                        not split_gdn_layout
+                        and is_tensor_data
+                        and HAS_MLX
+                        and self.paged_ssd_cache is not None
+                        and has_boundary_snapshot
+                        and existing_block.block_hash is not None
+                        and existing_block.block_hash
+                        not in self._backfill_checked_hashes
+                    ):
+                        snapshot_cache_data = boundary_snapshots[global_end]
+                        backfilled = (
+                            snapshot_cache_data
+                            and self._maybe_backfill_dedup_block_payload(
+                                existing_block.block_hash,
+                                global_end,
+                                snapshot_cache_data,
+                                hot_cache_write_back=hot_cache_write_back,
+                            )
+                        )
+                        if backfilled:
+                            self._backfill_checked_hashes.add(
+                                existing_block.block_hash
+                            )
+                            if (
+                                len(self._backfill_checked_hashes)
+                                > _BACKFILL_CHECKED_MAX_ENTRIES
+                            ):
+                                self._backfill_checked_hashes.clear()
                     # Reuse existing block
                     self.paged_cache.increment_ref(existing_block.block_id)
                     block_table.block_ids.append(existing_block.block_id)
@@ -1179,26 +1288,42 @@ class BlockAwarePrefixCache(CacheManager):
         if (
             tip_block_saved
             and first_new_block_idx is not None
-            and 0 < first_new_block_idx < len(block_table.block_ids)
+            and first_new_block_idx < len(block_table.block_ids)
             and layer_cache_types
             and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
         ):
-            prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
             new_tip_id = block_table.block_ids[-1]
-            prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
             new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
-            if (
-                prev_tip is not None
-                and prev_tip.block_hash is not None
-                and new_tip is not None
-                and new_tip.block_hash is not None
-            ):
-                superseded = self._rotating_tip_lineage.pop(prev_tip.block_hash, None)
-                if superseded is not None:
-                    self._strip_rotating_payload(superseded)
-                self._rotating_tip_lineage[new_tip.block_hash] = prev_tip.block_hash
-                if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
-                    self._rotating_tip_lineage.clear()
+            prev_tip = None
+            if first_new_block_idx > 0:
+                prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
+                prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
+            if new_tip is not None and new_tip.block_hash is not None:
+                # Only treat prev as a superseded tip when it actually was
+                # one. `first_new_block_idx - 1` is merely the last reused
+                # block of THIS store: on a store that diverged from an
+                # existing chain it is a shared-prefix interior block (often
+                # a boundary-snapshot block), and recording it here would get
+                # it stripped two stores later, permanently breaking
+                # partial-match walk-back restores.
+                if (
+                    prev_tip is not None
+                    and prev_tip.block_hash is not None
+                    and prev_tip.block_hash in self._store_tip_hashes
+                ):
+                    superseded = self._rotating_tip_lineage.pop(
+                        prev_tip.block_hash, None
+                    )
+                    if superseded is not None:
+                        self._strip_rotating_payload(superseded)
+                    self._rotating_tip_lineage[new_tip.block_hash] = (
+                        prev_tip.block_hash
+                    )
+                    if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                        self._rotating_tip_lineage.clear()
+                self._store_tip_hashes.add(new_tip.block_hash)
+                if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
+                    self._store_tip_hashes.clear()
 
         # Exact terminal blocks are discoverable only through
         # fetch_exact_prefix(); never expose them to general prefix matching.
@@ -1616,6 +1741,186 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return False
 
+    def _cachelist_snapshot_sub_tensors(
+        self,
+        source_layer: dict[str, Any],
+        source_state: Any,
+        sub_class_names: list[str],
+    ) -> list[Any] | None:
+        """Build ``__cache_list__`` sub-tensors from an extracted layer dict.
+
+        Clones *all* sub-state elements (PoolingCache's third element
+        ``pooled`` must survive the round-trip) and wraps PoolingCache subs
+        that carry a delta range as ``PoolingCacheDelta`` storage entries.
+        Returns None when the state is not a usable list.
+        """
+        if not isinstance(source_state, list):
+            return None
+        pooling_delta_ranges = source_layer.get("pooling_delta_ranges", {})
+        sub_tensors: list[Any] = []
+        for sub_idx, sub_state in enumerate(source_state):
+            if not (isinstance(sub_state, (list, tuple)) and len(sub_state) >= 1):
+                continue
+            cloned = [
+                self._clone_tensor(elem) if hasattr(elem, "shape") else elem
+                for elem in sub_state
+            ]
+            delta_range = pooling_delta_ranges.get(str(sub_idx))
+            sub_class = (
+                sub_class_names[sub_idx] if sub_idx < len(sub_class_names) else None
+            )
+            if (
+                sub_class == "PoolingCache"
+                and isinstance(delta_range, (list, tuple))
+                and len(delta_range) == 2
+            ):
+                cloned.append(mx.array(delta_range, dtype=mx.int64))
+                sub_tensors.append(
+                    _wrap_cachelist_sub_marker(
+                        sub_idx,
+                        cloned,
+                        sub_class_names,
+                        POOLING_CACHE_DELTA_CLASS,
+                    )
+                )
+            else:
+                sub_tensors.append(
+                    _wrap_cachelist_sub_marker(sub_idx, cloned, sub_class_names)
+                )
+        return sub_tensors
+
+    def _maybe_backfill_dedup_block_payload(
+        self,
+        block_hash: bytes,
+        boundary_tc: int,
+        snapshot_cache_data: list[dict[str, Any]],
+        hot_cache_write_back: bool = True,
+    ) -> bool:
+        """Rewrite a dedup'd placeholder block with boundary-snapshot state.
+
+        Deduplicated blocks are never rewritten by store_cache, so a block
+        first stored without snapshot coverage (or stripped since) keeps
+        placeholder non-sliceable payloads forever — every partial prefix
+        match that ends inside such a region is rejected and the request
+        re-prefills from scratch. When the current store re-processed the
+        same tokens and carries a boundary snapshot for this block's
+        boundary, rewrite the placeholder layers with the same
+        snapshot-derived payload a fresh snapshot-covered block would get,
+        making walk-back restores at this boundary possible again.
+
+        Strip interaction: _strip_rotating_payload only targets blocks that
+        still hold real rotating state, and this method only replaces
+        placeholder layers, so the two never rewrite the same block in one
+        store. A previously stripped ex-tip may be deliberately re-backfilled
+        by a later covered store.
+
+        Returns True when the block needs no further inspection this session
+        (payload already real, unusable snapshot, or rewrite saved); False
+        on transient load/save failure so a later store retries.
+        """
+        if self.paged_ssd_cache is None or not HAS_MLX:
+            return True
+        try:
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            if not data or not meta:
+                return False
+            types = meta.get("layer_cache_types") or []
+            new_data: list[Any] = []
+            replaced_indices: list[int] = []
+            for i, layer in enumerate(data):
+                type_name = types[i] if i < len(types) else "KVCache"
+                handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+                if handler.supports_block_slicing or not self._is_placeholder_state(
+                    layer
+                ):
+                    if type_name == "CacheList" and isinstance(layer, list):
+                        # load_block_with_metadata() exposes CacheList
+                        # payloads as their legacy list shape; restore the
+                        # storage marker before re-saving (same as strip).
+                        new_data.append(("__cache_list__", layer))
+                    else:
+                        new_data.append(layer)
+                    continue
+
+                snap_layer = (
+                    snapshot_cache_data[i]
+                    if i < len(snapshot_cache_data)
+                    else None
+                )
+                if not isinstance(snap_layer, dict) or "state" not in snap_layer:
+                    return True
+                snap_state = snap_layer["state"]
+                if CacheTypeRegistry.is_rotating_family(type_name):
+                    if not (
+                        isinstance(snap_state, (list, tuple))
+                        and len(snap_state) >= 2
+                    ):
+                        return True
+                    new_data.append(
+                        (
+                            self._clone_tensor(snap_state[0]),
+                            self._clone_tensor(snap_state[1]),
+                        )
+                    )
+                elif type_name == "CacheList":
+                    names = snap_layer.get("sub_class_names") or []
+                    if not names:
+                        snap_meta = snap_layer.get("meta_state")
+                        if (
+                            isinstance(snap_meta, (list, tuple))
+                            and len(snap_meta) >= 2
+                            and isinstance(snap_meta[0], (list, tuple))
+                        ):
+                            names = [str(n) for n in snap_meta[0]]
+                    subs = self._cachelist_snapshot_sub_tensors(
+                        snap_layer, snap_state, names
+                    )
+                    if subs is None:
+                        return True
+                    new_data.append(("__cache_list__", subs))
+                else:
+                    # Other non-sliceable layouts (ArraysCache family) keep
+                    # today's behavior; never persist a partially-filled
+                    # block.
+                    return True
+                replaced_indices.append(i)
+
+            if not replaced_indices:
+                return True
+
+            new_meta = list(meta.get("layer_meta_states") or [])
+            while len(new_meta) < len(data):
+                new_meta.append(())
+            for i in replaced_indices:
+                snap_meta_state = snapshot_cache_data[i].get("meta_state")
+                if snap_meta_state:
+                    new_meta[i] = snap_meta_state
+
+            self.paged_ssd_cache.forget_block(block_hash)
+            saved = self.paged_ssd_cache.save_block(
+                block_hash=block_hash,
+                cache_data=new_data,
+                token_count=int(meta.get("token_count") or self.block_size),
+                model_name=meta.get("model_name", self.paged_cache.model_name),
+                layer_cache_types=types or None,
+                layer_meta_states=new_meta,
+                hot_cache_write_back=hot_cache_write_back,
+            )
+            if not saved:
+                return False
+            logger.info(
+                "Backfilled dedup block %s at boundary %d (%d layer(s))",
+                block_hash.hex()[:16],
+                boundary_tc,
+                len(replaced_indices),
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "Dedup block backfill failed for %s: %s", block_hash.hex()[:16], e
+            )
+            return False
+
     def _extract_block_tensor_slice(
         self,
         cache_data: list[dict[str, Any]],
@@ -1850,23 +2155,9 @@ class BlockAwarePrefixCache(CacheManager):
                         for ss in state
                     )
 
-                    def _sub_class_for(sub_idx):
-                        if sub_idx < len(sub_class_names):
-                            return sub_class_names[sub_idx]
-                        return None
-
                     def _wrap_sub_marker(sub_idx, elements, storage_class_name=None):
-                        # Length-2 element lists round-trip as legacy
-                        # ``(keys, values)`` so existing callers (prefix
-                        # cache reconstruct, tests) keep their shape. Real
-                        # N-tuple sub-states (PoolingCache, BatchKVCache)
-                        # surface as ``__nstate__`` markers.
-                        if len(elements) == 2:
-                            return (elements[0], elements[1])
-                        return (
-                            "__nstate__",
-                            storage_class_name or _sub_class_for(sub_idx),
-                            list(elements),
+                        return _wrap_cachelist_sub_marker(
+                            sub_idx, elements, sub_class_names, storage_class_name
                         )
 
                     def _slice_sub_elements(sub_state):
@@ -1995,46 +2286,10 @@ class BlockAwarePrefixCache(CacheManager):
                             else:
                                 source_layer = layer_state
                                 source_state = state
-                            pooling_delta_ranges = source_layer.get(
-                                "pooling_delta_ranges", {}
+                            sub_tensors = self._cachelist_snapshot_sub_tensors(
+                                source_layer, source_state, sub_class_names
                             )
-                            if isinstance(source_state, list):
-                                sub_tensors = []
-                                for sub_idx, sub_state in enumerate(source_state):
-                                    if (
-                                        isinstance(sub_state, (list, tuple))
-                                        and len(sub_state) >= 1
-                                    ):
-                                        cloned = [
-                                            (
-                                                self._clone_tensor(elem)
-                                                if hasattr(elem, "shape")
-                                                else elem
-                                            )
-                                            for elem in sub_state
-                                        ]
-                                        delta_range = pooling_delta_ranges.get(
-                                            str(sub_idx)
-                                        )
-                                        if (
-                                            _sub_class_for(sub_idx) == "PoolingCache"
-                                            and isinstance(delta_range, (list, tuple))
-                                            and len(delta_range) == 2
-                                        ):
-                                            cloned.append(
-                                                mx.array(delta_range, dtype=mx.int64)
-                                            )
-                                            sub_tensors.append(
-                                                _wrap_sub_marker(
-                                                    sub_idx,
-                                                    cloned,
-                                                    POOLING_CACHE_DELTA_CLASS,
-                                                )
-                                            )
-                                        else:
-                                            sub_tensors.append(
-                                                _wrap_sub_marker(sub_idx, cloned)
-                                            )
+                            if sub_tensors is not None:
                                 block_slices.append(("__cache_list__", sub_tensors))
                             else:
                                 block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
@@ -2677,12 +2932,24 @@ class BlockAwarePrefixCache(CacheManager):
                 # admin poll cannot attribute an old endpoint to a miss.
                 self._last_gdn_restore = None
                 signature_builder = getattr(
-                    self.paged_ssd_cache, "cache_signature_for", None
+                    self.paged_ssd_cache, "gdn_cache_signature_for", None
+                )
+                if not callable(signature_builder):
+                    signature_builder = getattr(
+                        self.paged_ssd_cache, "cache_signature_for", None
+                    )
+                sidecar_lookup_getter = getattr(
+                    self.paged_ssd_cache,
+                    "get_gdn_checkpoint_file_with_diagnostic",
+                    None,
                 )
                 sidecar_getter = getattr(
                     self.paged_ssd_cache, "get_gdn_checkpoint_file", None
                 )
-                if not callable(signature_builder) or not callable(sidecar_getter):
+                if not callable(signature_builder) or (
+                    not callable(sidecar_lookup_getter)
+                    and not callable(sidecar_getter)
+                ):
                     logger.warning(
                         "Split GDN cache enabled but sidecar manager API is unavailable"
                     )
@@ -2703,66 +2970,118 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     if block is None or block.block_hash is None:
                         continue
-                    checkpoint_path = sidecar_getter(
-                        block.block_hash, cache_signature
-                    )
-                    if checkpoint_path is None:
-                        continue
-                    if self._gdn_checkpoint_loader is None:
-                        logger.warning(
-                            "Split GDN cache enabled without checkpoint loader"
+                    # A corrupt reduced sidecar is forgotten and the same
+                    # endpoint is retried once, allowing its legacy FP32
+                    # candidate to be selected before walking back a block.
+                    for _attempt in range(2):
+                        lookup_diagnostic = None
+                        if callable(sidecar_lookup_getter):
+                            lookup = sidecar_lookup_getter(
+                                block.block_hash, cache_signature
+                            )
+                            checkpoint_path = (
+                                getattr(lookup, "file_path", None)
+                                if lookup is not None
+                                else None
+                            )
+                            if checkpoint_path is not None:
+                                lookup_diagnostic = {
+                                    "requested_state_dtype": getattr(
+                                        lookup, "requested_state_dtype", None
+                                    ),
+                                    "effective_state_codec": getattr(
+                                        lookup, "effective_state_codec", None
+                                    ),
+                                    "used_legacy_fp32_fallback": getattr(
+                                        lookup,
+                                        "used_legacy_fp32_fallback",
+                                        None,
+                                    ),
+                                }
+                        else:
+                            checkpoint_path = sidecar_getter(
+                                block.block_hash, cache_signature
+                            )
+                        if checkpoint_path is None:
+                            break
+                        if self._gdn_checkpoint_loader is None:
+                            logger.warning(
+                                "Split GDN cache enabled without checkpoint loader"
+                            )
+                            return None
+                        load_started = time.perf_counter()
+                        dequantizations_before = self._gdn_dequantization_count()
+                        snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                        dequantizations_after = self._gdn_dequantization_count()
+                        load_latency_ms = (
+                            time.perf_counter() - load_started
+                        ) * 1000.0
+                        if snapshot is None:
+                            forgetter = getattr(
+                                self.paged_ssd_cache,
+                                "forget_gdn_checkpoint",
+                                None,
+                            )
+                            if callable(forgetter):
+                                forgetter(block.block_hash, cache_signature)
+                            continue
+                        candidate_payloads = self._validated_gdn_snapshot_layers(
+                            snapshot, layer_cache_types
                         )
-                        return None
-                    load_started = time.perf_counter()
-                    snapshot = self._gdn_checkpoint_loader(checkpoint_path)
-                    load_latency_ms = (time.perf_counter() - load_started) * 1000.0
-                    if snapshot is None:
-                        forgetter = getattr(
-                            self.paged_ssd_cache,
-                            "forget_gdn_checkpoint",
-                            None,
+                        if candidate_payloads is None:
+                            logger.warning(
+                                "Ignoring structurally invalid recurrent checkpoint "
+                                "for block %s",
+                                block.block_id,
+                            )
+                            forgetter = getattr(
+                                self.paged_ssd_cache,
+                                "forget_gdn_checkpoint",
+                                None,
+                            )
+                            if callable(forgetter):
+                                forgetter(block.block_hash, cache_signature)
+                            continue
+                        chosen_idx = idx
+                        chosen_payloads = candidate_payloads
+                        chosen_endpoint_tokens = sum(
+                            self.paged_cache.allocated_blocks[bid].token_count
+                            for bid in block_table.block_ids[: idx + 1]
+                            if bid in self.paged_cache.allocated_blocks
                         )
-                        if callable(forgetter):
-                            forgetter(block.block_hash, cache_signature)
-                        continue
-                    candidate_payloads = self._validated_gdn_snapshot_layers(
-                        snapshot, layer_cache_types
-                    )
-                    if candidate_payloads is None:
-                        logger.warning(
-                            "Ignoring structurally invalid recurrent checkpoint "
-                            "for block %s",
-                            block.block_id,
-                        )
-                        forgetter = getattr(
-                            self.paged_ssd_cache,
-                            "forget_gdn_checkpoint",
-                            None,
-                        )
-                        if callable(forgetter):
-                            forgetter(block.block_hash, cache_signature)
-                        continue
-                    chosen_idx = idx
-                    chosen_payloads = candidate_payloads
-                    chosen_endpoint_tokens = sum(
-                        self.paged_cache.allocated_blocks[bid].token_count
-                        for bid in block_table.block_ids[: idx + 1]
-                        if bid in self.paged_cache.allocated_blocks
-                    )
-                    source_hash = block.block_hash
-                    chosen_diagnostic = {
-                        "chosen_endpoint_tokens": chosen_endpoint_tokens,
-                        "checkpoint_load_latency_ms": round(load_latency_ms, 3),
-                        "walkback_blocks": len(all_block_data) - idx - 1,
-                        # Only a short content hash is exposed; the sidecar
-                        # path remains an internal implementation detail.
-                        "source_block_hash": (
-                            source_hash.hex()[:16]
-                            if isinstance(source_hash, (bytes, bytearray))
-                            else str(source_hash)[:16]
-                        ),
-                    }
-                    break
+                        source_hash = block.block_hash
+                        chosen_diagnostic = {
+                            "chosen_endpoint_tokens": chosen_endpoint_tokens,
+                            "checkpoint_load_latency_ms": round(load_latency_ms, 3),
+                            "walkback_blocks": len(all_block_data) - idx - 1,
+                            "source_block_hash": (
+                                source_hash.hex()[:16]
+                                if isinstance(source_hash, (bytes, bytearray))
+                                else str(source_hash)[:16]
+                            ),
+                            "requested_state_dtype": (
+                                lookup_diagnostic or {}
+                            ).get("requested_state_dtype"),
+                            "effective_state_codec": (
+                                lookup_diagnostic or {}
+                            ).get("effective_state_codec"),
+                            "used_legacy_fp32_fallback": (
+                                lookup_diagnostic or {}
+                            ).get("used_legacy_fp32_fallback"),
+                            "dequantized_state_count": (
+                                max(
+                                    0,
+                                    dequantizations_after
+                                    - dequantizations_before,
+                                )
+                                if dequantizations_before is not None
+                                and dequantizations_after is not None
+                                else None
+                            ),
+                        }
+                        break
+                    if chosen_idx is not None:
+                        break
 
                 if chosen_idx is None or chosen_payloads is None:
                     logger.info(

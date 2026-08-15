@@ -261,11 +261,26 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         max_kv_size=args.max_kv_size,
         pipeline_microbatch_size=args.pipeline_microbatch_size,
         cache_affinity=args.cache_affinity,
+        prompt_cache_ssd=args.prompt_cache_ssd,
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
         tuning_reason=args.tuning_reason,
     )
+
+
+def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
+    """Per-rank SSD directory for prompt-cache snapshots, or None when off.
+
+    Kept beside the runtime markers and scoped by deployment and rank, so two
+    deployments never read each other's snapshots and a rank only ever loads its
+    own layer slice.
+    """
+
+    if not args.prompt_cache_ssd:
+        return None
+    root = Path(args.state_dir).expanduser() / "prompt-cache-ssd"
+    return str(root / f"{args.deployment_id}-rank-{rank}")
 
 
 def _install_signal_handlers() -> None:
@@ -992,6 +1007,8 @@ def run_worker(args: argparse.Namespace) -> int:
                         marker,
                         execution=execution,
                         assignment=assignment,
+                        ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
+                        prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
                             rank=rank,
@@ -1097,6 +1114,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pipeline-microbatch-size", type=int, default=4)
     parser.add_argument("--auto-tune", action="store_true")
     parser.add_argument("--cache-affinity", action="store_true")
+    parser.add_argument("--prompt-cache-ssd", action="store_true")
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)

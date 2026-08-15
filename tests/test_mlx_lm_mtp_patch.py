@@ -2475,3 +2475,144 @@ class TestParkedScopePerSequence:
         _record_std_tax_sample(gb, 10.0)
         assert not hasattr(gb, "_omlx_mtp_tax_probe")
         assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+
+@pytest.fixture(autouse=True)
+def _quiet_prefill_tracker():
+    """Loop-tax probes consult the process-global prefill tracker; keep
+    every test in this module hermetic against activity left behind by
+    other suites (or by earlier tests here)."""
+    from omlx.prefill_progress import get_prefill_tracker
+
+    get_prefill_tracker().clear()
+    yield
+    get_prefill_tracker().clear()
+
+
+class TestLoopTaxHygiene:
+    """#2622: park probes must not latch contention-shaped timings.
+
+    A park that fires while another request is prefilling (any engine on
+    the shared GPU) measures a contention-inflated t0; if the std samples
+    then run after the contention ends, the t0/t_std ratio poisons
+    ``model._omlx_mtp_loop_tax`` and every later sequence exits MTP
+    against an inflated margin until restart.
+    """
+
+    def _fake_batch(self, uids):
+        return SimpleNamespace(model=SimpleNamespace(), uids=list(uids))
+
+    def _tracker(self):
+        from omlx.prefill_progress import get_prefill_tracker
+
+        return get_prefill_tracker()
+
+    def _drain_probe(self, gb, std_ms=10.0):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _record_std_tax_sample,
+        )
+
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES):
+            _record_std_tax_sample(gb, std_ms)
+
+    def test_probe_not_armed_while_prefill_live(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        self._tracker().update("r1", 10, 100, "modelA")
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_probe_not_armed_right_after_prefill_end(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        tracker = self._tracker()
+        tracker.update("r1", 10, 100, "modelA")
+        tracker.update("r1", 100, 100, "modelA")  # completes, entry popped
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_probe_discarded_when_prefill_ran_during_sampling(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES - 1):
+            _record_std_tax_sample(gb, 10.0)
+        # A prefill starts (and would end) inside the sampling window: the
+        # finalize step must throw the whole probe away.
+        self._tracker().update("r2", 10, 100, "modelB")
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+    def test_clean_probe_still_latches_with_timestamp(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7)
+        self._drain_probe(gb)
+        assert gb.model._omlx_mtp_loop_tax == pytest.approx(1.5)
+        assert hasattr(gb.model, "_omlx_mtp_loop_tax_ts")
+
+    def test_tax_log_level_by_threshold(self, caplog):
+        import logging
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        logger_name = "omlx.patches.mlx_lm_mtp.batch_generator"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            gb = self._fake_batch([7])
+            _arm_std_tax_probe(gb, 15.0, uid=7)
+            self._drain_probe(gb)  # tax 1.5 >= warn threshold
+            assert any(
+                "MTP loop tax measured" in r.message
+                and r.levelno == logging.INFO
+                for r in caplog.records
+            )
+            caplog.clear()
+            gb2 = self._fake_batch([8])
+            _arm_std_tax_probe(gb2, 11.0, uid=8)
+            self._drain_probe(gb2)  # tax 1.1 < warn threshold -> DEBUG only
+            assert not any(
+                "MTP loop tax measured" in r.message for r in caplog.records
+            )
+
+    def test_effective_loop_tax_decays_toward_default(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_DECAY_S,
+            _DepthController,
+            _effective_loop_tax,
+        )
+
+        model = SimpleNamespace()
+        assert _effective_loop_tax(model) is None
+        model._omlx_mtp_loop_tax = 1.5
+        # Legacy attribute without a timestamp passes through unchanged.
+        assert _effective_loop_tax(model) == pytest.approx(1.5)
+        model._omlx_mtp_loop_tax_ts = time.monotonic()
+        assert _effective_loop_tax(model) == pytest.approx(1.5, abs=0.01)
+        model._omlx_mtp_loop_tax_ts = time.monotonic() - 3 * _STD_TAX_DECAY_S
+        aged = _effective_loop_tax(model)
+        assert _DepthController.EXIT_MARGIN <= aged < 1.2
+
+    def test_recently_active_window(self):
+        tracker = self._tracker()
+        assert not tracker.recently_active(3.0)
+        tracker.update("r1", 10, 100, "m")
+        assert tracker.recently_active(3.0)
+        tracker.update("r1", 100, 100, "m")
+        assert tracker.recently_active(3.0)  # just-finished counts
+        tracker.clear()
+        assert not tracker.recently_active(3.0)

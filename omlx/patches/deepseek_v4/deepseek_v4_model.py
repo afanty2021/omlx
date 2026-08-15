@@ -619,8 +619,13 @@ def _native_sparse_attention_available() -> bool:
         from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
         return glm_fast.has_symbol("deepseek_v4_sparse_attention")
-    except Exception:
+    except Exception as exc:
         _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 native sparse attention unavailable; MLX fallback for "
+            "the rest of this process: %s",
+            exc,
+        )
         return False
 
 
@@ -692,8 +697,14 @@ def _sparse_pooled_attention(
                     int(compress_ratio),
                     int(local_window),
                 )
-        except Exception:
+        except Exception as exc:
             _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+            logging.getLogger(__name__).warning(
+                "DSV4 native sparse attention kernel failed; MLX fallback "
+                "for the rest of this process: %s",
+                exc,
+                exc_info=True,
+            )
 
     if native_only:
         return None
@@ -1303,8 +1314,14 @@ class Indexer(nn.Module):
                         bucketed=False,
                     )[:, 0]
                     return mx.sort(indices, axis=-1)
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native indexer top-k failed; MLX fallback "
+                    "(slower prefill) for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
 
         weights = (
             self.weights_proj(x) if projected_weights is None else projected_weights
@@ -1398,8 +1415,14 @@ def _batch_indexer_rows(
                         scores,
                         indexer.index_topk,
                     )
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native DSpark top-k failed; stable-sort fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
         if indices is None:
             indices = _stable_topk_indices(scores, indexer.index_topk)
         indices = indices[:, None]
@@ -1449,8 +1472,14 @@ def _batch_indexer_rows(
 
                 if fast.has_symbol("dspark_fp32_topk_indices"):
                     indices = fast.dspark_fp32_topk_indices(scores, k)
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native DSpark top-k failed; stable-sort fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
         if indices is None:
             indices = _stable_topk_indices(scores, k)
         indices = indices[:, None]

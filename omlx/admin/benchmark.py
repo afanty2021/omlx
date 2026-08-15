@@ -1455,14 +1455,20 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total": total_tests,
             },
         )
-        # VLM MTP requires VLMBatchedEngine (which has set_vlm_mtp_drafter),
-        # so don't force LM-only loading when VLM MTP is enabled.
-        vlm_mtp_active = (
+        # Both external VLM MTP and Lightning MTP on merged VLM checkpoints
+        # require VLMBatchedEngine. Text-only Lightning MTP models still
+        # resolve to BatchedEngine through their natural engine type.
+        external_vlm_mtp_active = (
             model_settings is not None
             and getattr(model_settings, "vlm_mtp_enabled", False)
             and getattr(model_settings, "vlm_mtp_draft_model", None)
         )
-        force_lm = True if request.force_lm_engine else not vlm_mtp_active
+        lightning_mtp_active = model_settings is not None and getattr(
+            model_settings, "mtp_enabled", False
+        )
+        force_lm = request.force_lm_engine or not (
+            external_vlm_mtp_active or lightning_mtp_active
+        )
         engine = await engine_pool.get_engine(
             request.model_id,
             force_lm=force_lm,

@@ -731,6 +731,16 @@ class TestBenchmarkEngineSelection:
         assert run.status == "completed"
 
     @pytest.mark.asyncio
+    async def test_auto_uses_vlm_engine_for_lightning_mtp(self):
+        settings = SimpleNamespace(mtp_enabled=True)
+
+        run, pool = await self._run(settings=settings)
+
+        assert pool.force_lm_values == [False]
+        assert run.experimental_features == ["mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
     async def test_force_lm_engine_overrides_vlm_mtp_auto(self):
         settings = SimpleNamespace(
             vlm_mtp_enabled=True,
@@ -741,6 +751,16 @@ class TestBenchmarkEngineSelection:
 
         assert pool.force_lm_values == [True]
         assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_force_lm_engine_overrides_lightning_mtp_auto(self):
+        settings = SimpleNamespace(mtp_enabled=True)
+
+        run, pool = await self._run(settings=settings, force_lm_engine=True)
+
+        assert pool.force_lm_values == [True]
+        assert run.experimental_features == ["mtp"]
         assert run.status == "completed"
 
     @pytest.mark.asyncio

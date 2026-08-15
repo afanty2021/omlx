@@ -697,6 +697,61 @@ class TestChatTemplateV4:
             is None
         )
 
+    def test_relocates_tool_adjacent_system_in_place(self, applied_patch):
+        # Claude Code's periodic reminders arrive after the Anthropic
+        # adapter split tool_result blocks, i.e. tool -> system -> assistant.
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        tool_call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": {"query": "x"}},
+        }
+        messages = [
+            {"role": "system", "content": "Be helpful."},
+            {"role": "user", "content": "Look it up"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Task reminder"},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        relocated = ct.relocate_mid_system_messages(messages)
+
+        assert relocated is not None
+        assert relocated[3] == {
+            "role": "latest_reminder",
+            "content": "Task reminder",
+        }
+        assert relocated[4]["role"] == "tool"
+        assert relocated[5]["role"] == "assistant"
+
+        prompt = ct.apply_chat_template(relocated, add_generation_prompt=True)
+        assert (
+            "<｜latest_reminder｜>Task reminder"
+            "<｜User｜><tool_result>result</tool_result>" in prompt
+        )
+
+    def test_relocates_tool_adjacent_system_at_tail(self, applied_patch):
+        from omlx.patches.deepseek_v4 import chat_template_v4 as ct
+
+        relocated = ct.relocate_mid_system_messages(
+            [
+                {"role": "user", "content": "Look it up"},
+                {"role": "assistant", "content": "", "tool_calls": []},
+                {"role": "tool", "tool_call_id": "c1", "content": "one"},
+                {"role": "tool", "tool_call_id": "c2", "content": "two"},
+                {"role": "system", "content": "Task reminder"},
+            ]
+        )
+
+        assert relocated is not None
+        assert relocated[2] == {
+            "role": "latest_reminder",
+            "content": "Task reminder",
+        }
+        assert [m["role"] for m in relocated[3:]] == ["tool", "tool"]
+
     def test_encode_arguments_accepts_dict(self, applied_patch):
         """Anthropic /v1/messages history stores tool_call arguments as
         a dict (anthropic_utils.py decodes the input before saving).

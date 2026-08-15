@@ -198,6 +198,70 @@ def test_qwen35_q8_route_uses_bit_specific_min_tokens():
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "group_size",
+        "nax_available",
+        "nax_qmm_kernels_built",
+        "allow_gs128",
+        "expected",
+    ),
+    [
+        (64, True, True, False, True),
+        (128, False, False, False, True),
+        (128, False, True, False, True),
+        (128, True, False, False, False),
+        (128, True, True, False, False),
+        (128, True, False, True, True),
+        (128, True, True, True, True),
+    ],
+)
+def test_qwen35_qmm_routing_uses_stock_nax_availability(
+    monkeypatch,
+    group_size,
+    nax_available,
+    nax_qmm_kernels_built,
+    allow_gs128,
+    expected,
+):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    linear = nn.QuantizedLinear(
+        256,
+        128,
+        bias=False,
+        group_size=group_size,
+        bits=4,
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+
+    monkeypatch.setattr(q4patch, "_qmm_supports_group_size", lambda _gs: True)
+    monkeypatch.setattr(q4patch, "_native_qmm_for_bits", lambda _bits: object())
+    monkeypatch.setattr(q4patch, "is_nax_available", lambda: nax_available)
+    monkeypatch.setattr(
+        fast,
+        "nax_qmm_kernels_built",
+        lambda: nax_qmm_kernels_built,
+    )
+    if allow_gs128:
+        monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", "1")
+    else:
+        monkeypatch.delenv("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", raising=False)
+
+    assert (
+        q4patch._is_supported_affine_linear_shape(
+            linear,
+            mx.bfloat16,
+            ndim=3,
+            seq_len=2048,
+            input_dim=256,
+        )
+        is expected
+    )
+
+
 def test_qwen35_q4_mlp_patch_prechecks_down_proj_before_gate_up(monkeypatch):
     fast = _require_q4_kernel()
     import mlx_lm.models.qwen3_5 as qwen35
@@ -539,32 +603,117 @@ def _quantize_module_linears(module, names, bits=4):
         )
 
 
-def test_muse_glimmer_q4_mlp_patch_bit_exact():
+def test_muse_glimmer_q4_attention_wrapper_matches_bf16_reference(monkeypatch):
+    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
+        apply_mlx_vlm_muse_glimmer_compat_patch,
+    )
+
+    apply_mlx_vlm_muse_glimmer_compat_patch()
+    from mlx_vlm.models.muse_glimmer.language import Attention
+
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    monkeypatch.setattr(
+        q4patch, "_can_route_affine_linear", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        q4patch, "_can_route_affine_linear_shape", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        q4patch,
+        "_linear_qmm",
+        lambda linear, inputs, variant: linear(inputs),
+    )
+
+    mx.random.seed(0)
+    attn = Attention(_tiny_muse_text_config(), 1)
+    attn.set_dtype(mx.bfloat16)
+    _quantize_module_linears(
+        attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
+    )
+    original_call = getattr(
+        Attention,
+        "_omlx_q4_muse_attn_original_call",
+        Attention.__call__,
+    )
+    patched_call = q4patch._make_patched_muse_attention(
+        original_call,
+        variant=8,
+        min_tokens=1,
+        q8_min_tokens=1,
+    )
+
+    inputs = mx.random.normal((1, 64, 128)).astype(mx.bfloat16)
+    patched = patched_call(attn, inputs, mask=None, cache=None)
+    reference = original_call(attn, inputs, mask=None, cache=None)
+    mx.eval(patched, reference)
+
+    assert bool(mx.array_equal(patched, reference))
+
+
+def _assert_muse_qmm_close(actual, expected):
+    # The native tile and mx.quantized_matmul use different BF16 reduction
+    # orders. Real Muse oQ checkpoints store BF16 scales and biases, so allow
+    # the observed one-ULP projection drift while keeping a tight end-to-end
+    # bound on the mirrored MLP/attention bodies.
+    max_diff = mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32)))
+    assert float(max_diff.item()) <= 0.02
+
+
+def _install_muse_qmm_spy(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    calls = {"count": 0}
+    original_qmm = q4patch._linear_qmm
+
+    def spy(*args, **kwargs):
+        calls["count"] += 1
+        return original_qmm(*args, **kwargs)
+
+    monkeypatch.setattr(q4patch, "_linear_qmm", spy)
+    return calls
+
+
+def test_muse_glimmer_q4_mlp_patch_matches_bf16_reference(monkeypatch):
     _muse_applied()
     from mlx_vlm.models.muse_glimmer.language import MLP
 
+    calls = _install_muse_qmm_spy(monkeypatch)
+
     mx.random.seed(0)
     mlp = MLP(_tiny_muse_text_config())
+    mlp.set_dtype(mx.bfloat16)
     _quantize_module_linears(mlp, ("gate_proj", "up_proj", "down_proj"))
     orig_call = type(mlp)._omlx_q4_mlp_original_call
 
     prefill = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
     decode = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
-    for x in (prefill, decode):
-        patched_out = mlp(x)
-        orig_out = orig_call(mlp, x)
-        mx.eval(patched_out, orig_out)
-        assert bool(mx.array_equal(patched_out, orig_out))
+
+    patched_out = mlp(prefill)
+    orig_out = orig_call(mlp, prefill)
+    mx.eval(patched_out, orig_out)
+    assert calls["count"] == 3
+    _assert_muse_qmm_close(patched_out, orig_out)
+
+    calls["count"] = 0
+    patched_out = mlp(decode)
+    orig_out = orig_call(mlp, decode)
+    mx.eval(patched_out, orig_out)
+    assert calls["count"] == 0
+    assert bool(mx.array_equal(patched_out, orig_out))
 
 
-def test_muse_glimmer_q4_attention_patch_bit_exact():
+def test_muse_glimmer_q4_attention_patch_matches_bf16_reference(monkeypatch):
     _muse_applied()
     from mlx_vlm.models.muse_glimmer.language import Attention
+
+    calls = _install_muse_qmm_spy(monkeypatch)
 
     mx.random.seed(0)
     config = _tiny_muse_text_config()
     for layer_idx in (0, 1):  # sliding+rope and full+NoPE
         attn = Attention(config, layer_idx)
+        attn.set_dtype(mx.bfloat16)
         _quantize_module_linears(
             attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
         )
@@ -572,22 +721,34 @@ def test_muse_glimmer_q4_attention_patch_bit_exact():
 
         prefill = mx.random.normal((1, 2048, 128)).astype(mx.bfloat16)
         decode = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
-        for x in (prefill, decode):
-            patched_out = attn(x, mask=None, cache=None)
-            orig_out = orig_call(attn, x, mask=None, cache=None)
-            mx.eval(patched_out, orig_out)
-            assert bool(mx.array_equal(patched_out, orig_out))
+
+        calls["count"] = 0
+        patched_out = attn(prefill, mask=None, cache=None)
+        orig_out = orig_call(attn, prefill, mask=None, cache=None)
+        mx.eval(patched_out, orig_out)
+        assert calls["count"] == 5
+        _assert_muse_qmm_close(patched_out, orig_out)
+
+        calls["count"] = 0
+        patched_out = attn(decode, mask=None, cache=None)
+        orig_out = orig_call(attn, decode, mask=None, cache=None)
+        mx.eval(patched_out, orig_out)
+        assert calls["count"] == 0
+        assert bool(mx.array_equal(patched_out, orig_out))
 
 
-def test_muse_glimmer_q4_attention_patch_with_cache_and_mask():
+def test_muse_glimmer_q4_attention_patch_with_cache_and_mask(monkeypatch):
     _muse_applied()
     from mlx_lm.models.base import create_attention_mask
     from mlx_vlm.models.cache import RotatingKVCache
     from mlx_vlm.models.muse_glimmer.language import Attention
 
+    calls = _install_muse_qmm_spy(monkeypatch)
+
     mx.random.seed(0)
     config = _tiny_muse_text_config()
     attn = Attention(config, 0)  # sliding layer
+    attn.set_dtype(mx.bfloat16)
     _quantize_module_linears(
         attn, ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
     )
@@ -601,5 +762,6 @@ def test_muse_glimmer_q4_attention_patch_with_cache_and_mask():
     patched_out = attn(x, mask=mask, cache=cache_a)
     orig_out = orig_call(attn, x, mask=mask, cache=cache_b)
     mx.eval(patched_out, orig_out)
-    assert bool(mx.array_equal(patched_out, orig_out))
+    assert calls["count"] == 5
+    _assert_muse_qmm_close(patched_out, orig_out)
     assert cache_a.offset == cache_b.offset

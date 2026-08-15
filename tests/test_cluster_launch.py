@@ -1047,6 +1047,37 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
     return args, plan_hash, assignments
 
 
+def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
+    from omlx.cluster.inference_worker import _prompt_cache_ssd_dir
+
+    deployment = _deployment()
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+
+    # On by default: the flag rides the one argv every host runs.
+    assert "--prompt-cache-ssd" in _worker_argv(deployment, tmp_path)
+    assert args.prompt_cache_ssd is True
+
+    # The directory is scoped by deployment and rank so no two runs or ranks
+    # read each other's snapshots.
+    rank0 = _prompt_cache_ssd_dir(args, rank=0)
+    rank1 = _prompt_cache_ssd_dir(args, rank=1)
+    assert rank0 is not None and rank1 is not None
+    assert rank0.endswith(f"{args.deployment_id}-rank-0")
+    assert rank1.endswith(f"{args.deployment_id}-rank-1")
+    assert rank0 != rank1
+
+
+def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
+    from types import SimpleNamespace
+
+    from omlx.cluster.inference_worker import _prompt_cache_ssd_dir
+
+    off = SimpleNamespace(
+        prompt_cache_ssd=False, state_dir=str(tmp_path), deployment_id="d"
+    )
+    assert _prompt_cache_ssd_dir(off, rank=0) is None
+
+
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
     deployment = _mixed_role_deployment()
 

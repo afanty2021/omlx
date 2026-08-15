@@ -162,6 +162,10 @@ class ExecutionSettings:
     max_kv_size: int | None = None
     pipeline_microbatch_size: int = 4
     cache_affinity: bool = True
+    # Snapshot the prompt cache to SSD at prefill boundaries so a model whose
+    # per-layer state cannot be sliced (rotating window, gated-delta-net) still
+    # reuses a long prefix across requests instead of recomputing it.
+    prompt_cache_ssd: bool = True
     sampling_rank_only: bool = True
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
@@ -212,6 +216,7 @@ class ExecutionSettings:
             "max_kv_size": self.max_kv_size,
             "pipeline_microbatch_size": self.pipeline_microbatch_size,
             "cache_affinity": self.cache_affinity,
+            "prompt_cache_ssd": self.prompt_cache_ssd,
             "sampling_rank_only": self.sampling_rank_only,
             "async_overlap": self.async_overlap,
             "ring_connections_per_ip": self.ring_connections_per_ip,
