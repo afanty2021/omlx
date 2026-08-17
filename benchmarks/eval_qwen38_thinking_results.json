@@ -1,0 +1,478 @@
+[
+  {
+    "label": "Qwen3.8@low",
+    "bench": "aime",
+    "accuracy": 0.8666666666666667,
+    "correct": 13,
+    "count": 15,
+    "avg_tokens": 5419,
+    "total_tokens": 81282,
+    "truncated": 2,
+    "wall_s": 5023,
+    "tok_s": 16.2,
+    "items": [
+      {
+        "ok": true,
+        "pred": "293",
+        "gold": "293",
+        "tokens": 2526,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "117",
+        "gold": "117",
+        "tokens": 1906,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "70",
+        "gold": "70",
+        "tokens": 1021,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "149",
+        "gold": "149",
+        "tokens": 3127,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "62",
+        "gold": "62",
+        "tokens": 8910,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "77",
+        "gold": "77",
+        "tokens": 1759,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "907",
+        "gold": "907",
+        "tokens": 7580,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "279",
+        "gold": "279",
+        "tokens": 4147,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "104",
+        "gold": "104",
+        "tokens": 7053,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "82",
+        "gold": "82",
+        "tokens": 5569,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "16",
+        "gold": "16",
+        "tokens": 1633,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "106",
+        "gold": "106",
+        "tokens": 2534,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "228",
+        "gold": "60",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "588",
+        "gold": "588",
+        "tokens": 8941,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "1",
+        "gold": "248",
+        "tokens": 12288,
+        "finish": "length"
+      }
+    ]
+  },
+  {
+    "label": "Qwen3.8@xhigh",
+    "bench": "aime",
+    "accuracy": 0.6,
+    "correct": 9,
+    "count": 15,
+    "avg_tokens": 7387,
+    "total_tokens": 110798,
+    "truncated": 6,
+    "wall_s": 7558,
+    "tok_s": 14.7,
+    "items": [
+      {
+        "ok": true,
+        "pred": "293",
+        "gold": "293",
+        "tokens": 6396,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "117",
+        "gold": "117",
+        "tokens": 1671,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "70",
+        "gold": "70",
+        "tokens": 835,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "8",
+        "gold": "149",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "29",
+        "gold": "62",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "77",
+        "gold": "77",
+        "tokens": 4808,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "907",
+        "gold": "907",
+        "tokens": 7058,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "279",
+        "gold": "279",
+        "tokens": 5568,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "416",
+        "gold": "104",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "82",
+        "gold": "82",
+        "tokens": 7147,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "16",
+        "gold": "16",
+        "tokens": 1424,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "106",
+        "gold": "106",
+        "tokens": 2163,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "143",
+        "gold": "60",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "1",
+        "gold": "588",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "2",
+        "gold": "248",
+        "tokens": 12288,
+        "finish": "length"
+      }
+    ]
+  },
+  {
+    "label": "Qwen3.6@think",
+    "bench": "aime",
+    "accuracy": 0.0,
+    "correct": 0,
+    "count": 15,
+    "avg_tokens": 12288,
+    "total_tokens": 184320,
+    "truncated": 15,
+    "wall_s": 13338,
+    "tok_s": 13.8,
+    "items": [
+      {
+        "ok": false,
+        "pred": "0",
+        "gold": "293",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "100",
+        "gold": "117",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "2",
+        "gold": "70",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "0",
+        "gold": "149",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "2",
+        "gold": "62",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "8",
+        "gold": "77",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "2",
+        "gold": "907",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "1",
+        "gold": "279",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "3",
+        "gold": "104",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "0",
+        "gold": "82",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "3",
+        "gold": "16",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "65",
+        "gold": "106",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "120",
+        "gold": "60",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "1",
+        "gold": "588",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": false,
+        "pred": "1",
+        "gold": "248",
+        "tokens": 12288,
+        "finish": "length"
+      }
+    ]
+  },
+  {
+    "label": "Qwen3.8@medium",
+    "bench": "aime",
+    "accuracy": 0.6666666666666666,
+    "correct": 10,
+    "count": 15,
+    "avg_tokens": 7059,
+    "total_tokens": 105889,
+    "truncated": 5,
+    "wall_s": 7387,
+    "tok_s": 14.3,
+    "items": [
+      {
+        "ok": true,
+        "pred": "293",
+        "gold": "293",
+        "tokens": 2250,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "117",
+        "gold": "117",
+        "tokens": 1844,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "70",
+        "gold": "70",
+        "tokens": 1000,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "149",
+        "gold": "149",
+        "tokens": 10771,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "4",
+        "gold": "62",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "77",
+        "gold": "77",
+        "tokens": 2207,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "0",
+        "gold": "907",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "279",
+        "gold": "279",
+        "tokens": 8808,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "2",
+        "gold": "104",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "82",
+        "gold": "82",
+        "tokens": 7943,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "16",
+        "gold": "16",
+        "tokens": 1308,
+        "finish": "stop"
+      },
+      {
+        "ok": true,
+        "pred": "106",
+        "gold": "106",
+        "tokens": 2833,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "6",
+        "gold": "60",
+        "tokens": 12288,
+        "finish": "length"
+      },
+      {
+        "ok": true,
+        "pred": "588",
+        "gold": "588",
+        "tokens": 5485,
+        "finish": "stop"
+      },
+      {
+        "ok": false,
+        "pred": "3",
+        "gold": "248",
+        "tokens": 12288,
+        "finish": "length"
+      }
+    ]
+  }
+]
