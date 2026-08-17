@@ -9,7 +9,10 @@ The small adapter at the end exposes mlx-lm's ``apply_chat_template`` API.
 
 import copy
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Special Tokens
@@ -82,6 +85,40 @@ REASONING_EFFORT_PROMPTS: Dict[str, str] = {
     ),
 }
 DEFAULT_REASONING_EFFORT = "low"
+
+# Clients send a wider vocabulary than this template's three levels (OpenAI
+# uses minimal/medium/high; Hermes uses xhigh). Map aliases onto the nearest
+# supported level instead of failing the request: a 400 here surfaces as an
+# opaque provider error in agent clients. Unknown values fall back to the
+# default rather than aborting the chat-template render.
+REASONING_EFFORT_ALIASES: Dict[str, str] = {
+    "none": "low",
+    "off": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "moderate": "high",
+    "high": "high",
+    "xhigh": "max",
+    "ultra": "max",
+    "max": "max",
+    "maximum": "max",
+}
+
+
+def normalize_reasoning_effort(value: Optional[str]) -> str:
+    """Map a client-supplied reasoning effort to a supported level."""
+    if not value:
+        return DEFAULT_REASONING_EFFORT
+    normalized = REASONING_EFFORT_ALIASES.get(str(value).strip().lower())
+    if normalized is None:
+        logger.warning(
+            "Unknown reasoning effort %r; falling back to %r",
+            value,
+            DEFAULT_REASONING_EFFORT,
+        )
+        return DEFAULT_REASONING_EFFORT
+    return normalized
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -299,10 +336,7 @@ def render_message(
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
     # Reasoning effort prefix (only at index 0 in thinking mode; "low" adds nothing)
-    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-    assert (
-        reasoning_effort in REASONING_EFFORT_PROMPTS
-    ), f"Invalid reasoning effort: {reasoning_effort}, expected one of {list(REASONING_EFFORT_PROMPTS)}"
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if index == 0 and thinking_mode == "thinking":
         prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
 
@@ -866,6 +900,25 @@ def apply_chat_template(
     if not add_generation_prompt:
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_start_token)
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_end_token)
+    elif not (
+        prepared_messages and prepared_messages[-1].get("task") is not None
+    ) and not out.endswith(
+        (
+            ASSISTANT_SP_TOKEN + thinking_start_token,
+            ASSISTANT_SP_TOKEN + thinking_end_token,
+        )
+    ):
+        # encode_messages only emits the generation anchor after a
+        # user/developer-final message. A system-final conversation (e.g. a
+        # bare title-generation instruction, or a trailing workspace/system
+        # note after the last user turn) otherwise ends without
+        # <|Assistant|><think>, and the model free-runs as document
+        # continuation until max_tokens.
+        out += ASSISTANT_SP_TOKEN + (
+            thinking_start_token
+            if encode_kwargs.get("thinking_mode", "thinking") == "thinking"
+            else thinking_end_token
+        )
     if continue_final_message and messages and messages[-1].get("role") == "assistant":
         out = out.removesuffix(eos_token)
     return out
