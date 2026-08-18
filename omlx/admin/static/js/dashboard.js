@@ -5,6 +5,7 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
+    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -27,6 +28,14 @@
         'turboquant_kv_enabled',
         'turboquant_kv_bits',
         'turboquant_skip_last',
+        'qwen35_ane_prefill_enabled',
+        'qwen35_ane_prefill_sequence_length',
+        'qwen35_ane_prefill_fraction',
+        'qwen35_ane_prefill_max_layers',
+        'qwen35_ane_prefill_dual_ane',
+        'qwen35_ane_prefill_gdn',
+        'qwen35_ane_prefill_gdn_fraction',
+        'qwen35_ane_prefill_gdn_max_layers',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -107,7 +116,7 @@
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_state_dtype: 'rht_int16' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
@@ -205,6 +214,14 @@
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
                 is_diffusion_model: false,
+                qwen35_ane_prefill_enabled: false,
+                qwen35_ane_prefill_sequence_length: 2048,
+                qwen35_ane_prefill_fraction: 0.53,
+                qwen35_ane_prefill_max_layers: 64,
+                qwen35_ane_prefill_dual_ane: true,
+                qwen35_ane_prefill_gdn: true,
+                qwen35_ane_prefill_gdn_fraction: 0.5,
+                qwen35_ane_prefill_gdn_max_layers: 48,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -6390,7 +6407,7 @@
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
                             gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
-                            gdn_sidecar_state_dtype: this.globalSettings.cache.gdn_sidecar_state_dtype,
+                            gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_context_window_policy: this.globalSettings.sampling.max_context_window_policy || null,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
@@ -6858,6 +6875,13 @@
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
             },
 
+            isQwen35AnePrefillModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
+            },
+
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
             },
@@ -7026,6 +7050,14 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
+                    qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
+                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
+                    qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
+                    qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
+                    qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
+                    qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -7572,6 +7604,16 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
+                                qwen35_ane_prefill_sequence_length: parseInt(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
+                                qwen35_ane_prefill_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_max_layers: parseInt(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
+                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
+                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
+                                qwen35_ane_prefill_gdn_fraction: parseFloat(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
+                                    : 48,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -7654,6 +7696,14 @@
                                     max_tool_result_tokens: 0,
                                     turboquant_kv_enabled: false,
                                     turboquant_kv_bits: 4,
+                                    qwen35_ane_prefill_enabled: false,
+                                    qwen35_ane_prefill_sequence_length: 2048,
+                                    qwen35_ane_prefill_fraction: 0.53,
+                                    qwen35_ane_prefill_max_layers: 64,
+                                    qwen35_ane_prefill_dual_ane: true,
+                                    qwen35_ane_prefill_gdn: true,
+                                    qwen35_ane_prefill_gdn_fraction: 0.5,
+                                    qwen35_ane_prefill_gdn_max_layers: 48,
                                     specprefill_enabled: false,
                                     specprefill_draft_model: null,
                                     specprefill_keep_pct: null,
@@ -7742,6 +7792,14 @@
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.qwen35_ane_prefill_enabled = false;
+                        this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
+                        this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
+                        this.modelSettings.qwen35_ane_prefill_max_layers = 64;
+                        this.modelSettings.qwen35_ane_prefill_dual_ane = true;
+                        this.modelSettings.qwen35_ane_prefill_gdn = true;
+                        this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
+                        this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;

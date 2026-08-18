@@ -134,6 +134,15 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
+    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
+    qwen35_ane_prefill_enabled: bool | None = None
+    qwen35_ane_prefill_sequence_length: int | None = None
+    qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_max_layers: int | None = None
+    qwen35_ane_prefill_dual_ane: bool | None = None
+    qwen35_ane_prefill_gdn: bool | None = None
+    qwen35_ane_prefill_gdn_fraction: float | None = None
+    qwen35_ane_prefill_gdn_max_layers: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -260,7 +269,7 @@ class GlobalSettingsRequest(BaseModel):
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
-    gdn_sidecar_state_dtype: str | None = None
+    gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
@@ -2289,6 +2298,66 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
+    # controls; the runtime signature below causes a loaded model to be
+    # re-created when the user applies a changed profile.
+    if "qwen35_ane_prefill_enabled" in sent:
+        enabled = bool(request.qwen35_ane_prefill_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and not config_type.startswith(
+            ("qwen3_5", "qwen3_6", "qwen3_8")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
+            )
+        current_settings.qwen35_ane_prefill_enabled = enabled
+    if "qwen35_ane_prefill_sequence_length" in sent:
+        value = request.qwen35_ane_prefill_sequence_length
+        if value is None or value < 1024 or value % 64:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+            )
+        current_settings.qwen35_ane_prefill_sequence_length = int(value)
+    if "qwen35_ane_prefill_fraction" in sent:
+        value = request.qwen35_ane_prefill_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="MLP ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_fraction = float(value)
+    if "qwen35_ane_prefill_max_layers" in sent:
+        value = request.qwen35_ane_prefill_max_layers
+        if value is None or value < 1:
+            raise HTTPException(
+                status_code=400, detail="ANE MLP layer limit must be positive."
+            )
+        current_settings.qwen35_ane_prefill_max_layers = int(value)
+    if "qwen35_ane_prefill_dual_ane" in sent:
+        current_settings.qwen35_ane_prefill_dual_ane = bool(
+            request.qwen35_ane_prefill_dual_ane
+        )
+    if "qwen35_ane_prefill_gdn" in sent:
+        current_settings.qwen35_ane_prefill_gdn = bool(request.qwen35_ane_prefill_gdn)
+    if "qwen35_ane_prefill_gdn_fraction" in sent:
+        value = request.qwen35_ane_prefill_gdn_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="GDN ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_gdn_fraction = float(value)
+    if "qwen35_ane_prefill_gdn_max_layers" in sent:
+        value = request.qwen35_ane_prefill_gdn_max_layers
+        if value is None or value < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE GDN layer limit must be zero or greater.",
+            )
+        current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -2620,6 +2689,10 @@ async def update_model_settings(
     # effect at engine construction time is changed on a loaded model.
     requires_reload = entry.engine is not None and (
         ("model_type_override" in sent and entry.engine_type != prev_engine_type)
+        # Runtime-signature fields are engine-construction settings. This
+        # catches Qwen ANE controls (and future signature additions) without
+        # requiring a second hand-maintained field list here.
+        or prev_load_signature != current_load_signature
         or "index_cache_freq" in sent
         or "dflash_enabled" in sent
         or "dflash_draft_model" in sent
@@ -3305,7 +3378,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
-            "gdn_sidecar_state_dtype": global_settings.cache.gdn_sidecar_state_dtype,
+            "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
@@ -3808,14 +3881,14 @@ async def update_global_settings(
                 detail="gdn_ssd_pending_max_size must be positive",
             )
     if (
-        request.gdn_sidecar_state_dtype is not None
-        and request.gdn_sidecar_state_dtype.lower()
+        request.gdn_sidecar_precision is not None
+        and request.gdn_sidecar_precision.lower()
         not in {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
     ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "gdn_sidecar_state_dtype must be one of: "
+                "gdn_sidecar_precision must be one of: "
                 "fp32, bf16, int8, rht_int8, rht_int16"
             ),
         )
@@ -3844,9 +3917,9 @@ async def update_global_settings(
             request.gdn_ssd_pending_max_size
         )
         cache_changed = True
-    if request.gdn_sidecar_state_dtype is not None:
+    if request.gdn_sidecar_precision is not None:
         global_settings.cache.gdn_sidecar_state_dtype = (
-            request.gdn_sidecar_state_dtype.lower()
+            request.gdn_sidecar_precision.lower()
         )
         cache_changed = True
     if request.hot_cache_max_size is not None:

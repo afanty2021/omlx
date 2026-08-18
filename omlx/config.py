@@ -117,7 +117,7 @@ class PagedSSDCacheConfig:
     clear_on_unload: bool = False  # Clear SSD cache when model is unloaded
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
-    gdn_sidecar_state_dtype: str = "rht_int16"
+    gdn_sidecar_state_dtype: str = "fp32"
 
     @property
     def gdn_snapshot_storage(self) -> str:
