@@ -36,9 +36,9 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 | oQ4 | 4 | ~4.6 | Recommended |
 | oQ5 | 5 | ~5.5 | High quality |
 | oQ6 | 6 | ~6.5 | Near-lossless |
-| oQ8 | 8 | ~8.6 | Near-lossless |
+| oQ8 | 8 | ~8.0 | Near-lossless |
 
-Base format is affine quantization (group_size=64) for all levels except 8-bit, which uses mxfp8 (group_size=32).
+Base format is affine quantization (group_size=64) for all levels.
 
 oQ and oQ+ share the same levels. oQ+ adds GPTQ-based weight optimization before quantization.
 
@@ -75,7 +75,7 @@ The GPTQ step uses Hessian-based error compensation to optimize rounding decisio
 | Tensor | Treatment |
 |--------|-----------|
 | lm_head | 8-bit (within budget) |
-| MoE router | 8-bit |
+| MoE router | fp16 |
 | shared_expert_gate | 8-bit |
 | Vision encoder | fp16 |
 | SSM state params | fp32 |
@@ -102,15 +102,7 @@ Boosts apply only to non-expert tensors. Routed experts (93-98% of MoE params) s
 
 The budget plan ensures total bpw stays within the target and hard cap for each level. The result is that every model gets a different bit allocation tailored to its specific layer sensitivities, rather than a one-size-fits-all profile.
 
-### Minimal Protection (oQ8)
-
-No budget plan. Position-based heuristics only:
-
-- lm_head: 6-bit
-- SSM output: 8-bit
-- Embedding: base+2
-- Sensitive layers (first/last 12.5%): base+1
-- Everything else: base
+Every level including oQ8 runs the full protection path shown above.
 
 ## GPTQ Weight Optimization
 
@@ -163,7 +155,7 @@ For large models (70B+), the streaming path processes tensors one at a time via 
 
 Built-in calibration dataset shipped with oQ. No download required.
 
-600 samples across 7 categories, ~726 KB total:
+600 samples across 7 categories, ~1.3 MB total:
 
 | Category | Samples | Composition |
 |----------|---------|-------------|

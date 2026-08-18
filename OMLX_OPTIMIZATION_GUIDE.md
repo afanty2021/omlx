@@ -8,7 +8,7 @@
 ## 根本原因
 1. **内存限制配置不当** - 默认配置没有充分限制模型内存
 2. **KV 缓存增长** - 长上下文对话导致 KV 缓存过度增长
-3. **并发请求过高** - 默认 max_num_seqs=8 可能对大模型过多
+3. **并发请求过高** - 默认 max_concurrent_requests=8 可能对大模型过多
 4. **未启用推测解码** - DFlash 可以提供 3-4x 加速
 
 ## 解决方案
@@ -19,16 +19,14 @@
 # 基础优化配置
 omlx serve \
   --model-dir ~/models \
-  --max-model-memory 28GB \
-  --max-process-memory 40GB \
+  --memory-guard-gb 40 \
   --max-concurrent-requests 4 \
   --log-level info
 
 # 启用 SSD 缓存（适合长上下文）
 omlx serve \
   --model-dir ~/models \
-  --max-model-memory 28GB \
-  --max-process-memory 40GB \
+  --memory-guard-gb 40 \
   --paged-ssd-cache-dir ~/.omlx/cache \
   --paged-ssd-cache-max-size 50GB \
   --hot-cache-max-size 8GB \
@@ -79,7 +77,8 @@ pip install dflash-mlx
 {
   "dflash_enabled": true,
   "dflash_draft_model": "/path/to/qwen2.5-14b-4bit",
-  "dflash_draft_quant_bits": 4
+  "dflash_draft_quant_enabled": true,
+  "dflash_draft_quant_weight_bits": 4
 }
 ```
 
@@ -103,8 +102,7 @@ watch -n 2 'mx.get_active_memory() / 1024**3'  # Python
 
 | 参数 | 推荐值 | 说明 |
 |------|--------|------|
-| `--max-model-memory` | 28GB | 模型权重 + KV 缓存上限 |
-| `--max-process-memory` | 40GB | 总进程内存限制（留 8GB 给系统） |
+| `--memory-guard-gb` | 40 | 总内存上限（留 8GB 给系统） |
 | `--max-concurrent-requests` | 4 | 降低并发以减少内存峰值 |
 | `--paged-ssd-cache-max-size` | 50GB | SSD 缓存大小 |
 | `--hot-cache-max-size` | 8GB | 热缓存（内存）大小 |

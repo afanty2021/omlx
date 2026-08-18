@@ -23,8 +23,8 @@ oMLX 是专为 Apple Silicon 优化的 LLM 推理引擎，提供连续批处理�
 ### 技术栈
 
 **核心框架：**
-- Python 3.10+
-- MLX >= 0.31.1（Apple 机器学习框架）
+- Python 3.11–3.13
+- MLX 0.32.0（Apple 机器学习框架）
 - FastAPI + Uvicorn（Web 服务器）
 - mlx-lm（LLM 推理）
 - mlx-vlm（视觉语言模型）
@@ -32,14 +32,14 @@ oMLX 是专为 Apple Silicon 优化的 LLM 推理引擎，提供连续批处理�
 
 **关键依赖：**
 ```toml
-mlx>=0.31.1
-mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e3
-mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@23e1dff
+mlx==0.32.0
+mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e
+mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb
 mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa
-dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@814c4a1 (v0.1.3)
+dflash-mlx @ git+https://github.com/jundot/dflash-mlx@2eb169f (v0.1.10+omlx.5)
 fastapi>=0.108.0
 uvicorn>=0.23.0
-transformers>=5.0.0,<5.4.0
+transformers>=5.12.1,<5.13
 ```
 
 ## 架构设计
@@ -241,8 +241,7 @@ omlx serve --model-dir ~/models
 
 # 自定义配置
 omlx serve --model-dir ~/models \
-  --max-model-memory 32GB \
-  --max-process-memory 80% \
+  --memory-guard-gb 32 \
   --paged-ssd-cache-dir ~/.omlx/cache \
   --hot-cache-max-size 20% \
   --max-concurrent-requests 16

@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -90,7 +90,7 @@ pip install -e ".[mcp]"   # MCP (Model Context Protocol) 포함
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
+Python 3.11–3.13와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
 
 ## 빠른 시작
 
@@ -144,7 +144,7 @@ Apple Silicon에서 텍스트 LLM, 비전-언어 모델(VLM), OCR 모델, 임베
 
 ### 관리자 대시보드
 
-`/admin`에서 실시간 모니터링, 모델 관리, 채팅, 벤치마크, 모델별 설정을 위한 웹 UI를 제공합니다. 한국어, 영어, 일본어, 중국어, 러시아어를 지원합니다. 모든 CDN 의존성이 번들되어 완전한 오프라인 운영이 가능합니다.
+`/admin`에서 실시간 모니터링, 모델 관리, 채팅, 벤치마크, 모델별 설정을 위한 웹 UI를 제공합니다. 한국어, 영어, 일본어, 중국어, 중국어 번체, 프랑스어, 러시아어, 스페인어, 브라질 포르투갈어를 지원합니다. 모든 CDN 의존성이 번들되어 완전한 오프라인 운영이 가능합니다.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 관리자 대시보드" width="720">
@@ -264,7 +264,7 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
-위에 나열되지 않은 모델도 채팅 템플릿이 `tools`를 허용하고 출력이 인식 가능한 `<tool_call>` XML 형식을 사용하면 작동할 수 있습니다. Tool calling이 포함된 스트리밍 요청은 모든 콘텐츠를 버퍼링한 후 완료 시 결과를 전송합니다.
+위에 나열되지 않은 모델도 채팅 템플릿이 `tools`를 허용하고 출력이 인식 가능한 `<tool_call>` XML 형식을 사용하면 작동할 수 있습니다. 도구 호출이 활성화된 스트리밍 요청에서는 알려진 도구 호출 제어 마크업을 표시 콘텐츠에서 숨기면서 어시스턴트 텍스트를 점진적으로 내보내며, 구조화된 도구 호출은 전체 턴 파싱이 완료된 후 전송됩니다.
 
 ## 모델
 
@@ -297,11 +297,11 @@ omlx start
 omlx stop
 omlx restart
 
-# 로드된 모델의 메모리 제한
-omlx serve --model-dir ~/models --max-model-memory 32GB
+# 시작 시 메모리 가드 등급 선택 (기본값: balanced)
+omlx serve --model-dir ~/models --memory-guard safe
 
-# 프로세스 수준 메모리 제한 (기본값: auto = RAM - 8GB)
-omlx serve --model-dir ~/models --max-process-memory 80%
+# GB 단위로 사용자 지정 메모리 가드 상한 설정
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # KV 블록용 SSD 캐시 활성화
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache

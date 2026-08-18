@@ -232,8 +232,7 @@ def provide_recommendations():
 
     recommendations = [
         "1. 设置合理的内存限制:",
-        "   --max-model-memory 28GB",
-        "   --max-process-memory 40GB",
+        "   --memory-guard-gb 40",
         "",
         "2. 降低并发请求数:",
         "   --max-concurrent-requests 4",

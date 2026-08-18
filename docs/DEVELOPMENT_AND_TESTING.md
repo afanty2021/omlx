@@ -1,7 +1,7 @@
 # oMLX 开发与测试指南（本机实操）
 
-> 最后更新：2026-06-18
-> 适用版本：oMLX v0.4.4
+> 最后更新：2026-08-19
+> 适用版本：oMLX v0.6.1
 > 定位：记录在本机（Apple Silicon）开发与测试 oMLX 的**实操流程与踩过的坑**。
 > 通用贡献流程（Fork / PR / License）见 [CONTRIBUTING.md](CONTRIBUTING.md)；本文档聚焦**本机环境与运行陷阱**。
 
@@ -34,7 +34,7 @@ $PY -m pytest -m "not slow and not integration"
 
 ### 1.1 ⚠️ 必须使用 `Quant-3.11` conda 环境
 
-oMLX **不能**用系统 `/opt/homebrew/bin/omlx` 或裸 `python3` 运行。当前代码（v0.4.4）的 `omlx/speculative/vlm_mtp.py` 硬依赖 `mlx_vlm.speculative` 子模块，需要 `mlx-vlm >= 0.6.1`。
+oMLX **不能**用系统 `/opt/homebrew/bin/omlx` 或裸 `python3` 运行。当前代码（v0.6.1）的 `omlx/speculative/vlm_mtp.py` 硬依赖 `mlx_vlm.speculative` 子模块，需要 `mlx-vlm >= 0.6.1`。
 
 | 环境 | python | mlx-vlm | `speculative` | 结果 |
 |------|--------|---------|---------------|------|

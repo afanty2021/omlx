@@ -26,7 +26,8 @@
       "_comment": "推测解码（需要安装 dflash-mlx）",
       "dflash_enabled": false,
       "dflash_draft_model": null,
-      "dflash_draft_quant_bits": null,
+      "dflash_draft_quant_enabled": null,
+      "dflash_draft_quant_weight_bits": null,
 
       "_comment": "SpecPrefill（MoE 模型稀疏预填充）",
       "specprefill_enabled": false,

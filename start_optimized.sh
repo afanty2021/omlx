@@ -6,8 +6,7 @@ set -e
 
 # 配置参数
 MODEL_DIR="${MODEL_DIR:-$HOME/models}"
-MAX_MODEL_MEMORY="${MAX_MODEL_MEMORY:-28GB}"
-MAX_PROCESS_MEMORY="${MAX_PROCESS_MEMORY:-40GB}"
+MEMORY_GUARD_GB="${MEMORY_GUARD_GB:-40}"
 MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS:-4}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 PORT="${PORT:-8000}"
@@ -32,8 +31,7 @@ echo ""
 # 显示配置
 echo "配置参数："
 echo "  模型目录: $MODEL_DIR"
-echo "  最大模型内存: $MAX_MODEL_MEMORY"
-echo "  最大进程内存: $MAX_PROCESS_MEMORY"
+echo "  内存保护上限: ${MEMORY_GUARD_GB}GB"
 echo "  最大并发请求: $MAX_CONCURRENT_REQUESTS"
 echo "  日志级别: $LOG_LEVEL"
 echo "  端口: $PORT"
@@ -63,8 +61,7 @@ fi
 # 构建启动命令
 CMD="omlx serve"
 CMD="$CMD --model-dir $MODEL_DIR"
-CMD="$CMD --max-model-memory $MAX_MODEL_MEMORY"
-CMD="$CMD --max-process-memory $MAX_PROCESS_MEMORY"
+CMD="$CMD --memory-guard-gb $MEMORY_GUARD_GB"
 CMD="$CMD --max-concurrent-requests $MAX_CONCURRENT_REQUESTS"
 CMD="$CMD --log-level $LOG_LEVEL"
 CMD="$CMD --port $PORT"

@@ -57,7 +57,7 @@ DFlashEngine is a `BaseEngine` implementation that:
 | `omlx/patches/dflash_laguna.py` | Laguna target adapter, gated drafter, fused-QKV loader, and mixed-cache rollback |
 | `omlx/engine/__init__.py` | DFlashEngine export (required dependency) |
 | `omlx/engine_pool.py` | DFlash routing: checks `dflash_enabled` before engine type switch |
-| `omlx/model_settings.py` | Per-model settings: `dflash_enabled`, `dflash_draft_model`, `dflash_draft_quant_bits` |
+| `omlx/model_settings.py` | Per-model settings: `dflash_enabled`, `dflash_draft_model`, `dflash_draft_quant_*` |
 | `omlx/admin/routes.py` | Admin API: settings CRUD + `requires_reload` on dflash changes |
 | `omlx/admin/templates/dashboard/_modal_model_settings.html` | UI: toggle, draft model dropdown, quantization selector |
 | `omlx/admin/static/js/dashboard.js` | Frontend settings binding |
@@ -67,7 +67,7 @@ DFlashEngine is a `BaseEngine` implementation that:
 
 ### Dependency
 
-- `dflash-mlx` pinned to `jundot/dflash-mlx` (v0.1.10+omlx.4)
+- `dflash-mlx` pinned to `jundot/dflash-mlx` (v0.1.10+omlx.5)
 - Listed as required dependency in `pyproject.toml`; the mac-app release
   lockfiles are regenerated from it by the packaging pipeline
 

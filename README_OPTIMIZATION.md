@@ -49,8 +49,7 @@ pkill -f "omlx serve"
 
 ### 内存限制
 ```bash
---max-model-memory 28GB      # 模型权重 + KV 缓存上限
---max-process-memory 40GB    # 总进程内存限制
+--memory-guard-gb 40          # 总内存上限（留 8GB 给系统）
 ```
 
 ### 并发控制
@@ -90,7 +89,8 @@ pip install dflash-mlx
 {
   "dflash_enabled": true,
   "dflash_draft_model": "/path/to/draft-model",
-  "dflash_draft_quant_bits": 4
+  "dflash_draft_quant_enabled": true,
+  "dflash_draft_quant_weight_bits": 4
 }
 ```
 

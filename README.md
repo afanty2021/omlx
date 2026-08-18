@@ -160,7 +160,7 @@ Supports text LLMs, vision-language models (VLM), OCR models, embeddings, and re
 
 ### Admin Dashboard
 
-Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, French, Russian, Spanish, and Brazilian Portuguese. All CDN dependencies are vendored for fully offline operation.
+Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, Traditional Chinese, French, Russian, Spanish, and Brazilian Portuguese. All CDN dependencies are vendored for fully offline operation.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
@@ -249,24 +249,6 @@ Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, and Pi directly from th
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
 </p>
-
-### Ollama Integration
-
-oMLX includes scripts for integrating with local Ollama instances, enabling you to use Ollama models across your local network:
-
-- **Server Setup**: Configure Ollama for LAN access with `scripts/ollama_network_setup.sh`
-- **Client Tools**: Shell scripts and Python clients for easy model access
-- **Claude Code Integration**: Use Ollama models from Claude Code CLI on any network machine
-
-```bash
-# Quick server configuration
-./scripts/ollama_network_setup.sh
-
-# Client usage
-OLLAMA_HOST=http://192.168.2.19:11434 ./scripts/ollama_chat.sh "Your question"
-```
-
-See [Ollama Network Setup Guide](docs/OLLAMA_NETWORK_SETUP.md) for complete documentation.
 
 ### Performance Benchmark
 

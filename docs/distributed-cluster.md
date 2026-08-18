@@ -150,7 +150,7 @@ On the coordinator:
 3. Select **Downloaded model**, choose its local directory, set a reserve for
    KV/activations, and build the unequal plan.
 4. Select JACCL, JACCL Ring, or the TCP Ring fallback and choose an execution
-   profile. Leave **Auto benchmark & tune** enabled to calibrate both Macs and
+   profile. Leave **Auto tune** enabled to calibrate both Macs and
    the selected link before the final shard plan is stored.
 5. Review the final measured shard map, then activate.
 6. Load or request that model through the normal oMLX API. If it was already

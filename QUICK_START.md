@@ -36,8 +36,7 @@ pkill -f "omlx serve" 2>/dev/null || true
 
 | 参数 | 原值 | 优化值 | 效果 |
 |------|------|--------|------|
-| max-model-memory | 未限制 | 28GB | 限制模型内存使用 |
-| max-process-memory | 未限制 | 40GB | 总内存上限，留 8GB 给系统 |
+| memory-guard-gb | 未设置（默认 balanced） | 40 | 总内存上限，留 8GB 给系统 |
 | max-concurrent-requests | 8 | 4 | 减少并发压力 |
 | turboquant_kv_bits | 4 | 3 | KV 缓存压缩，减少 25% 内存 |
 | max_context_window | 未限制 | 8192 | 限制上下文长度 |
@@ -54,7 +53,7 @@ pkill -f "omlx serve" 2>/dev/null || true
 ### 如果内存仍然过高:
 ```bash
 # 进一步减少内存限制
-export MAX_MODEL_MEMORY=24GB
+export MEMORY_GUARD_GB=24
 export HOT_CACHE_MAX_SIZE=4GB
 
 # 或启用更激进的 KV 压缩
@@ -106,7 +105,8 @@ pip install dflash-mlx
 {
   "dflash_enabled": true,
   "dflash_draft_model": "/path/to/qwen2.5-14b-4bit",
-  "dflash_draft_quant_bits": 4
+  "dflash_draft_quant_enabled": true,
+  "dflash_draft_quant_weight_bits": 4
 }
 ```
 
@@ -132,7 +132,7 @@ export HOT_CACHE_MAX_SIZE=8GB
 
 - 查看详细指南: `cat OMLX_OPTIMIZATION_GUIDE.md`
 - 运行诊断: `./diagnose.sh`
-- 检查日志: `tail -f ~/.omlx/logs/omlx.log`
+- 检查日志: `tail -f ~/.omlx/logs/server.log`
 - GitHub Issues: https://github.com/jundot/omlx/issues
 
 ---

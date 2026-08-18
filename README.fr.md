@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -91,7 +91,7 @@ pip install -e ".[mcp]"   # Avec support MCP (Model Context Protocol)
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4).
+Nécessite macOS 15.0+ (Sequoia), Python 3.11–3.13, et Apple Silicon (M1/M2/M3/M4).
 
 ## Démarrage rapide
 
@@ -135,7 +135,7 @@ Prend en charge les LLM texte, les modèles vision-langage (VLM), les modèles O
 
 ### Tableau de bord Admin
 
-Interface web sur `/admin` pour le monitoring en temps réel, la gestion des modèles, le chat, les benchmarks et les réglages par modèle. Disponible en anglais, coréen, japonais, chinois, français et russe. Toutes les dépendances CDN sont incluses pour un fonctionnement entièrement hors-ligne.
+Interface web sur `/admin` pour le monitoring en temps réel, la gestion des modèles, le chat, les benchmarks et les réglages par modèle. Disponible en anglais, coréen, japonais, chinois, chinois traditionnel, français, russe, espagnol et portugais brésilien. Toutes les dépendances CDN sont incluses pour un fonctionnement entièrement hors-ligne.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
@@ -282,11 +282,11 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 ## Configuration CLI
 
 ```bash
-# Limite mémoire pour les modèles chargés
-omlx serve --model-dir ~/models --max-model-memory 32GB
+# Choisir un niveau de garde mémoire au démarrage (par défaut : balanced)
+omlx serve --model-dir ~/models --memory-guard safe
 
-# Limite mémoire au niveau du processus (par défaut : auto = RAM - 8 Go)
-omlx serve --model-dir ~/models --max-process-memory 80%
+# Définir un plafond de garde mémoire personnalisé en Go
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # Activer le cache SSD pour les blocs KV
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache

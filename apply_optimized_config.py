@@ -104,7 +104,7 @@ def main():
     print()
     print("下一步:")
     print("1. 使用优化启动脚本: ./start_optimized.sh")
-    print("2. 或手动启动: omlx serve --max-model-memory 28GB --max-process-memory 40GB")
+    print("2. 或手动启动: omlx serve --memory-guard-gb 40")
     print()
 
 if __name__ == "__main__":

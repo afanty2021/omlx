@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -90,7 +90,7 @@ pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
+需要 macOS 15.0+ (Sequoia), Python 3.11–3.13 和 Apple Silicon（M1/M2/M3/M4）。
 
 ## 快速开始
 
@@ -134,7 +134,7 @@ brew services info omlx     # 查看状态
 
 ### 管理后台
 
-在 `/admin` 提供实时监控、模型管理、聊天、基准测试和模型级设置的 Web UI。支持英语、韩语、日语、中文和俄语。所有 CDN 依赖已内置，完全支持离线运行。
+在 `/admin` 提供实时监控、模型管理、聊天、基准测试和模型级设置的 Web UI。支持英语、韩语、日语、中文、繁体中文、法语、俄语、西班牙语和巴西葡萄牙语。所有 CDN 依赖已内置，完全支持离线运行。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理后台" width="720">
@@ -282,11 +282,11 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 ## CLI 配置
 
 ```bash
-# 已加载模型的内存限制
-omlx serve --model-dir ~/models --max-model-memory 32GB
+# 启动时选择内存保护级别（默认：balanced）
+omlx serve --model-dir ~/models --memory-guard safe
 
-# 进程级内存限制（默认：auto = RAM - 8GB）
-omlx serve --model-dir ~/models --max-process-memory 80%
+# 以 GB 为单位设置自定义内存保护上限
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # 启用 KV 块的 SSD 缓存
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache

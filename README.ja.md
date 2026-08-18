@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -90,7 +90,7 @@ pip install -e ".[mcp]"   # MCP（Model Context Protocol）サポート付き
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+とApple Silicon（M1/M2/M3/M4）が必要です。
+Python 3.11–3.13とApple Silicon（M1/M2/M3/M4）が必要です。
 
 ## クイックスタート
 
@@ -134,7 +134,7 @@ Apple SiliconでテキストLLM、ビジョン言語モデル（VLM）、OCRモ�
 
 ### 管理画面
 
-`/admin`でリアルタイム監視、モデル管理、チャット、ベンチマーク、モデル別設定のためのWeb UIを提供します。英語、韓国語、日本語、中国語、ロシア語に対応。すべてのCDN依存関係がバンドルされ、完全オフラインでの運用が可能です。
+`/admin`でリアルタイム監視、モデル管理、チャット、ベンチマーク、モデル別設定のためのWeb UIを提供します。英語、韓国語、日本語、中国語、繁体中文、フランス語、ロシア語、スペイン語、ブラジルポルトガル語に対応。すべてのCDN依存関係がバンドルされ、完全オフラインでの運用が可能です。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理画面" width="720">
@@ -254,7 +254,7 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
-上記に記載されていないモデルでも、チャットテンプレートが`tools`を受け入れ、出力が認識可能な`<tool_call>` XML形式を使用していれば動作する可能性があります。ツール呼び出しを含むストリーミングリクエストはすべてのコンテンツをバッファリングし、完了時に結果を送信します。
+上記に記載されていないモデルでも、チャットテンプレートが`tools`を受け入れ、出力が認識可能な`<tool_call>` XML形式を使用していれば動作する可能性があります。ツール呼び出しを含むストリーミングリクエストでは、既知のツール呼び出し制御マークアップを表示コンテンツから隠しつつアシスタントテキストを逐次排出し、構造化されたツール呼び出しはターン全体のパース完了後に送信されます。
 
 ## モデル
 
@@ -282,11 +282,11 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 ## CLI 設定
 
 ```bash
-# ロード済みモデルのメモリ上限
-omlx serve --model-dir ~/models --max-model-memory 32GB
+# 起動時にメモリガード tier を選択（デフォルト: balanced）
+omlx serve --model-dir ~/models --memory-guard safe
 
-# プロセスレベルのメモリ上限（デフォルト: auto = RAM - 8GB）
-omlx serve --model-dir ~/models --max-process-memory 80%
+# GB単位でカスタムメモリガード上限を設定
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # KVブロック用SSDキャッシュを有効化
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
