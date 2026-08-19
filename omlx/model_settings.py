@@ -137,10 +137,12 @@ class ModelSettings:
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+        dflash_draft_window_size: Draft model sliding-attention window
+            (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
         dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (None = dflash default 64).
+            (default 0, disabling sink tokens).
+        dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
@@ -254,11 +256,11 @@ class ModelSettings:
         False  # Requires in-memory cache and an omlx paged SSD cache dir
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
-    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
-    # agentic workloads where acceptance drops on the default sliding window.
+    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
+    # sliding_window when present; sink size defaults to no attention-sink tokens.
     dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = 0
+    dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
@@ -1158,6 +1160,10 @@ class ModelSettingsManager:
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
+            # Keep persistent profile application consistent with request-time
+            # profile overlays: output-shaping settings win over the speed-only
+            # VLM MTP toggle when the merged settings need logits processors.
+            merged, _ = resolve_vlm_mtp_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:

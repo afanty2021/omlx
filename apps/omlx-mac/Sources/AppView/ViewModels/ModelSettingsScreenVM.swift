@@ -44,7 +44,7 @@ final class ModelSettingsScreenVM {
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
         case dflashDraftQuantEnabled, dflashDraftQuantWeightBits
         case dflashDraftQuantActivationBits, dflashDraftQuantGroupSize
-        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize
+        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
         case mtpEnabled
@@ -198,10 +198,13 @@ final class ModelSettingsScreenVM {
     ]
 
     static let qwen35AneFractionOptions: [(String, String)] = [
+        ("0.15", "15%"),
+        ("0.25", "25%"),
+        ("0.35", "35%"),
         ("0.4", "40%"),
         ("0.45", "45%"),
         ("0.5", "50%"),
-        ("0.53", "53% — measured MLP"),
+        ("0.53", "53%"),
         ("0.55", "55%"),
         ("0.6", "60%"),
     ]
@@ -285,6 +288,10 @@ final class ModelSettingsScreenVM {
     var qwen35AnePrefillGdn: Bool = true
     var qwen35AnePrefillGdnFraction: String = "0.5"
     var qwen35AnePrefillGdnMaxLayers: String = "48"
+    var aneTuningID: String?
+    var aneTuningIsRunning: Bool = false
+    var aneTuningStatus: ANETuningStatusResponse?
+    var aneTuningIsApplying: Bool = false
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -306,7 +313,8 @@ final class ModelSettingsScreenVM {
     var dflashMaxCtx: String = ""
     var dflashVerifyMode: String = ""
     var dflashDraftWindowSize: String = ""
-    var dflashDraftSinkSize: String = ""
+    var dflashDraftSinkSize: String = "0"
+    var dflashBlockSize: String = ""
     var dflashInMemoryCache: Bool = false
     var dflashInMemoryCacheGib: String = "8"
     var dflashInMemoryCacheMaxEntries: String = "4"
@@ -393,7 +401,7 @@ final class ModelSettingsScreenVM {
             return true
         case .dflashDraftQuantActivationBits, .dflashDraftQuantGroupSize:
             return true
-        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashDraftSinkSize:
+        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashDraftSinkSize, .dflashBlockSize:
             return true
         case .dflashInMemoryCache, .dflashInMemoryCacheGib:
             return true
@@ -458,6 +466,11 @@ final class ModelSettingsScreenVM {
     func markProfileDirty() { self.profileDirty = true }
 
     func load(modelID: String, client: OMLXClient) async {
+        if self.modelID != modelID {
+            aneTuningID = nil
+            aneTuningIsRunning = false
+            aneTuningStatus = nil
+        }
         self.modelID = modelID
         do {
             let models = try await client.listModels().models
@@ -525,7 +538,8 @@ final class ModelSettingsScreenVM {
                 self.dflashMaxCtx = s?.dflashMaxCtx.map(String.init) ?? ""
                 self.dflashVerifyMode = s?.dflashVerifyMode ?? ""
                 self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
-                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? ""
+                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? "0"
+                self.dflashBlockSize = s?.dflashBlockSize.map(String.init) ?? ""
                 self.dflashInMemoryCache = s?.dflashInMemoryCache ?? false
                 self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s?.dflashInMemoryCacheMaxBytes)
                     .map(String.init) ?? "8"
@@ -683,6 +697,7 @@ final class ModelSettingsScreenVM {
         case .dflashVerifyMode:        patch.dflashVerifyMode = dflashVerifyMode.isEmpty ? nil : dflashVerifyMode
         case .dflashDraftWindowSize:   patch.dflashDraftWindowSize = Int(dflashDraftWindowSize)
         case .dflashDraftSinkSize:     patch.dflashDraftSinkSize = Int(dflashDraftSinkSize)
+        case .dflashBlockSize:         patch.dflashBlockSize = Int(dflashBlockSize)
         case .dflashInMemoryCache:
             patch.dflashInMemoryCache = dflashInMemoryCache
             if !dflashInMemoryCache {
@@ -708,6 +723,90 @@ final class ModelSettingsScreenVM {
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
+        }
+    }
+
+    func startANETuning(client: OMLXClient) async {
+        guard !aneTuningIsRunning else { return }
+        guard let sequenceLength = Int(qwen35AnePrefillSequenceLength) else {
+            lastError = "ANE prompt block must be a number."
+            return
+        }
+        aneTuningIsRunning = true
+        aneTuningStatus = nil
+        lastError = nil
+        do {
+            let started = try await client.startANETuning(
+                ANETuningStartRequest(
+                    modelId: modelID,
+                    sequenceLength: sequenceLength,
+                    repeats: 2
+                )
+            )
+            aneTuningID = started.tuningId
+            while aneTuningIsRunning {
+                let snapshot = try await client.getANETuningResults(
+                    tuningId: started.tuningId
+                )
+                aneTuningStatus = snapshot
+                if snapshot.status != "running" {
+                    aneTuningIsRunning = false
+                    if snapshot.status == "error" {
+                        lastError = snapshot.error ?? "ANE tuning failed."
+                    }
+                    break
+                }
+                try await Task.sleep(for: .seconds(1))
+            }
+        } catch is CancellationError {
+            aneTuningIsRunning = false
+        } catch {
+            aneTuningIsRunning = false
+            lastError = error.omlxDescription
+        }
+    }
+
+    func cancelANETuning(client: OMLXClient) async {
+        guard let tuningID = aneTuningID, aneTuningIsRunning else { return }
+        do {
+            _ = try await client.cancelANETuning(tuningId: tuningID)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    func applyANETuningRecommendation(client: OMLXClient) async {
+        guard let recommendation = aneTuningStatus?.recommendation else { return }
+        aneTuningIsApplying = true
+        defer { aneTuningIsApplying = false }
+
+        var patch = ModelSettingsPatch()
+        patch.qwen35AnePrefillEnabled = recommendation.enabled
+        patch.qwen35AnePrefillSequenceLength = recommendation.sequenceLength
+        if recommendation.enabled {
+            patch.qwen35AnePrefillFraction = recommendation.mlpFraction
+            patch.qwen35AnePrefillDualAne = true
+            patch.qwen35AnePrefillGdn = recommendation.gdnEnabled
+            if recommendation.gdnEnabled {
+                patch.qwen35AnePrefillGdnFraction = recommendation.gdnFraction
+            }
+        }
+
+        do {
+            _ = try await client.updateModelSettings(id: modelID, patch: patch)
+            qwen35AnePrefillEnabled = recommendation.enabled
+            qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+            if let fraction = recommendation.mlpFraction {
+                qwen35AnePrefillFraction = Self.formatPct(fraction)
+            }
+            qwen35AnePrefillDualAne = true
+            qwen35AnePrefillGdn = recommendation.gdnEnabled
+            if let fraction = recommendation.gdnFraction {
+                qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
+            }
+            lastError = nil
+        } catch {
+            lastError = error.omlxDescription
         }
     }
 
@@ -991,6 +1090,7 @@ final class ModelSettingsScreenVM {
                 }
                 putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
                 putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
+                putInt(ProfileSettingsKey.dflashBlockSize, dflashBlockSize)
                 putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
                 if dflashInMemoryCache {
                     if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {

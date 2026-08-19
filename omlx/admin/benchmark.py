@@ -346,6 +346,7 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_ssd_cache",
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
+    "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
     "mtp_num_draft_tokens",
@@ -1736,8 +1737,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             )
             # The settings flag only records intent. The load-time patch stores
             # what it actually compiled on the model, so the trace and the
-            # uploaded metadata reflect the runtime state (the patch can skip
-            # itself, e.g. on NAX GPUs, or drop layers at the program budget).
+            # uploaded metadata reflect the runtime state (the patch can find
+            # no eligible layers or drop layers at the program budget).
             loaded_model = getattr(engine, "_model", None)
             compiled_mlp = getattr(
                 loaded_model, "_omlx_ane_mlp_prefill_count", None

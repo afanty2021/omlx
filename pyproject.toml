@@ -121,14 +121,16 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.5 (2eb169f) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # dflash-mlx v0.1.10+omlx.6 (b7f6255) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
     # fired upstream), the single-host-sync decode cycle (one D2H transfer
     # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
     # target exports, and Muse Glimmer target/drafter support (bundled
     # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
-    # FP32 Muse Glimmer query scaling parity with mlx-vlm.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@2eb169f461ad6b3c5b58e29025f8afb07f23cf3e",
+    # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
+    # support (sampling params + candidate selector, PR 6), min_p with the
+    # mlx-lm sampler filter order, and the sink=0 empty-chunk L2 write fix.
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@b7f625504a733216d9e06caa3f7847a048241d94",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 
@@ -143,7 +145,7 @@ grammar = [
     "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
 ]
 modelscope = [
     "modelscope>=1.10.0",
@@ -178,7 +180,7 @@ paroquant = [
 # git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
 # separately via --no-deps post-resolution.
 bundle = [
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
     "modelscope>=1.10.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
@@ -204,7 +206,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
     # The torch-stub smoke test (tests/test_torch_stub.py) gates
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
@@ -228,7 +230,7 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.5.0",
+    "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.3",
     "apache-tvm-ffi==0.1.11",
