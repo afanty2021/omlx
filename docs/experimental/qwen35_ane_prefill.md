@@ -19,16 +19,19 @@ logits remain on GPU.
 - The dual path is intended for M3 Ultra, where the two dies expose physical
   ANE instances 1 and 2.
 - The oMLX native custom kernels must be built (`OMLX_WITH_CUSTOM_KERNEL=1`).
-- Dense Qwen3.5/3.6/3.8 affine q4 gate/up linears with group size 64 or 128.
+- Dense Qwen3.5/3.6/3.8 affine q4, q5, q6, or q8 gate/up linears with group
+  size 64 or 128.
   The down projection may use compatible affine q2/q4/q5/q6/q8 weights and
   remains on the GPU.
-- Optional GDN acceleration accepts affine q4/q5 projections with group size
-  64 or 128. Mixed q4/q5 layouts are supported when the ANE prefix covers the
-  full z projection, leaving a homogeneous qkv suffix on the GPU.
-- An MLP prefill call whose flattened token count exactly matches the fixed
-  configured sequence length. Decode, target verification, short chunks, and
-  unsupported layers automatically use the existing path.
-- Fixed-shape ANE programs and their combined q4 suffixes are prepared eagerly
+- Optional GDN acceleration accepts affine q4/q5/q6/q8 projections with group
+  size 64 or 128. Mixed q4/q5/q6/q8 layouts are supported when the ANE prefix
+  covers the full z projection, leaving a homogeneous qkv suffix on the GPU.
+- An MLP prefill call whose flattened token count matches the fixed configured
+  sequence length, or a single-prompt call that is wider: wide chunks are tiled
+  internally into fixed-shape blocks plus a residual tail on the ordinary
+  quantized linears. Decode, target verification, chunks narrower than the
+  fixed shape, and unsupported layers automatically use the existing path.
+- Fixed-shape ANE programs and their combined affine suffixes are prepared eagerly
   on the MLX executor while the model starts. For the 64-layer 27B target this
   adds a substantial startup phase, but the first matching prompt no longer
   pays the compilation cost. Programs are cached for the model's lifetime.
@@ -47,6 +50,13 @@ metallib is missing at runtime, the suffix quietly falls back to the
 classic Metal kernels, and `OMLX_QWEN35_QMM_NAX=0` forces that fallback.
 `OMLX_QWEN35_ANE_PREFILL=0` keeps the whole feature off everywhere
 regardless of the per-model setting.
+
+The ANE GDN dispatch runs through the mlx-lm prefill linear patch, so
+`OMLX_QWEN35_Q4_LM_LINEAR=0` disables ANE GDN acceleration as well as the
+standalone GPU qmm routing. GDN b/a suffix projections follow the same q8
+token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
+(default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
+where the native q8 tile is not profitable.
 
 ## Per-model settings
 
@@ -97,12 +107,23 @@ working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
-When the feature is active, oMLX aligns the scheduler's prompt chunk size with
-the configured fixed ANE shape. This also overrides the wider Qwen prefill
-floor used on high-memory systems. A 4,096-token ANE shape is supported, but a
-4K benchmark request prefills only 4,095 tokens because the final token is
-reserved for generation kickoff. The default remains 2,048 so 4K prompts still
-route one full chunk through ANE.
+The split tuner calibrates MLP gate/up and GDN work between ANE and GPU. It
+packages several widths from one real MLP and GDN layer into a small temporary
+procedure bank, measures the production native paths, and eagerly compiles
+only the predicted full-model candidate. Timings from that application-level
+run rebalance the ANE and GPU branch rates once before a final verification.
+This avoids a full-model grid while retaining end-to-end prompt throughput as
+the recommendation criterion.
+
+The scheduler keeps its normal prompt chunk width; chunks wider than the
+compiled ANE shape are tiled internally. sequence_length must therefore not
+exceed the delivered chunk width: chunks narrower than the compiled shape
+cannot tile onto it, and the load logs a warning when the configuration can
+never execute. With boundary caching on, delivered chunks are cut at the
+2,048-token cache block edge, so 2,048 remains the safe default everywhere.
+A 4K benchmark request prefills only 4,095 tokens because the final token is
+reserved for generation kickoff; the benchmark screen's ANE alignment option
+adds one token so an exact multiple of the fixed shape is prefilled.
 
 The throughput-benchmark screen also offers a **Full · 2,048** warm-up. The
 scheduler reserves the last prompt token for the first decode step, so this
@@ -114,8 +135,9 @@ Every native throughput-benchmark trial emits INFO-level comparison traces to
 cache offset, model/cache evaluation time, and non-model overhead), while
 `[benchmark-ane-profile]` records actual native MLP/GDN operation counts and
 the same input-ready, ANE-evaluation, GPU-QMM, gap, and duty-cycle counters used
-by the offline benchmark. `[benchmark-ane-summary]` explicitly reports the
-expected fixed-shape calls and residual GPU tail. Ordinary inference requests
+by the offline benchmark. `[benchmark-ane-summary]` reports the observed
+fixed-shape tiles and residual tail when the scheduler trace is available,
+falling back to a prompt-length estimate otherwise. Ordinary inference requests
 do not enable these counters or emit the per-chunk trace.
 
 Qwen's configured padding token (`<|endoftext|>` for the tested checkpoint) is

@@ -83,9 +83,11 @@ NATIVE_SYMBOLS = (
     "qwen35_ane_q4_affine_qmm_t",
     "qwen35_ane_affine_qmm_t",
     "qwen35_ane_q4_swiglu_t",
+    "qwen35_ane_affine_swiglu_t",
     "qwen35_ane_compile_linear_bank",
     "qwen35_ane_dual_affine_qmm_t",
     "qwen35_ane_dual_q4_swiglu_t",
+    "qwen35_ane_dual_affine_swiglu_t",
     "qwen35_ane_q4_swiglu_down_t",
 )
 
@@ -176,6 +178,7 @@ def qwen35_ane_affine_qmm_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    profile_category: int = 1,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_affine_qmm_t"):
         raise RuntimeError("ANE hybrid affine qmm native kernel is unavailable")
@@ -188,6 +191,7 @@ def qwen35_ane_affine_qmm_t(
         bits,
         variant,
         group_size,
+        profile_category,
     )
 
 
@@ -264,6 +268,30 @@ def qwen35_ane_q4_swiglu_t(
     )
 
 
+def qwen35_ane_affine_swiglu_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_affine_swiglu_t"):
+        raise RuntimeError("ANE hybrid affine SwiGLU native kernel is unavailable")
+    return _ext.qwen35_ane_affine_swiglu_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model,
+        bits,
+        variant,
+        group_size,
+    )
+
+
 def qwen35_ane_dual_affine_qmm_t(
     x: mx.array,
     gpu_weight: mx.array,
@@ -274,6 +302,7 @@ def qwen35_ane_dual_affine_qmm_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    profile_category: int = 1,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_qmm_t"):
         raise RuntimeError("Dual ANE hybrid affine qmm native kernel is unavailable")
@@ -287,6 +316,7 @@ def qwen35_ane_dual_affine_qmm_t(
         bits,
         variant,
         group_size,
+        profile_category,
     )
 
 
@@ -309,6 +339,34 @@ def qwen35_ane_dual_q4_swiglu_t(
         gpu_biases,
         ane_model0,
         ane_model1,
+        variant,
+        group_size,
+    )
+
+
+def qwen35_ane_dual_affine_swiglu_t(
+    x: mx.array,
+    gpu_weight: mx.array,
+    gpu_scales: mx.array,
+    gpu_biases: mx.array,
+    ane_model0,
+    ane_model1,
+    bits: int,
+    variant: int = 8,
+    group_size: int = 128,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_swiglu_t"):
+        raise RuntimeError(
+            "Dual ANE hybrid affine SwiGLU native kernel is unavailable"
+        )
+    return _ext.qwen35_ane_dual_affine_swiglu_t(
+        x,
+        gpu_weight,
+        gpu_scales,
+        gpu_biases,
+        ane_model0,
+        ane_model1,
+        bits,
         variant,
         group_size,
     )

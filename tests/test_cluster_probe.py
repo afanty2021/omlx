@@ -204,6 +204,14 @@ def test_parse_invalid_thunderbolt_payload_returns_no_ports():
     assert probe.parse_thunderbolt_ports(result) == ()
 
 
+def test_collect_status_does_not_advertise_an_ssh_user():
+    # Dropped until a consumer lands: an unvalidated login-name string on the
+    # wire is exactly the shape the validate_ssh_target fix exists to keep out
+    # of ssh argv construction.
+    status = probe.collect_cluster_status()
+    assert "ssh_user" not in status.to_dict()["node"]
+
+
 def test_mlx_version_uses_core_module_version(monkeypatch):
     monkeypatch.setattr(probe.hardware, "HAS_MLX", True)
     monkeypatch.setattr(

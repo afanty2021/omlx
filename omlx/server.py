@@ -176,6 +176,7 @@ from .api.utils import (
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
+from .engine.distributed import DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -822,6 +823,31 @@ async def scheduler_queue_full_handler(
         content=content,
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(DistributedInferenceError)
+async def distributed_unavailable_handler(
+    request: FastAPIRequest, exc: DistributedInferenceError
+):
+    """Map a failed distributed cluster check to a clean HTTP 503.
+
+    The distributed engine's preflight health gate raises this before the
+    StreamingResponse is built, which is what turns a dead or half-dead
+    cluster into an honest error instead of an empty 200 whose failure only
+    surfaces mid-stream (#2708). Errors raised after streaming has started
+    still land in-band; this handler covers every pre-commit path.
+    """
+    logger.warning(
+        "%s %s -> 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(str(exc), 503)
+    else:
+        content = {"detail": str(exc)}
+    return JSONResponse(status_code=503, content=content)
 
 
 def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
@@ -1950,11 +1976,13 @@ def init_server(
         scheduler_config=scheduler_config,
     )
     from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.incidents import configure_cluster_incidents
     from .cluster.registry import configure_cluster_registry
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)
@@ -6338,9 +6366,13 @@ async def create_response(
                 cached_tokens=output.cached_tokens,
             )
 
+            # Surface max_output_tokens truncation so clients can tell an
+            # incomplete turn from a natural stop. The Responses API has no
+            # finish_reason field; status + incomplete_details is the signal.
+            truncated = getattr(output, "finish_reason", None) == "length"
             response_obj = ResponseObject(
                 model=request.model,
-                status="completed",
+                status="incomplete" if truncated else "completed",
                 output=output_items,
                 usage=usage,
                 tools=request.tools or [],
@@ -6349,6 +6381,7 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
+                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
             )
 
             # Store response
@@ -7050,13 +7083,15 @@ async def stream_responses_api(
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
-    # 13. response.completed — MUST always be sent
+    # 13. Emit the terminal event matching the final response status.
+    truncated = getattr(last_output, "finish_reason", None) == "length"
+    terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,
         "object": "response",
         "created_at": initial_response.created_at,
         "model": request.model,
-        "status": "completed",
+        "status": "incomplete" if truncated else "completed",
         "output": output_items,
         "usage": usage_data,
         "tool_choice": request.tool_choice or "auto",
@@ -7069,14 +7104,16 @@ async def stream_responses_api(
         "top_p": request.top_p,
         "max_output_tokens": request.max_output_tokens,
     }
+    if truncated:
+        final_response["incomplete_details"] = {"reason": "max_output_tokens"}
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id
 
     seq += 1
     yield format_sse_event(
-        "response.completed",
+        terminal_event,
         {
-            "type": "response.completed",
+            "type": terminal_event,
             "response": final_response,
             "sequence_number": seq,
         },
