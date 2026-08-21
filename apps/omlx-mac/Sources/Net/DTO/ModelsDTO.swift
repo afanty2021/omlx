@@ -105,12 +105,20 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     let qwen35AnePrefillEnabled: Bool?
     let qwen35AnePrefillSequenceLength: Int?
+    let qwen35AnePrefillTailPaddingMinTokens: Int?
     let qwen35AnePrefillFraction: Double?
+    let qwen35AnePrefillFusedDown: Bool?
     let qwen35AnePrefillMaxLayers: Int?
     let qwen35AnePrefillDualAne: Bool?
     let qwen35AnePrefillGdn: Bool?
     let qwen35AnePrefillGdnFraction: Double?
     let qwen35AnePrefillGdnMaxLayers: Int?
+    let qwen35AnePrefillCpuEnabled: Bool?
+    let qwen35AnePrefillCpuFraction: Double?
+    let qwen35AnePrefillCpuDownFraction: Double?
+    let qwen35AnePrefillCpuGdnFraction: Double?
+    let qwen35AnePrefillCpuThreads: Int?
+    let qwen35AnePrefillCpuSharedResource: Bool?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -179,12 +187,20 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillEnabled: Bool? = nil
     var qwen35AnePrefillSequenceLength: Int? = nil
+    var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
     var qwen35AnePrefillFraction: Double? = nil
+    var qwen35AnePrefillFusedDown: Bool? = nil
     var qwen35AnePrefillMaxLayers: Int? = nil
     var qwen35AnePrefillDualAne: Bool? = nil
     var qwen35AnePrefillGdn: Bool? = nil
     var qwen35AnePrefillGdnFraction: Double? = nil
     var qwen35AnePrefillGdnMaxLayers: Int? = nil
+    var qwen35AnePrefillCpuEnabled: Bool? = nil
+    var qwen35AnePrefillCpuFraction: Double? = nil
+    var qwen35AnePrefillCpuDownFraction: Double? = nil
+    var qwen35AnePrefillCpuGdnFraction: Double? = nil
+    var qwen35AnePrefillCpuThreads: Int? = nil
+    var qwen35AnePrefillCpuSharedResource: Bool? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

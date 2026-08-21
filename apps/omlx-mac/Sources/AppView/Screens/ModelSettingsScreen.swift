@@ -914,6 +914,8 @@ private struct EntryEditor: View {
     let client: OMLXClient
     let entryID: UUID
 
+    private static let reasoningEffortValueWidth: CGFloat = 130
+
     @Environment(\.omlxTheme) private var theme
 
     private var entry: ChatTemplateKwargEntry {
@@ -989,36 +991,21 @@ private struct EntryEditor: View {
                 forceCheckbox
             }
         case .reasoningEffort:
-            VStack(alignment: .leading, spacing: 6) {
+            ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
-                    if entry.usesCustomReasoningEffort {
-                        TextInput(
-                            text: vm.bindProfile(binding.reasoningEffortCustomValue),
-                            placeholder: "0.9",
-                            mono: true,
-                            width: 130
-                        )
-                    } else {
-                        Popup(
-                            selection: vm.bindProfile(binding.value),
-                            width: 130,
-                            options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
-                                ($0, $0)
-                            }
-                        )
+                    customReasoningEffortToggle
+                    reasoningEffortValueControl
+                        .frame(width: Self.reasoningEffortValueWidth)
+                    forceCheckbox
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        customReasoningEffortToggle
+                        reasoningEffortValueControl
+                            .frame(width: Self.reasoningEffortValueWidth)
                     }
                     forceCheckbox
                 }
-                Toggle(isOn: vm.bindProfile(binding.usesCustomReasoningEffort)) {
-                    Text(String(
-                        localized: "settings.advanced.chat_template.reasoning_effort.custom",
-                        defaultValue: "Custom",
-                        comment: "Checkbox label that enables a custom reasoning_effort value"
-                    ))
-                    .font(.omlxText(11))
-                    .foregroundStyle(theme.textSecondary)
-                }
-                .toggleStyle(.checkbox)
             }
         case .custom:
             VStack(alignment: .leading, spacing: 6) {
@@ -1036,6 +1023,40 @@ private struct EntryEditor: View {
                     forceCheckbox
                 }
             }
+        }
+    }
+
+    private var customReasoningEffortToggle: some View {
+        Toggle(isOn: vm.bindProfile(binding.usesCustomReasoningEffort)) {
+            Text(String(
+                localized: "settings.advanced.chat_template.reasoning_effort.custom",
+                defaultValue: "Custom",
+                comment: "Checkbox label that enables a custom reasoning_effort value"
+            ))
+            .font(.omlxText(11))
+            .foregroundStyle(theme.textSecondary)
+        }
+        .toggleStyle(.checkbox)
+    }
+
+    @ViewBuilder
+    private var reasoningEffortValueControl: some View {
+        if entry.usesCustomReasoningEffort {
+            TextInput(
+                text: vm.bindProfile(binding.reasoningEffortCustomValue),
+                placeholder: "0.9",
+                mono: true,
+                width: Self.reasoningEffortValueWidth
+            )
+        } else {
+            Popup(
+                selection: vm.bindProfile(binding.value),
+                width: Self.reasoningEffortValueWidth,
+                fillsWidth: true,
+                options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
+                    ($0, $0)
+                }
+            )
         }
     }
 
@@ -1106,10 +1127,9 @@ private struct ExperimentalSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        // Most experimental fields are profile edits. Qwen ANE controls are
-        // load-time hardware settings, so they save directly to the model;
-        // leaving them as working-profile-only edits makes a visually enabled
-        // switch a no-op until an unrelated profile action is performed.
+        // Experimental fields, including Qwen ANE controls, are profile
+        // edits. Applying a profile persists the load-time settings and the
+        // engine picks them up when it reloads.
         ListGroup {
             if vm.isQwen35AnePrefillModel {
                 Row(label: String(localized: "settings.experimental.qwen_ane.label",
@@ -1118,22 +1138,31 @@ private struct ExperimentalSection: View {
                     sublabel: String(localized: "settings.experimental.qwen_ane.sub",
                                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
                                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
-                    Toggle("", isOn: saved(
-                        $vm.qwen35AnePrefillEnabled,
-                        field: .qwen35AnePrefillEnabled
-                    ))
+                    Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
                         .labelsHidden().toggleStyle(.switch)
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
                     sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
-                                     defaultValue: "Calibrates ANE and GPU work on real model layers, then verifies the predicted split end to end. Saved settings change only when you apply the result.",
+                                     defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
                         if !vm.aneTuningIsRunning {
                             Menu("Tuner overrides") {
+                                Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
+                                Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
+                                    .disabled(!vm.aneTuningAllowCPU)
+                                Toggle("Allow CPU down projection", isOn: $vm.aneTuningAllowCPUDown)
+                                    .disabled(!vm.aneTuningAllowCPU)
                                 Toggle("Allow GDN on ANE", isOn: $vm.aneTuningAllowANEGDN)
+                                Toggle("Allow GDN on CPU", isOn: $vm.aneTuningAllowCPUGDN)
+                                    .disabled(!vm.aneTuningAllowCPU || !vm.aneTuningAllowANEGDN)
+                                Toggle(
+                                    "Allow performance-aware CPU scheduling",
+                                    isOn: $vm.aneTuningAllowCPUSharedResource
+                                )
+                                .disabled(!vm.aneTuningAllowCPU)
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
@@ -1163,13 +1192,14 @@ private struct ExperimentalSection: View {
                                 .foregroundStyle(theme.textSecondary)
                                 .lineLimit(2)
                                 .multilineTextAlignment(.trailing)
-                            Button(vm.aneTuningIsApplying ? "Applying…" : "Apply result") {
-                                Task {
-                                    await vm.applyANETuningRecommendation(client: client)
-                                }
+                            Button("Use result") {
+                                vm.applyANETuningRecommendation()
                             }
                             .buttonStyle(.omlx(.primary, size: .small))
-                            .disabled(vm.aneTuningIsApplying)
+                            Button("Tune again") {
+                                Task { await vm.startANETuning(client: client) }
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
                         } else {
                             Button("Tune for this Mac") {
                                 Task { await vm.startANETuning(client: client) }
@@ -1234,13 +1264,21 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.sequence.sub",
                                          defaultValue: "Only prompt chunks exactly matching this token count use the ANE path. 2,048 is the measured default.",
                                          comment: "Sublabel explaining the fixed Qwen ANE prompt block size")) {
-                        TextInput(text: $vm.qwen35AnePrefillSequenceLength,
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength),
                                   placeholder: "2048", mono: true,
                                   isNumeric: true, range: 1024...262_144,
                                   step: 64, width: 190)
-                            .onSubmit {
-                                Task { await vm.save(.qwen35AnePrefillSequenceLength, client: client) }
-                            }
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.tail_padding.label",
+                                      defaultValue: "Pad Intermediate Tails From",
+                                      comment: "Row label for the Qwen ANE intermediate tail threshold"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.tail_padding.sub",
+                                         defaultValue: "Residual projection blocks at least this large are zero-padded to the ANE shape. Zero disables padding; Tune ANE Split calculates the crossover.",
+                                         comment: "Sublabel explaining Qwen ANE intermediate tail padding")) {
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillTailPaddingMinTokens),
+                                  placeholder: "0", mono: true,
+                                  isNumeric: true, range: 0...262_143,
+                                  step: 1, width: 190)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
@@ -1248,13 +1286,10 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_fraction.sub",
                                          defaultValue: "Output channels assigned to both ANEs; the GPU handles the remainder.",
                                          comment: "Sublabel explaining the Qwen MLP ANE workload fraction")) {
-                        TextInput(text: $vm.qwen35AnePrefillFraction,
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillFraction),
                                   placeholder: "0.53", mono: true,
                                   isNumeric: true, range: 0.05...0.90,
                                   step: 0.005, width: 190)
-                            .onSubmit {
-                                Task { await vm.save(.qwen35AnePrefillFraction, client: client) }
-                            }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_layers.label",
                                       defaultValue: "MLP Layer Limit",
@@ -1262,11 +1297,10 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.mlp_layers.sub",
                                          defaultValue: "Maximum eligible MLP layers prepared eagerly. The selected default covers the measured 64-layer model.",
                                          comment: "Sublabel explaining the maximum number of Qwen MLP ANE layers")) {
-                        TextInput(text: $vm.qwen35AnePrefillMaxLayers,
-                                  placeholder: "64", mono: true, width: 90)
-                            .onSubmit {
-                                Task { await vm.save(.qwen35AnePrefillMaxLayers, client: client) }
-                            }
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillMaxLayers),
+                                  placeholder: "64", mono: true,
+                                  isNumeric: true, range: 1...256,
+                                  step: 1, width: 190)
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.dual.label",
                                       defaultValue: "Use Both ANEs",
@@ -1274,11 +1308,72 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.dual.sub",
                                          defaultValue: "Pin one resident procedure bank to each physical ANE. Recommended on M3 Ultra.",
                                          comment: "Sublabel describing dual-ANE Qwen prefill")) {
-                        Toggle("", isOn: saved(
-                            $vm.qwen35AnePrefillDualAne,
-                            field: .qwen35AnePrefillDualAne
-                        ))
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillDualAne))
                             .labelsHidden().toggleStyle(.switch)
+                    }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.cpu.label",
+                                      defaultValue: "Share MLP Work with CPU",
+                                      comment: "Row label for optional CPU participation in Qwen MLP prefill"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.cpu.sub",
+                                         defaultValue: "Requires a separate q4 checkpoint clone whose floating tensors are FP16. Retune the ANE MLP share when enabled.",
+                                         comment: "Constraint and tuning guidance for Qwen CPU prefill sharing")) {
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuEnabled))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                    if vm.qwen35AnePrefillCpuEnabled {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_fraction.label",
+                                          defaultValue: "MLP on CPU",
+                                          comment: "Row label for the Qwen MLP CPU workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_fraction.sub",
+                                             defaultValue: "Gate/up output channels assigned to CPU FP16 matrix multiplication.",
+                                             comment: "Sublabel explaining the Qwen MLP CPU workload fraction")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuFraction),
+                                      placeholder: "0.135", mono: true,
+                                      isNumeric: true, range: 0...0.25,
+                                      step: 0.005, width: 190)
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_threads.label",
+                                          defaultValue: "CPU Workers",
+                                          comment: "Row label for the requested Accelerate CPU worker count"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_threads.sub",
+                                             defaultValue: "Eight is the measured starting point. Automatic delegates worker selection to Accelerate.",
+                                             comment: "Sublabel explaining the Qwen CPU worker setting")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuThreads),
+                                      placeholder: "8", mono: true,
+                                      isNumeric: true, range: 0...64,
+                                      step: 1, width: 190)
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.label",
+                                          defaultValue: "Down Projection on CPU",
+                                          comment: "Row label for the Qwen MLP down-projection CPU workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_down_fraction.sub",
+                                             defaultValue: "Optional second-stage split. Disabled by default; 20% was the best isolated starting point.",
+                                             comment: "Sublabel explaining the Qwen down-projection CPU workload fraction")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuDownFraction),
+                                      placeholder: "0", mono: true,
+                                      isNumeric: true, range: 0...0.50,
+                                      step: 0.005, width: 190)
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_gdn_fraction.label",
+                                          defaultValue: "GDN on CPU",
+                                          comment: "Row label for the Qwen GDN CPU workload fraction"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_gdn_fraction.sub",
+                                             defaultValue: "Residual GDN QKV channels assigned to CPU FP16 matrix multiplication alongside ANE and GPU.",
+                                             comment: "Sublabel explaining the Qwen GDN CPU workload fraction")) {
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillCpuGdnFraction),
+                                      placeholder: "0", mono: true,
+                                      isNumeric: true, range: 0...0.50,
+                                      step: 0.005, width: 190)
+                        }
+                        Row(label: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.label",
+                                          defaultValue: "Performance-Aware Scheduling",
+                                          comment: "Row label for the shared-resource CPU scheduler hint"),
+                            sublabel: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.sub",
+                                             defaultValue: "Distributes independent CPU shards across processor clusters and falls back automatically when unsupported.",
+                                             comment: "Sublabel explaining performance-aware CPU scheduling")) {
+                            Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuSharedResource))
+                                .labelsHidden().toggleStyle(.switch)
+                        }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.gdn.label",
                                       defaultValue: "Accelerate GDN",
@@ -1286,10 +1381,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.gdn.sub",
                                          defaultValue: "Also split eligible GDN z+qkv input projections across ANE and GPU.",
                                          comment: "Sublabel describing Qwen GDN ANE acceleration")) {
-                        Toggle("", isOn: saved(
-                            $vm.qwen35AnePrefillGdn,
-                            field: .qwen35AnePrefillGdn
-                        ))
+                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillGdn))
                             .labelsHidden().toggleStyle(.switch)
                     }
                     if vm.qwen35AnePrefillGdn {
@@ -1299,13 +1391,10 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_fraction.sub",
                                              defaultValue: "GDN projection channels assigned to both ANEs; the GPU handles the remainder.",
                                              comment: "Sublabel explaining the Qwen GDN ANE workload fraction")) {
-                            TextInput(text: $vm.qwen35AnePrefillGdnFraction,
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnFraction),
                                       placeholder: "0.5", mono: true,
                                       isNumeric: true, range: 0.05...0.90,
                                       step: 0.005, width: 190)
-                                .onSubmit {
-                                    Task { await vm.save(.qwen35AnePrefillGdnFraction, client: client) }
-                                }
                         }
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_layers.label",
                                           defaultValue: "GDN Layer Limit",
@@ -1313,13 +1402,10 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.gdn_layers.sub",
                                              defaultValue: "Maximum eligible GDN layers prepared eagerly. The selected default covers 48 layers.",
                                              comment: "Sublabel explaining the maximum number of Qwen GDN ANE layers")) {
-                            TextInput(text: $vm.qwen35AnePrefillGdnMaxLayers,
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillGdnMaxLayers),
                                       placeholder: "48", mono: true,
                                       isNumeric: true, range: 0...256,
                                       step: 1, width: 190)
-                                .onSubmit {
-                                    Task { await vm.save(.qwen35AnePrefillGdnMaxLayers, client: client) }
-                                }
                         }
                     }
                 }
@@ -1603,15 +1689,6 @@ private struct ExperimentalSection: View {
         }
     }
 
-    private func saved<T: Equatable>(
-        _ binding: Binding<T>,
-        field: ModelSettingsScreenVM.Field
-    ) -> Binding<T> {
-        vm.bind(binding) {
-            Task { await vm.save(field, client: client) }
-        }
-    }
-
     private var vlmMtpOwnsSpeculativePathReason: String {
         String(localized: "settings.speculative.conflict.vlm_mtp",
                defaultValue: "Disable VLM MTP before enabling this feature.",
@@ -1692,12 +1769,25 @@ private struct ExperimentalSection: View {
             )
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
-        var parts = ["MLP ANE \(mlp)%"]
+        var parts = [
+            recommendation.fusedDown == true
+                ? "Fused MLP per ANE \(mlp)%"
+                : "MLP ANE \(mlp)%"
+        ]
         if recommendation.gdnEnabled {
             let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
             parts.append("GDN ANE \(gdn)%")
         } else {
             parts.append("GDN off")
+        }
+        if recommendation.cpuEnabled == true {
+            let gate = Int(((recommendation.cpuFraction ?? 0) * 100).rounded())
+            let down = Int(((recommendation.cpuDownFraction ?? 0) * 100).rounded())
+            let gdn = Int(((recommendation.cpuGdnFraction ?? 0) * 100).rounded())
+            parts.append("CPU \(gate)%/\(down)%/\(gdn)%")
+        }
+        if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
+            parts.append("Pad tails ≥\(threshold)")
         }
         return String(
             format: "%@ · %.1f tok/s (%+.1f%%)",

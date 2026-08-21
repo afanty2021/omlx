@@ -369,12 +369,20 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_draft_block_size",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",
     "qwen35_ane_prefill_dual_ane",
     "qwen35_ane_prefill_gdn",
     "qwen35_ane_prefill_gdn_fraction",
     "qwen35_ane_prefill_gdn_max_layers",
+    "qwen35_ane_prefill_cpu_enabled",
+    "qwen35_ane_prefill_cpu_fraction",
+    "qwen35_ane_prefill_cpu_down_fraction",
+    "qwen35_ane_prefill_cpu_gdn_fraction",
+    "qwen35_ane_prefill_cpu_threads",
+    "qwen35_ane_prefill_cpu_shared_resource",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(

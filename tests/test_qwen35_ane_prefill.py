@@ -52,6 +52,11 @@ class _MLP(nn.Module):
         )
 
 
+def _no_bank_builder(sequence_length):
+    """Force the pre-builder staging path regardless of the built extension."""
+    raise RuntimeError("bank builder disabled for this test")
+
+
 class _Model(nn.Module):
     def __init__(self, count):
         super().__init__()
@@ -67,6 +72,79 @@ class _GDN(nn.Module):
         self.in_proj_z = nn.QuantizedLinear(128, 128, bias=False, group_size=64, bits=5)
         self.in_proj_b = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
         self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=5)
+
+
+class _Q6MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=6
+        )
+        self.up_proj = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=6
+        )
+        self.down_proj = nn.QuantizedLinear(
+            256, 128, bias=False, group_size=64, bits=6
+        )
+        for linear in (self.gate_proj, self.up_proj, self.down_proj):
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+
+
+class _Q6GDN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=6
+        )
+        self.in_proj_z = nn.QuantizedLinear(
+            128, 128, bias=False, group_size=64, bits=6
+        )
+        self.in_proj_b = nn.QuantizedLinear(
+            128, 48, bias=False, group_size=64, bits=6
+        )
+        self.in_proj_a = nn.QuantizedLinear(
+            128, 48, bias=False, group_size=64, bits=6
+        )
+        for linear in (
+            self.in_proj_qkv,
+            self.in_proj_z,
+            self.in_proj_b,
+            self.in_proj_a,
+        ):
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+
+
+def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
+    assert ane_patch._eligible_pair(_Q6MLP())
+    assert ane_patch._eligible_gdn(_Q6GDN())
+
+
+@pytest.mark.parametrize(
+    ("bits", "symbol"),
+    [
+        (4, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"),
+        (5, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+        (6, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+        (8, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+    ],
+)
+def test_cpu_gate_kernel_keeps_q4_specialized(bits, symbol):
+    assert ane_patch._cpu_gate_kernel_symbol(bits) == symbol
+
+
+@pytest.mark.parametrize(
+    ("bits", "symbol"),
+    [
+        (4, "qwen35_ane_cpu_fp16_q4_swiglu_t"),
+        (5, "qwen35_ane_cpu_fp16_swiglu_t"),
+        (6, "qwen35_ane_cpu_fp16_swiglu_t"),
+        (8, "qwen35_ane_cpu_fp16_swiglu_t"),
+    ],
+)
+def test_cpu_gate_kernel_selects_single_ane_symbols(bits, symbol):
+    assert ane_patch._cpu_gate_kernel_symbol(bits, dual=False) == symbol
 
 
 class _OQ4eMLP(nn.Module):
@@ -277,6 +355,56 @@ def test_mlp_wide_call_tiles_full_blocks_and_keeps_gpu_tail(monkeypatch):
     assert result[:, 2048:].tolist()[0][0][0] == 30
 
 
+def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
+    calls = []
+
+    def exact(_mlp, block, _target_verify=False):
+        calls.append((int(block.shape[-2]), float(mx.sum(block).item())))
+        return mx.full(block.shape, 7, dtype=block.dtype)
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            2048, 0.53, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 4095, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    assert result is not None
+    mx.eval(result)
+
+    assert result.shape == (1, 4095, 8)
+    assert calls == [(2048, 16384.0), (2048, 16376.0)]
+    assert bool(mx.all(result == 7))
+
+
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+    seen = []
+
+    def exact(_mlp, block, _target_verify=False):
+        seen.append(block)
+        return block + 2
+
+    monkeypatch.setattr(ane_patch, "_backend_exact", exact)
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
+            2048, 0.53, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    assert result is not None
+    mx.eval(result, *seen)
+
+    assert result.shape == x.shape
+    assert seen[0].shape == (1, 2048, 8)
+    assert bool(mx.all(seen[0][:, :1400] == 1))
+    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(result == 3))
+
+
 def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
     calls = []
 
@@ -347,6 +475,33 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
     ]
     assert [part[0, 0, 0].item() for part in result] == [1, 2, 3, 4]
     assert [part[0, -1, 0].item() for part in result] == [10, 20, 30, 40]
+
+
+def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
+    calls = []
+
+    def exact(_gdn, block, _target_verify=False):
+        calls.append((int(block.shape[-2]), float(mx.sum(block).item())))
+        return tuple(
+            mx.full((1, block.shape[-2], 1), value, dtype=block.dtype)
+            for value in (1, 2, 3, 4)
+        )
+
+    monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    gdn = SimpleNamespace(
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(
+            2048, 0.50, 8, tail_padding_min_tokens=1358
+        )
+    )
+    x = mx.ones((1, 4095, 8), dtype=mx.float16)
+
+    result = ane_patch._gdn_backend(gdn, x)
+    assert result is not None
+    mx.eval(*result)
+
+    assert [part.shape for part in result] == [(1, 4095, 1)] * 4
+    assert calls == [(2048, 16384.0), (2048, 16376.0)]
+    assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
 def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
@@ -449,6 +604,74 @@ def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_cpu_shared_resource_scheduler_is_capability_guarded(
+    monkeypatch, available
+):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(
+        fast, "qwen35_cpu_shared_resource_available", lambda: available
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    captured = []
+
+    def enable_banks(model, candidates, config, **kwargs):
+        captured.append(config)
+        return (1, 1, 0, 2)
+
+    monkeypatch.setattr(ane_patch, "_enable_dual_procedure_banks", enable_banks)
+    model = _Model(1)
+    model.layers[0].gate_proj.scales = model.layers[0].gate_proj.scales.astype(
+        mx.float16
+    )
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        cpu_fraction=0.125,
+        cpu_threads=8,
+        cpu_shared_resource=True,
+    )
+
+    assert count == 1
+    assert captured[0].cpu_threads == 8
+    assert captured[0].cpu_shared_resource is available
+
+
+def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    mlp = _MLP()
+    linear = mlp.down_proj
+    linear.scales = linear.scales.astype(mx.float16)
+    linear.biases = linear.biases.astype(mx.float16)
+    state = ane_patch._prepare_cpu_linear(linear, 0.5)
+
+    assert state is not None
+    assert state.weight.shape == (64, 256)
+    assert state.gpu_weight.shape[0] == 64
+
+    captured = []
+
+    def hybrid(*args):
+        captured.append(args)
+        return mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    monkeypatch.setattr(fast, "qwen35_cpu_fp16_affine_qmm_t", hybrid)
+    result = ane_patch._post_ane_linear(
+        linear,
+        mx.zeros((1, 1, 256), dtype=mx.float16),
+        8,
+        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
+        cpu_state=state,
+        cpu_threads=8,
+        cpu_shared_resource=True,
+    )
+
+    assert result.shape == (1, 1, 128)
+    assert captured[0][-2:] == (8, True)
+
+
 def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
@@ -509,6 +732,9 @@ def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
 def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -555,10 +781,33 @@ def test_bank_chunk_spans_respects_byte_cap():
     assert ane_patch._bank_chunk_spans(weights, 1 << 30) == [(0, 4)]
 
 
+def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
+    weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(3)]
+    calls = []
+
+    def compile_bank(values, sequence_length, ane_instance):
+        calls.append((len(values), sequence_length, ane_instance))
+        return [object() for _ in values]
+
+    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+
+    result = ane_patch._compile_single_banks(weights, 2048)
+
+    assert result is not None
+    models, resident = result
+    assert len(models) == 3
+    assert resident == 1
+    assert calls == [(3, 2048, 0)]
+
+
 def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -607,6 +856,9 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -637,6 +889,9 @@ def test_enable_env_cap_forces_split_banks(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "1")
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     compiled = []
@@ -666,6 +921,9 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
 
@@ -789,6 +1047,24 @@ def test_prepare_pair_accepts_oq4e_group64_with_q5_down():
     assert dense1.shape == (128, 128)
 
 
+def test_prepare_pair_single_ane_keeps_one_full_prefix():
+    mlp = _MLP()
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    prepared = ane_patch._prepare_pair_for_bank(
+        mlp,
+        ane_patch._AnePrefillConfig(2048, 0.5, 8, dual_ane=False),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.ane_outputs == 128
+    assert dense0.shape == (256, 128)
+    assert dense1 is None
+
+
 def test_eligible_pair_preserves_q4_and_accepts_affine_q8():
     mlp = _MLP()
     for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
@@ -803,13 +1079,10 @@ def test_eligible_pair_preserves_q4_and_accepts_affine_q8():
     assert ane_patch._eligible_pair(q8_mlp)
 
 
-@pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("dual", [False, True])
-def test_q5_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(
-    monkeypatch, bits, dual
-):
-    assert ane_patch._eligible_pair(_make_affine_mlp(bits, 64))
-    generic_name = ane_patch._fused_swiglu_symbol(bits, dual=dual)
+def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
+    assert ane_patch._eligible_pair(_make_affine_mlp(6, 64))
+    generic_name = ane_patch._fused_swiglu_symbol(6, dual=dual)
     assert generic_name == (
         "qwen35_ane_dual_affine_swiglu_t"
         if dual
@@ -829,7 +1102,7 @@ def test_q5_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(
     monkeypatch.setattr(
         fast,
         q4_name,
-        lambda *args: pytest.fail("Q5/Q6 must use the generic fused SwiGLU"),
+        lambda *args: pytest.fail("Q6 must use the generic fused SwiGLU"),
     )
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
@@ -840,12 +1113,12 @@ def test_q5_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(
     state = ane_patch._CombinedMLPState(
         model=model0,
         model1=model1,
-        weight=mx.zeros((4, bits), dtype=mx.uint32),
+        weight=mx.zeros((4, 3), dtype=mx.uint32),
         scales=mx.zeros((4, 1), dtype=mx.bfloat16),
         biases=mx.zeros((4, 1), dtype=mx.bfloat16),
         ane_outputs=2,
         gpu_outputs=2,
-        bits=bits,
+        bits=6,
         group_size=64,
     )
     mlp = SimpleNamespace(
@@ -855,7 +1128,7 @@ def test_q5_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(
         ),
         _omlx_ane_prefill_state=state,
     )
-    x = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
+    x = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
 
     result = ane_patch._backend(mlp, x)
     mx.eval(result)
@@ -867,7 +1140,7 @@ def test_q5_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(
         state.biases,
         model0,
         *(() if not dual else (model1,)),
-        bits,
+        6,
         8,
         64,
     )
@@ -1156,6 +1429,80 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
         8,
         128,
     )
+@pytest.mark.parametrize("bits", [5, 6, 8])
+def test_prepare_pair_enables_cpu_gate_share_for_q5_plus(monkeypatch, bits):
+    mlp = SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=bits
+        ),
+        up_proj=nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=bits
+        ),
+        down_proj=nn.QuantizedLinear(
+            256, 128, bias=False, group_size=64, bits=bits
+        ),
+    )
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_dual_cpu_fp16_swiglu_t",
+    )
+
+    state = ane_patch._prepare_pair_runtime_state(
+        mlp,
+        ane_patch._AnePrefillConfig(
+            2048, 0.5, 8, dual_ane=True, cpu_fraction=0.25
+        ),
+        object(),
+        object(),
+    )
+
+    assert state is not None
+    assert state.bits == bits
+    assert state.cpu_outputs == 64
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (128, 128)
+    assert state.gpu_outputs == 64
+    assert state.weight.shape == (128, 4 * bits)
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_prepare_pair_enables_cpu_gate_share_for_single_ane(monkeypatch, bits):
+    mlp = SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=bits
+        ),
+        up_proj=nn.QuantizedLinear(
+            128, 256, bias=False, group_size=64, bits=bits
+        ),
+        down_proj=nn.QuantizedLinear(
+            256, 128, bias=False, group_size=64, bits=bits
+        ),
+    )
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    expected_symbol = ane_patch._cpu_gate_kernel_symbol(bits, dual=False)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: name == expected_symbol)
+
+    state = ane_patch._prepare_pair_runtime_state(
+        mlp,
+        ane_patch._AnePrefillConfig(
+            2048, 0.5, 8, dual_ane=False, cpu_fraction=0.25
+        ),
+        object(),
+        None,
+    )
+
+    assert state is not None
+    assert state.model1 is None
+    assert state.cpu_outputs == 64
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (128, 128)
+    assert state.gpu_outputs == 64
 
 
 def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
@@ -1218,6 +1565,197 @@ def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
     assert state.scales.shape == (128, 2)
     assert dense0.shape == (128, 128)
     assert dense1.shape == (128, 128)
+
+
+def test_prepare_gdn_single_ane_keeps_one_full_prefix():
+    gdn = _OQ4eGDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+
+    prepared = ane_patch._prepare_gdn_for_bank(
+        gdn,
+        ane_patch._AneGDNConfig(2048, 0.75, 8, dual_ane=False),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert state.z_outputs == 128
+    assert state.qkv_outputs == 256
+    assert dense0.shape == (256, 128)
+    assert dense1 is None
+
+
+def test_prepare_gdn_splits_residual_qkv_across_cpu_and_gpu(monkeypatch):
+    gdn = _OQ4eGDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+    )
+
+    prepared = ane_patch._prepare_gdn_for_bank(
+        gdn,
+        ane_patch._AneGDNConfig(
+            2048, 0.5, 8, dual_ane=True, cpu_fraction=0.20
+        ),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert dense0.shape == (64, 128)
+    assert dense1.shape == (64, 128)
+    assert state.cpu_outputs == 64
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (64, 128)
+    assert state.weight.shape == (192, 16)
+    assert state.scales.shape == (192, 2)
+
+
+def test_prepare_gdn_splits_cpu_work_with_single_ane(monkeypatch):
+    gdn = _OQ4eGDN()
+    for linear in (
+        gdn.in_proj_qkv,
+        gdn.in_proj_z,
+        gdn.in_proj_b,
+        gdn.in_proj_a,
+    ):
+        linear.scales = linear.scales.astype(mx.float16)
+        linear.biases = linear.biases.astype(mx.float16)
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "qwen35_ane_cpu_fp16_affine_qmm_t",
+    )
+
+    prepared = ane_patch._prepare_gdn_for_bank(
+        gdn,
+        ane_patch._AneGDNConfig(
+            2048, 0.5, 8, dual_ane=False, cpu_fraction=0.20
+        ),
+    )
+
+    assert prepared is not None
+    state, dense0, dense1 = prepared
+    assert dense0.shape == (192, 128)
+    assert dense1 is None
+    assert state.cpu_outputs == 64
+    assert state.cpu_weight is not None
+    assert state.cpu_weight.shape == (64, 128)
+    assert state.weight.shape == (128, 16)
+
+
+def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch):
+    combined = mx.array([[[1, 2, 10, 20, 30, 40]]], dtype=mx.float16)
+    calls = []
+
+    def hybrid(*args):
+        calls.append(args)
+        return combined
+
+    monkeypatch.setattr(fast, "qwen35_ane_dual_cpu_fp16_affine_qmm_t", hybrid)
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(
+        q4_patch,
+        "_linear_qmm",
+        lambda linear, x, variant: mx.zeros((*x.shape[:-1], 1), dtype=x.dtype),
+    )
+    state = ane_patch._CombinedGDNState(
+        model=object(),
+        model1=object(),
+        weight=mx.zeros((2, 16), dtype=mx.uint32),
+        scales=mx.zeros((2, 2), dtype=mx.float16),
+        biases=mx.zeros((2, 2), dtype=mx.float16),
+        qkv_outputs=4,
+        z_outputs=2,
+        bits=4,
+        group_size=64,
+        cpu_weight=mx.zeros((1, 128), dtype=mx.float16),
+        cpu_outputs=1,
+    )
+    gdn = SimpleNamespace(
+        in_proj_qkv=object(),
+        in_proj_z=object(),
+        in_proj_b=object(),
+        in_proj_a=object(),
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(
+            1, 0.4, 8, True, 0.1, 6, True
+        ),
+        _omlx_ane_gdn_state=state,
+    )
+    x = mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    mixed_qkv, z, _, _ = ane_patch._gdn_backend(gdn, x)
+    mx.eval(mixed_qkv, z)
+
+    assert len(calls) == 1
+    assert calls[0][-2:] == (6, True)
+    assert z.tolist() == [[[1.0, 2.0]]]
+    assert mixed_qkv.tolist() == [[[10.0, 20.0, 30.0, 40.0]]]
+
+
+def test_gdn_backend_routes_single_ane_cpu_split(monkeypatch):
+    combined = mx.array([[[1, 2, 10, 20, 30, 40]]], dtype=mx.float16)
+    calls = []
+
+    def hybrid(*args):
+        calls.append(args)
+        return combined
+
+    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_affine_qmm_t", hybrid)
+    import omlx.patches.qwen35_q4_mlp as q4_patch
+
+    monkeypatch.setattr(
+        q4_patch,
+        "_linear_qmm",
+        lambda linear, x, variant: mx.zeros((*x.shape[:-1], 1), dtype=x.dtype),
+    )
+    state = ane_patch._CombinedGDNState(
+        model=object(),
+        weight=mx.zeros((2, 16), dtype=mx.uint32),
+        scales=mx.zeros((2, 2), dtype=mx.float16),
+        biases=mx.zeros((2, 2), dtype=mx.float16),
+        qkv_outputs=4,
+        z_outputs=2,
+        bits=4,
+        group_size=64,
+        cpu_weight=mx.zeros((1, 128), dtype=mx.float16),
+        cpu_outputs=1,
+    )
+    gdn = SimpleNamespace(
+        in_proj_qkv=object(),
+        in_proj_z=object(),
+        in_proj_b=object(),
+        in_proj_a=object(),
+        _omlx_ane_gdn_config=ane_patch._AneGDNConfig(
+            1, 0.4, 8, False, 0.1, 6, True
+        ),
+        _omlx_ane_gdn_state=state,
+    )
+    x = mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    mixed_qkv, z, _, _ = ane_patch._gdn_backend(gdn, x)
+    mx.eval(mixed_qkv, z)
+
+    assert len(calls) == 1
+    assert state.model in calls[0]
+    assert calls[0][-2:] == (6, True)
+    assert z.tolist() == [[[1.0, 2.0]]]
+    assert mixed_qkv.tolist() == [[[10.0, 20.0, 30.0, 40.0]]]
 
 
 def test_gdn_backend_restores_projection_order_and_keeps_b_a_exact(monkeypatch):
@@ -1416,6 +1954,227 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
     )
 
 
+def test_fused_down_backend_runs_compatible_cpu_hidden_branch(monkeypatch):
+    output = mx.zeros((1, 1, 8), dtype=mx.float16)
+    captured = {}
+
+    def fused(*args):
+        captured["args"] = args
+        return output
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t", fused
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._FusedDownMLPState(
+        model=model0,
+        model1=model1,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+        cpu_gate_up_weight=mx.zeros((4, 8), dtype=mx.float16),
+        cpu_down_weight=mx.zeros((8, 2), dtype=mx.float16),
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.14,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+        ane_down_fraction=0.19,
+        fused_down=True,
+    )
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_fused_down_state=state,
+    )
+    x = mx.zeros((1, 1, 8), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    assert result is output
+    assert captured["args"] == (
+        x,
+        state.cpu_gate_up_weight,
+        state.cpu_down_weight,
+        state.gate_up_weight,
+        state.gate_up_scales,
+        state.gate_up_biases,
+        state.down_weight,
+        state.down_scales,
+        state.down_biases,
+        model0,
+        model1,
+        8,
+        128,
+        12,
+        True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("bits", "expected_kernel"),
+    [(4, "q4"), (5, "generic"), (6, "generic"), (8, "generic")],
+)
+def test_cpu_gate_uses_bit_appropriate_fused_swiglu(
+    monkeypatch, bits, expected_kernel
+):
+    activation = mx.zeros((1, 1, 4), dtype=mx.float16)
+    captured = {}
+
+    def generic_fused(*args):
+        captured["kernel"] = "generic"
+        captured["args"] = args
+        return activation
+
+    def q4_fused(*args):
+        captured["kernel"] = "q4"
+        captured["args"] = args
+        return activation
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t", q4_fused
+    )
+    monkeypatch.setattr(
+        fast, "qwen35_ane_dual_cpu_fp16_swiglu_t", generic_fused
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_post_ane_linear",
+        lambda linear, value, *args, **kwargs: value,
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._CombinedMLPState(
+        model=model0,
+        model1=model1,
+        weight=mx.zeros((4, 4 * bits), dtype=mx.uint32),
+        scales=mx.zeros((4, 2), dtype=mx.float16),
+        biases=mx.zeros((4, 2), dtype=mx.float16),
+        ane_outputs=2,
+        gpu_outputs=2,
+        group_size=64,
+        bits=bits,
+        cpu_weight=mx.zeros((4, 128), dtype=mx.float16),
+        cpu_outputs=2,
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.25,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    expected_args = (
+        x,
+        state.cpu_weight,
+        state.weight,
+        state.scales,
+        state.biases,
+        model0,
+        model1,
+    )
+    if bits != 4:
+        expected_args += (bits,)
+    expected_args += (
+        8,
+        64,
+        12,
+        True,
+    )
+    assert captured == {"kernel": expected_kernel, "args": expected_args}
+
+
+@pytest.mark.parametrize(
+    ("bits", "expected_kernel"),
+    [(4, "q4"), (5, "generic"), (6, "generic"), (8, "generic")],
+)
+def test_single_ane_cpu_gate_uses_bit_appropriate_fused_swiglu(
+    monkeypatch, bits, expected_kernel
+):
+    activation = mx.zeros((1, 1, 4), dtype=mx.float16)
+    captured = {}
+
+    def generic_fused(*args):
+        captured["kernel"] = "generic"
+        captured["args"] = args
+        return activation
+
+    def q4_fused(*args):
+        captured["kernel"] = "q4"
+        captured["args"] = args
+        return activation
+
+    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_q4_swiglu_t", q4_fused)
+    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_swiglu_t", generic_fused)
+    monkeypatch.setattr(
+        ane_patch,
+        "_post_ane_linear",
+        lambda linear, value, *args, **kwargs: value,
+    )
+    model = object()
+    state = ane_patch._CombinedMLPState(
+        model=model,
+        weight=mx.zeros((4, 4 * bits), dtype=mx.uint32),
+        scales=mx.zeros((4, 2), dtype=mx.float16),
+        biases=mx.zeros((4, 2), dtype=mx.float16),
+        ane_outputs=2,
+        gpu_outputs=2,
+        group_size=64,
+        bits=bits,
+        cpu_weight=mx.zeros((4, 128), dtype=mx.float16),
+        cpu_outputs=2,
+    )
+    config = ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=False,
+        cpu_fraction=0.25,
+        cpu_threads=12,
+        cpu_shared_resource=True,
+    )
+    mlp = SimpleNamespace(
+        down_proj=object(),
+        _omlx_ane_prefill_config=config,
+        _omlx_ane_prefill_state=state,
+    )
+    x = mx.zeros((1, 1, 128), dtype=mx.float16)
+
+    result = ane_patch._backend(mlp, x)
+    mx.eval(result)
+
+    expected_args = (
+        x,
+        state.cpu_weight,
+        state.weight,
+        state.scales,
+        state.biases,
+        model,
+    )
+    if bits != 4:
+        expected_args += (bits,)
+    expected_args += (8, 64, 12, True)
+    assert captured == {"kernel": expected_kernel, "args": expected_args}
+
+
 def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
     class PatchedMLP:
         _omlx_q4_mlp_patched = True
@@ -1504,3 +2263,519 @@ def test_enable_env_kill_switch_wins(monkeypatch):
 
     assert count == 0
     assert installed == []
+
+
+def test_prefill_status_reports_configured_layers():
+    model = SimpleNamespace(
+        _omlx_ane_mlp_prefill_count=12,
+        _omlx_ane_gdn_prefill_count=4,
+        _omlx_ane_dual_prefill_count=8,
+        _omlx_ane_resident_program_count=24,
+    )
+    assert ane_patch.qwen35_ane_prefill_status(model) == {
+        "attempted": True,
+        "configured": True,
+        "mlp_layers": 12,
+        "gdn_layers": 4,
+        "dual_ane_layers": 8,
+        "resident_programs": 24,
+        "tail_padding_min_tokens": 0,
+    }
+
+
+def test_prefill_status_flags_attempted_but_empty():
+    model = SimpleNamespace(
+        _omlx_ane_mlp_prefill_count=0,
+        _omlx_ane_gdn_prefill_count=0,
+        _omlx_ane_dual_prefill_count=0,
+        _omlx_ane_resident_program_count=0,
+    )
+    status = ane_patch.qwen35_ane_prefill_status(model)
+    assert status["attempted"] is True
+    assert status["configured"] is False
+
+
+def test_prefill_status_safe_on_untouched_model():
+    status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
+    assert status["attempted"] is False
+    assert status["configured"] is False
+    assert status["mlp_layers"] == 0
+
+
+def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(
+        ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
+    )
+    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
+
+    model = SimpleNamespace(modules=lambda: [])
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(model)
+
+    assert count == 0
+    assert "no eligible MLP layers found" in caplog.text
+    assert ane_patch.qwen35_ane_prefill_status(model)["attempted"] is True
+
+
+def test_bank_prepare_keeps_packed_q6_suffix():
+    gdn = _make_affine_gdn(6, 128)
+    config = ane_patch._AneGDNConfig(2048, 0.5, 8, True)
+    packed = ane_patch._pack_affine_gdn_suffix(
+        gdn.in_proj_qkv, gdn.in_proj_b, gdn.in_proj_a, 0, (6, 128)
+    )
+    assert packed is not None
+    expected_weight, expected_scales, expected_biases, b_outputs, a_outputs = packed
+
+    prepared = ane_patch._prepare_gdn_for_bank(gdn, config)
+    assert prepared is not None
+    state, _dense0, dense1 = prepared
+    assert (state.b_outputs, state.a_outputs) == (b_outputs, a_outputs)
+    assert state.weight.shape == expected_weight.shape
+    assert bool(mx.array_equal(state.weight, expected_weight))
+    assert bool(mx.array_equal(state.scales, expected_scales))
+    assert bool(mx.array_equal(state.biases, expected_biases))
+    assert dense1 is not None
+
+
+def test_enable_survives_warmup_failure(monkeypatch, caplog):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    class _FailingModel:
+        def warmup(self):
+            raise RuntimeError("ANE evaluation failed")
+
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda weights, sequence_length, ane_instance: [
+            _FailingModel() for _ in weights
+        ],
+    )
+    model = _Model(2)
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=2,
+            dual_ane=True,
+        )
+
+    assert count == 2
+    assert "ANE warmup failed" in caplog.text
+
+
+def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
+    linear = nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.float16)
+    linear.biases = linear.biases.astype(mx.float16)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    assert ane_patch._prepare_cpu_linear(linear, 0.25) is None
+
+    monkeypatch.setattr(
+        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
+    )
+    assert ane_patch._prepare_cpu_linear(linear, 0.25) is not None
+
+
+def test_enable_warms_the_cpu_sharing_path(monkeypatch):
+    """CPU-shared modules get one dummy dispatch at load, not at first use."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda weights, sequence_length, ane_instance: [object() for _ in weights],
+    )
+    warmed = []
+    monkeypatch.setattr(
+        ane_patch, "_backend", lambda module, x: warmed.append(module) or mx.zeros(1)
+    )
+
+    model = _Model(2)
+    for layer in model.layers:
+        for linear in (layer.gate_proj, layer.up_proj, layer.down_proj):
+            linear.scales = linear.scales.astype(mx.float16)
+            linear.biases = linear.biases.astype(mx.float16)
+
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=2,
+        dual_ane=True,
+        cpu_fraction=0.25,
+    )
+
+    assert count == 2
+    assert {id(m) for m in warmed} == {id(layer) for layer in model.layers}
+
+    # Without a CPU share the dummy dispatch must not run.
+    warmed.clear()
+    plain = _Model(2)
+    count = ane_patch.enable_qwen35_ane_prefill(
+        plain,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=2,
+        dual_ane=True,
+    )
+    assert count == 2
+    assert warmed == []
+
+
+# --- ANE prefill transient memory estimate (issue #2841) ---
+
+
+def test_ane_prefill_transient_bytes_reads_live_model_dims():
+    """The estimate sums (input + output) * seq * 2 over the compiled models."""
+    seq = 2048
+
+    def _ane_model(input_dim, output_dim):
+        return SimpleNamespace(
+            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+        )
+
+    mlp = SimpleNamespace(
+        _omlx_ane_prefill_state=SimpleNamespace(
+            model=_ane_model(5120, 4608), model1=_ane_model(5120, 4608)
+        )
+    )
+    gdn = SimpleNamespace(
+        _omlx_ane_gdn_state=SimpleNamespace(
+            model=_ane_model(5120, 768), model1=None
+        )
+    )
+    model = SimpleNamespace(modules=lambda: [mlp, gdn, SimpleNamespace()])
+
+    expected = 2 * (5120 + 4608) * seq * 2 + (5120 + 768) * seq * 2
+    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+
+
+def test_ane_prefill_transient_bytes_zero_without_ane():
+    """A model with no compiled ANE slice reserves nothing."""
+    assert ane_patch.ane_prefill_transient_bytes(SimpleNamespace()) == 0
+    plain = SimpleNamespace(modules=lambda: [SimpleNamespace()])
+    assert ane_patch.ane_prefill_transient_bytes(plain) == 0
+
+
+def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
+    """Fused SwiGLU/down banks and ANE down slices hold IOSurfaces too."""
+    seq = 2048
+
+    def _ane_model(input_dim, output_dim):
+        return SimpleNamespace(
+            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+        )
+
+    fused = SimpleNamespace(
+        _omlx_ane_fused_down_state=SimpleNamespace(
+            model=_ane_model(5120, 5120), model1=_ane_model(5120, 5120)
+        )
+    )
+    down = SimpleNamespace(
+        _omlx_ane_prefill_state=SimpleNamespace(
+            model=_ane_model(5120, 4608),
+            model1=None,
+            down_ane=SimpleNamespace(
+                model=_ane_model(4608, 5120), model1=_ane_model(4608, 5120)
+            ),
+        )
+    )
+    model = SimpleNamespace(modules=lambda: [fused, down])
+
+    expected = (
+        2 * (5120 + 5120) * seq * 2
+        + (5120 + 4608) * seq * 2
+        + 2 * (4608 + 5120) * seq * 2
+    )
+    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+
+
+# --- incremental bank builder staging (issue #2781) ---
+
+
+class _RecorderBankBuilder:
+    """Stands in for the native AneLinearBankBuilder."""
+
+    def __init__(self, fail_full_span_once=False):
+        self.added = []
+        self.compiled_spans = []
+        self._fail_full_span_once = fail_full_span_once
+
+    def add(self, weight):
+        self.added.append(weight)
+
+    @property
+    def size(self):
+        return len(self.added)
+
+    def compile(self, ane_instance, start, stop):
+        if self._fail_full_span_once and stop - start == len(self.added):
+            self._fail_full_span_once = False
+            raise RuntimeError("bank load failed (0x20004)")
+        self.compiled_spans.append((ane_instance, start, stop))
+        return [object() for _ in range(stop - start)]
+
+
+def _builder_test_setup(monkeypatch, builders):
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", lambda seq: builders.pop(0)
+    )
+    monkeypatch.setattr(
+        fast,
+        "qwen35_ane_compile_linear_bank",
+        lambda *a, **k: pytest.fail(
+            "the builder path must not stage all weights at once"
+        ),
+    )
+
+
+def test_enable_streams_layers_through_the_bank_builder(monkeypatch):
+    """Each layer is handed to the builder as prepared, not held until compile."""
+    builder0 = _RecorderBankBuilder()
+    builder1 = _RecorderBankBuilder()
+    _builder_test_setup(monkeypatch, [builder0, builder1])
+
+    model = _Model(4)
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    assert len(builder0.added) == 4
+    assert len(builder1.added) == 4
+    assert builder0.compiled_spans == [(1, 0, 4)]
+    assert builder1.compiled_spans == [(2, 0, 4)]
+    assert model._omlx_ane_resident_program_count == 2
+    states = [layer._omlx_ane_prefill_state for layer in model.layers]
+    assert all(s.model is not None and s.model1 is not None for s in states)
+
+
+def test_builder_split_ladder_retries_without_restaging(monkeypatch):
+    """A monolithic load failure retries in spans from the stored chunks."""
+    builder0 = _RecorderBankBuilder(fail_full_span_once=True)
+    builder1 = _RecorderBankBuilder()
+    _builder_test_setup(monkeypatch, [builder0, builder1])
+
+    model = _Model(4)
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.5,
+        max_layers=4,
+        dual_ane=True,
+    )
+
+    assert count == 4
+    # staged exactly once despite the retry
+    assert len(builder0.added) == 4
+    # first attempt failed on the monolithic span, retry split into two banks
+    assert builder0.compiled_spans[0][1:] != (0, 4) or len(
+        builder0.compiled_spans
+    ) > 1
+    assert model._omlx_ane_resident_program_count == 4
+
+
+def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
+    """One broken procedure disables its module; the rest keep warming (#2940)."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+    )
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+
+    warm_calls = []
+
+    class _WarmModel:
+        def __init__(self, index):
+            self.index = index
+
+        def warmup(self):
+            if self.index == 1:
+                raise RuntimeError("ANE evaluation failed")
+            warm_calls.append(self.index)
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        return [_WarmModel(i) for i in range(len(weights))]
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    model = _Model(3)
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        count = ane_patch.enable_qwen35_ane_prefill(
+            model,
+            sequence_length=2048,
+            fraction=0.5,
+            max_layers=3,
+            dual_ane=True,
+        )
+
+    assert count == 3
+    assert getattr(model.layers[1], "_omlx_ane_prefill_failed", False)
+    assert not getattr(model.layers[0], "_omlx_ane_prefill_failed", False)
+    assert not getattr(model.layers[2], "_omlx_ane_prefill_failed", False)
+    assert sorted(warm_calls) == [0, 0, 2, 2]
+    assert "disabling ANE" in caplog.text
+
+
+# --- fused bank streaming + CPU warm helper (post-#2935 follow-up) ---
+
+
+class _RecorderFusedBankBuilder:
+    """Stands in for the native AneFusedBankBuilder."""
+
+    def __init__(self):
+        self.added = []
+        self.compiled_spans = []
+
+    def add(self, gate, up, down):
+        self.added.append((gate, up, down))
+
+    @property
+    def size(self):
+        return len(self.added)
+
+    def compile(self, ane_instance, start, stop):
+        self.compiled_spans.append((ane_instance, start, stop))
+        return [object() for _ in range(stop - start)]
+
+
+def _fused_bank_state():
+    return ane_patch._FusedDownMLPState(
+        model=None,
+        model1=None,
+        gate_up_weight=mx.zeros((4, 1), dtype=mx.uint32),
+        gate_up_scales=mx.zeros((4, 1), dtype=mx.float16),
+        gate_up_biases=mx.zeros((4, 1), dtype=mx.float16),
+        down_weight=mx.zeros((8, 1), dtype=mx.uint32),
+        down_scales=mx.zeros((8, 1), dtype=mx.float16),
+        down_biases=mx.zeros((8, 1), dtype=mx.float16),
+    )
+
+
+def test_fused_bank_staging_streams_through_builder(monkeypatch):
+    """Fused enable stages one gate/up/down triple at a time (issue #2781)."""
+    builders = []
+
+    def _make_builder(sequence_length):
+        assert sequence_length == 2048
+        builder = _RecorderFusedBankBuilder()
+        builders.append(builder)
+        return builder
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_fused_bank_builder", _make_builder, raising=False
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_prepare_fused_down_for_bank",
+        lambda module, config: (
+            _fused_bank_state(),
+            tuple(mx.zeros((2, 2)) for _ in range(6)),
+        ),
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+
+    config = ane_patch._AnePrefillConfig(
+        2048, 0.3, 8, dual_ane=True, fused_down=True
+    )
+    model = SimpleNamespace()
+    modules = [SimpleNamespace() for _ in range(3)]
+
+    result = ane_patch._enable_fused_down_banks(model, modules, config)
+
+    assert result == (3, 2)
+    assert len(builders) == 2
+    assert [len(builder.added) for builder in builders] == [3, 3]
+    assert builders[0].compiled_spans == [(1, 0, 3)]
+    assert builders[1].compiled_spans == [(2, 0, 3)]
+    for module in modules:
+        assert module._omlx_ane_fused_down_state.model is not None
+        assert module._omlx_ane_fused_down_state.model1 is not None
+    assert model._omlx_ane_down_prefill_count == 3
+
+
+def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
+    """Old extensions without the fused builder keep the one-shot path."""
+    monkeypatch.delattr(fast, "qwen35_ane_fused_bank_builder", raising=False)
+    compiled = []
+
+    def _compile_bank(gates, ups, downs, sequence_length, ane_instance):
+        compiled.append((len(gates), sequence_length, ane_instance))
+        return [object() for _ in gates]
+
+    monkeypatch.setattr(
+        fast, "qwen35_ane_compile_swiglu_down_bank", _compile_bank
+    )
+    monkeypatch.setattr(
+        ane_patch,
+        "_prepare_fused_down_for_bank",
+        lambda module, config: (
+            _fused_bank_state(),
+            tuple(mx.zeros((2, 2)) for _ in range(6)),
+        ),
+    )
+    monkeypatch.setattr(ane_patch, "_warm_ane_models", lambda models: None)
+
+    config = ane_patch._AnePrefillConfig(
+        2048, 0.3, 8, dual_ane=True, fused_down=True
+    )
+    model = SimpleNamespace()
+    modules = [SimpleNamespace() for _ in range(2)]
+
+    result = ane_patch._enable_fused_down_banks(model, modules, config)
+
+    assert result == (2, 2)
+    assert compiled == [(2, 2048, 1), (2, 2048, 2)]
+    for module in modules:
+        assert module._omlx_ane_fused_down_state.model is not None
+
+
+def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
+    """The shared helper warms MLP and GDN modules with exact-shape zeros."""
+    calls = []
+
+    def _mlp_backend(module, x):
+        calls.append(("mlp", x.shape))
+        return mx.zeros((1,))
+
+    def _gdn_backend(module, x):
+        calls.append(("gdn", x.shape))
+        return (mx.zeros((1,)),)
+
+    monkeypatch.setattr(ane_patch, "_backend", _mlp_backend)
+    monkeypatch.setattr(ane_patch, "_gdn_backend", _gdn_backend)
+
+    linear = SimpleNamespace(
+        weight=mx.zeros((4, 4), dtype=mx.uint32),
+        bits=4,
+        scales=mx.zeros((1,), dtype=mx.float16),
+    )
+    mlp = SimpleNamespace(gate_proj=linear)
+    gdn = SimpleNamespace(in_proj_qkv=linear)
+
+    ane_patch._warm_cpu_sharing_path(64, [mlp], [gdn])
+
+    assert calls == [("mlp", (1, 64, 32)), ("gdn", (1, 64, 32))]
