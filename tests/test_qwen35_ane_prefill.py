@@ -29,6 +29,18 @@ def test_ane_compile_bindings_release_the_python_gil():
         assert guard in block
 
 
+def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    helper = source.split("static AneTicketPair begin_ane_ticket_pair(", 1)[1]
+    helper = helper.split("bool qwen35_ane_available()", 1)[0]
+
+    assert "first->cancel_ticket(first_ticket);" in helper
+    assert source.count("begin_ane_ticket_pair(") == 3
+
+
 @pytest.fixture(autouse=True)
 def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch

@@ -2941,6 +2941,11 @@ class Scheduler:
                 if sampling_params.frequency_penalty != 0.0
                 else None
             ),
+            **(
+                {"repetition_context_size": sampling_params.repetition_context_size}
+                if sampling_params.repetition_context_size is not None
+                else {}
+            ),
         )
 
         suppress_processor = _make_suppress_logits_processor(
@@ -5628,6 +5633,11 @@ class Scheduler:
                 sampling_params.frequency_penalty
                 if sampling_params.frequency_penalty != 0.0
                 else None
+            ),
+            **(
+                {"repetition_context_size": sampling_params.repetition_context_size}
+                if sampling_params.repetition_context_size is not None
+                else {}
             ),
         )
 

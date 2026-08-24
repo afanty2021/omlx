@@ -494,6 +494,30 @@ public:
   std::mutex evaluation_mutex_;
 };
 
+// Ceiling on every wait for an ANE signal on the live request path. A healthy
+// readiness spin resolves in microseconds (the producer buffer is committed
+// and waited on before the evaluation thread is spawned) and a healthy
+// evaluation in milliseconds-to-seconds (first-eval JIT), but a wedged ANE
+// driver never signals at all (#2974) — without a bound, one lost signal
+// spins a core forever and hangs the server. OMLX_ANE_WAIT_TIMEOUT_S
+// overrides the 30s default; 0 restores the old unbounded behavior.
+static std::chrono::seconds ane_wait_timeout() {
+  static const std::chrono::seconds timeout = [] {
+    if (const char *raw = std::getenv("OMLX_ANE_WAIT_TIMEOUT_S")) {
+      char *end = nullptr;
+      const long parsed = std::strtol(raw, &end, 10);
+      if (end != raw) {
+        if (parsed <= 0) {
+          return std::chrono::seconds(std::chrono::hours(24 * 365));
+        }
+        return std::chrono::seconds(parsed);
+      }
+    }
+    return std::chrono::seconds(30);
+  }();
+  return timeout;
+}
+
 class AneLinearModel::Impl {
 public:
   Impl(const float *weight, int output_dim, int input_dim, int sequence_length,
@@ -847,15 +871,36 @@ public:
     }
   }
 
-  AneLinearModel::Ticket begin(MTL::CommandBuffer *command_buffer) {
+  bool has_error() {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    return !completion_error_.empty();
+  }
+
+  AneLinearModel::Ticket begin(MTL::CommandBuffer *command_buffer) {
+    std::unique_lock<std::mutex> lock(state_mutex_);
     if (!completion_error_.empty()) {
       throw std::runtime_error("Prior ANE evaluation failed: " +
                                completion_error_);
     }
     if (submitted_ != completed_) {
-      throw std::runtime_error("The same fixed-shape ANE model cannot have "
-                               "overlapping evaluations.");
+      // A pending evaluation can be legitimately in flight for a moment
+      // (another request aborted between spawn and wait); give it one bounded
+      // grace period, then latch — a counter stuck past the timeout is the
+      // wedged-driver state and must not stay indistinguishable from a race.
+      const bool settled = completion_cv_.wait_for(
+          lock, ane_wait_timeout(),
+          [this] { return completed_ >= submitted_; });
+      if (!settled) {
+        if (completion_error_.empty()) {
+          completion_error_ = "a prior ANE evaluation never completed";
+        }
+        throw std::runtime_error("Prior ANE evaluation failed: " +
+                                 completion_error_);
+      }
+      if (!completion_error_.empty()) {
+        throw std::runtime_error("Prior ANE evaluation failed: " +
+                                 completion_error_);
+      }
     }
     const uint64_t ready = next_event_value_++;
     const uint64_t done = next_event_value_++;
@@ -867,7 +912,20 @@ public:
   }
 
   void evaluate_and_signal(AneLinearModel::Ticket ticket) {
+    const auto deadline = std::chrono::steady_clock::now() + ane_wait_timeout();
     while ([event_ signaledValue] < ticket.ready) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          completion_error_ =
+              "ANE readiness signal timed out; the producer command buffer "
+              "never signaled the shared event";
+          ++completed_;
+        }
+        [event_ setSignaledValue:ticket.done];
+        completion_cv_.notify_all();
+        return;
+      }
       std::this_thread::yield();
     }
     NSError *error = nil;
@@ -905,9 +963,37 @@ public:
     [buffer encodeWaitForEvent:event_ value:ticket.done];
   }
 
+  void cancel_ticket(AneLinearModel::Ticket ticket) {
+    // The ticket's producer command buffer failed, so its encoded ready
+    // signal will never fire. Retire the ticket before any evaluation thread
+    // is spawned: balance the counters, publish the done value, and wake any
+    // waiter. This is a per-submission failure (typically a request abort
+    // tearing down Metal state mid-prefill), not a program fault, so
+    // completion_error_ is left clear and the next request may use this
+    // program again.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      ++completed_;
+    }
+    [event_ setSignaledValue:ticket.done];
+    completion_cv_.notify_all();
+  }
+
   void wait(AneLinearModel::Ticket) {
     std::unique_lock<std::mutex> lock(state_mutex_);
-    completion_cv_.wait(lock, [this] { return completed_ >= submitted_; });
+    const bool finished = completion_cv_.wait_for(
+        lock, ane_wait_timeout(), [this] { return completed_ >= submitted_; });
+    if (!finished) {
+      // The evaluation thread is parked inside the private ANE framework and
+      // cannot be unblocked from here; latch the error so begin() refuses
+      // further dispatches to this program and the per-module fallback takes
+      // over, instead of the caller sleeping forever.
+      if (completion_error_.empty()) {
+        completion_error_ = "ANE evaluation timed out; the driver never "
+                            "signaled completion for this program";
+      }
+      throw std::runtime_error(completion_error_);
+    }
     if (!completion_error_.empty()) {
       throw std::runtime_error(completion_error_);
     }
@@ -917,7 +1003,14 @@ public:
     AneLinearModel::Ticket ticket{};
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
-      completion_cv_.wait(lock, [this] { return submitted_ == completed_; });
+      const bool idle = completion_cv_.wait_for(
+          lock, ane_wait_timeout(),
+          [this] { return submitted_ == completed_; });
+      if (!idle) {
+        throw std::runtime_error(
+            "Prior ANE evaluation never completed; refusing to warm this "
+            "program");
+      }
       if (!completion_error_.empty()) {
         throw std::runtime_error("Prior ANE evaluation failed: " +
                                  completion_error_);
@@ -960,6 +1053,7 @@ public:
 AneLinearModel::AneLinearModel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 AneLinearModel::~AneLinearModel() = default;
+bool AneLinearModel::has_error() { return impl_->has_error(); }
 int AneLinearModel::input_dim() const { return impl_->input_dim_; }
 int AneLinearModel::output_dim() const { return impl_->output_dim_; }
 int AneLinearModel::sequence_length() const { return impl_->sequence_length_; }
@@ -981,6 +1075,9 @@ void AneLinearModel::execute(AneLinearModel::Ticket ticket) {
 void AneLinearModel::wait(AneLinearModel::Ticket ticket) {
   impl_->wait(ticket);
 }
+void AneLinearModel::cancel_ticket(AneLinearModel::Ticket ticket) {
+  impl_->cancel_ticket(ticket);
+}
 void AneLinearModel::warmup() {
   @autoreleasepool {
     impl_->warmup();
@@ -989,6 +1086,45 @@ void AneLinearModel::warmup() {
 void AneLinearModel::end(MTL::CommandBuffer *command_buffer,
                          AneLinearModel::Ticket ticket) {
   impl_->end(command_buffer, ticket);
+}
+
+// A pack-and-signal buffer that completed with an error never fired its
+// encoded ready signal, so a detached evaluation thread launched for its
+// ticket would spin on a value that never arrives (#3025: a request abort
+// mid-prefill tears down Metal state and fails the buffer). The dispatch
+// sites check this after waitUntilCompleted() and, on failure, retire the
+// tickets and fail the dispatch immediately instead of leaving the wait
+// timeout as the only backstop.
+static bool pack_buffer_failed(MTL::CommandBuffer *producer_buffer) {
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(producer_buffer));
+  return buffer.status == MTLCommandBufferStatusError;
+}
+
+static std::string pack_buffer_error(MTL::CommandBuffer *producer_buffer) {
+  id<MTLCommandBuffer> buffer =
+      (__bridge id<MTLCommandBuffer>)(static_cast<void *>(producer_buffer));
+  return error_text(
+      @"ANE input pack command buffer failed; canceling this dispatch",
+      buffer.error);
+}
+
+struct AneTicketPair {
+  AneLinearModel::Ticket first;
+  AneLinearModel::Ticket second;
+};
+
+static AneTicketPair begin_ane_ticket_pair(
+    const std::shared_ptr<AneLinearModel> &first,
+    const std::shared_ptr<AneLinearModel> &second,
+    MTL::CommandBuffer *producer_buffer) {
+  auto first_ticket = first->begin(producer_buffer);
+  try {
+    return {first_ticket, second->begin(producer_buffer)};
+  } catch (...) {
+    first->cancel_ticket(first_ticket);
+    throw;
+  }
 }
 
 bool qwen35_ane_available() {
@@ -2020,6 +2156,12 @@ public:
     // both devices, complete it up front; the expensive ANE and qmm stages are
     // still launched concurrently below.
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model_->cancel_ticket(ticket);
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
@@ -2316,10 +2458,24 @@ public:
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket0 = model0_->begin(producer_buffer);
-    auto ticket1 = model1_->begin(producer_buffer);
+    AneTicketPair tickets{};
+    try {
+      tickets = begin_ane_ticket_pair(model0_, model1_, producer_buffer);
+    } catch (...) {
+      producer_buffer->release();
+      throw;
+    }
+    const auto ticket0 = tickets.first;
+    const auto ticket1 = tickets.second;
     encoder.commit();
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model0_->cancel_ticket(ticket0);
+      model1_->cancel_ticket(ticket1);
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
@@ -2645,9 +2801,13 @@ public:
     AneLinearModel::Ticket ticket{};
     AneLinearModel::Ticket ticket1{};
     try {
-      ticket = model_->begin(producer_buffer);
       if (model1_) {
-        ticket1 = model1_->begin(producer_buffer);
+        const auto tickets =
+            begin_ane_ticket_pair(model_, model1_, producer_buffer);
+        ticket = tickets.first;
+        ticket1 = tickets.second;
+      } else {
+        ticket = model_->begin(producer_buffer);
       }
     } catch (...) {
       producer_buffer->release();
@@ -2655,6 +2815,15 @@ public:
     }
     encoder.commit();
     producer_buffer->waitUntilCompleted();
+    if (pack_buffer_failed(producer_buffer)) {
+      const std::string reason = pack_buffer_error(producer_buffer);
+      producer_buffer->release();
+      model_->cancel_ticket(ticket);
+      if (model1_) {
+        model1_->cancel_ticket(ticket1);
+      }
+      throw std::runtime_error(reason);
+    }
     producer_buffer->release();
     if (profiling) {
       profile_add(profile_category, kPackNs,
