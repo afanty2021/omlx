@@ -275,6 +275,8 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_dir: str | None = None
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
+    hot_cache_write_through: bool | None = None
+    ane_compile_cache: bool | None = None
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
@@ -963,6 +965,9 @@ async def _apply_cache_settings_runtime(
     # These settings all affect objects constructed with each scheduler. Keep
     # the pool template synchronized before unloading existing engines.
     pool._scheduler_config.hot_cache_only = global_settings.cache.hot_cache_only
+    pool._scheduler_config.hot_cache_write_through = (
+        global_settings.cache.hot_cache_write_through
+    )
     pool._scheduler_config.gdn_ssd_split_enabled = (
         global_settings.cache.get_gdn_ssd_split_enabled()
     )
@@ -3503,6 +3508,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 )
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
+            "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
+            "ane_compile_cache": global_settings.cache.ane_compile_cache,
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
@@ -4034,6 +4041,11 @@ async def update_global_settings(
     if request.hot_cache_only is not None:
         global_settings.cache.hot_cache_only = request.hot_cache_only
         cache_changed = True
+    if request.hot_cache_write_through is not None:
+        global_settings.cache.hot_cache_write_through = (
+            request.hot_cache_write_through
+        )
+        cache_changed = True
     if requested_storage is not None:
         global_settings.cache.set_gdn_snapshot_storage(requested_storage)
         cache_changed = True
@@ -4056,6 +4068,15 @@ async def update_global_settings(
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
         cache_changed = True
+    # No cache_changed: reloading models cannot re-arm the native gate, which
+    # reads the env var once at the first ANE compile of the process. The env
+    # update covers a process that has not compiled yet; otherwise restart.
+    if request.ane_compile_cache is not None:
+        global_settings.cache.ane_compile_cache = request.ane_compile_cache
+        if request.ane_compile_cache:
+            os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] = "1"
+        else:
+            os.environ.pop("OMLX_QWEN35_ANE_COMPILE_CACHE", None)
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
