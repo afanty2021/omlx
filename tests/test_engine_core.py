@@ -1391,6 +1391,25 @@ class TestGlobalMLXExecutor:
         executor2 = get_mlx_executor()
         assert executor1 is executor2
 
+    def test_is_executor_broken_catches_broken_thread_pool(self):
+        """A broken pool must be detected, not crash the health check.
+
+        concurrent.futures does not re-export BrokenThreadPool at package
+        level on all Python versions, so naming it in the except clause
+        raised AttributeError exactly when detection was needed; the check
+        must catch the public BrokenExecutor base instead.
+        """
+        from concurrent.futures.thread import BrokenThreadPool
+
+        from omlx.engine_core import _is_executor_broken
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with patch.object(executor, "submit", side_effect=BrokenThreadPool):
+                assert _is_executor_broken(executor) is True
+        finally:
+            executor.shutdown(wait=True)
+
     def test_engines_have_per_engine_executors(self, mock_model, mock_tokenizer):
         """Each EngineCore must have its own executor (#1248)."""
         with patch("omlx.engine_core.get_registry") as mock_registry:

@@ -172,7 +172,10 @@ def _is_executor_broken(executor: concurrent.futures.ThreadPoolExecutor) -> bool
         future = executor.submit(lambda: None)
         future.result(timeout=1.0)
         return False
-    except (concurrent.futures.BrokenThreadPool, RuntimeError):
+    except (concurrent.futures.BrokenExecutor, RuntimeError):
+        # BrokenExecutor is the top-level base class; BrokenThreadPool is
+        # only importable from concurrent.futures.thread and raises
+        # AttributeError from this except clause on some Python versions.
         return True
     except Exception:
         # Other exceptions (timeout, cancellation) don't mean broken
