@@ -358,6 +358,7 @@ try:
         MemoryMonitor,
         collect_kv_layer_specs,
         estimate_mla_kv_bytes_per_token,
+        estimate_qwen4_exp_kv_bytes_per_token,
         make_prefill_memory_profile,
     )
 
@@ -368,6 +369,7 @@ except ImportError:
     MemoryMonitor = None
     collect_kv_layer_specs = None
     estimate_mla_kv_bytes_per_token = None
+    estimate_qwen4_exp_kv_bytes_per_token = None
     make_prefill_memory_profile = None
     HAS_TIERED_CACHE = False
 
@@ -7459,6 +7461,9 @@ class Scheduler:
                     if handler is not None and class_name in (
                         "MiniMaxM3KVCache",
                         "MiniMaxM3BatchKVCache",
+                        "QSAKVCache",
+                        "QSAQuantizedKVCache",
+                        "BatchQSAKVCache",
                     ):
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
@@ -12240,15 +12245,22 @@ class Scheduler:
                 else:
                     dtype_size = tq_dtype_size
 
-            kv_bytes_per_token = (
-                estimate_mla_kv_bytes_per_token(
+            kv_bytes_per_token = None
+            if estimate_qwen4_exp_kv_bytes_per_token is not None:
+                kv_bytes_per_token = estimate_qwen4_exp_kv_bytes_per_token(
                     config,
                     cache_list_for_tq,
                     base_dtype_size,
                 )
-                if estimate_mla_kv_bytes_per_token is not None
-                else None
-            )
+            if (
+                kv_bytes_per_token is None
+                and estimate_mla_kv_bytes_per_token is not None
+            ):
+                kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
+                    config,
+                    cache_list_for_tq,
+                    base_dtype_size,
+                )
             prefill_memory_profile = (
                 make_prefill_memory_profile(
                     config,

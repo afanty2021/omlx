@@ -22,7 +22,9 @@ from omlx.memory_monitor import (
     _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
     _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryMonitor,
+    collect_kv_layer_specs,
     estimate_mla_kv_bytes_per_token,
+    estimate_qwen4_exp_kv_bytes_per_token,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -95,6 +97,17 @@ class _GlmMlaConfig:
     index_head_dim = 128
 
 
+class _Qwen4Config:
+    model_type = "qwen4_exp"
+    num_key_value_heads = 2
+    head_dim = 128
+    indexer_head_dim = 128
+
+
+class QSAKVCache:
+    pass
+
+
 class _VLMConfigEmptySubConfigs:
     """Sub-configs are present but expose no layer count — skip and fall
     back to the top-level config. Defends against accidentally walking
@@ -105,6 +118,20 @@ class _VLMConfigEmptySubConfigs:
     num_attention_heads = 32
     head_dim = 128
     text_config = MagicMock(spec=["something_else"])  # no layer count
+
+
+def test_qwen4_qsa_memory_includes_indexer_and_mrope_state():
+    caches = [QSAKVCache() for _ in range(12)]
+
+    full_layers, rotating, arrays = collect_kv_layer_specs(caches)
+    estimate = estimate_qwen4_exp_kv_bytes_per_token(
+        _Qwen4Config(),
+        caches,
+        dtype_size=2,
+    )
+
+    assert (full_layers, rotating, arrays) == (12, [], 0)
+    assert estimate == 12 * (2 * 2 * 128 * 2 + 128 * 2 + 3 * 8)
 
 
 class TestSetModelInfoForMonitorVLMWalk:

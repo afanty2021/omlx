@@ -103,6 +103,7 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 
@@ -1076,6 +1077,66 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
 
 @contextlib.contextmanager
+def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
+    """Run Qwen4-Exp key sanitization before quantization selection.
+
+    Converted MLX checkpoints legitimately declare ``format=mlx``, but the
+    published Qwen4 layout still uses ``model.language_model.*`` and
+    ``model.visual.*`` names.  mlx-vlm normally skips ``Model.sanitize`` for
+    MLX-format files, which makes its quantization predicate inspect the wrong
+    names and leaves every ``scales``/``biases`` tensor unmatched.  Hide only
+    the format marker for this model and this load so sanitization happens at
+    the point expected by the upstream loader: before ``nn.quantize``.
+    """
+    if _read_config_model_type(model_dir) != "qwen4_exp":
+        yield
+        return
+
+    import safetensors
+
+    original_safe_open = safetensors.safe_open
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    safetensors.safe_open = _patched_safe_open
+    try:
+        logger.info("Qwen4-Exp pre-quantization sanitize active for %s", model_dir.name)
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+
+
+@contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
     ``load_model`` for MLX-format models where sanitize is skipped.
@@ -1620,6 +1681,7 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
+                _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
                 _transpose_qwen35_mlx_vision_patch_embed_on_load(
                     Path(self._model_name)
@@ -1638,15 +1700,15 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
-
                 with _load_optiq_vision_sidecar_on_load(
                     Path(self._model_name)
                 ):
-                    return vlm_load(
+                    loaded = vlm_load(
                         self._model_name,
                         tokenizer_config=tokenizer_config,
                         trust_remote_code=self._trust_remote_code,
                     )
+                    return loaded
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
@@ -2447,7 +2509,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
-                # can handle it.  Image/audio/video parts stay as list.
+                # can handle it. Image/audio parts stay as a list.
                 fc = formatted.get("content")
                 if isinstance(fc, list) and all(
                     isinstance(p, dict) and p.get("type") == "text" for p in fc
@@ -2540,8 +2602,6 @@ class VLMBatchedEngine(BaseEngine):
         # Strategy 2: qwen-style (vision_tower + grid_thw)
         if model_type in _QWEN_VISION_MODELS:
             grid_thw = extra_model_inputs.get("image_grid_thw")
-            if grid_thw is None:
-                grid_thw = extra_model_inputs.get("video_grid_thw")
             if grid_thw is None:
                 return None
             dtype = model.vision_tower.patch_embed.proj.weight.dtype
@@ -2808,10 +2868,17 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+        if model_type == COHERE2_MOE_MODEL_TYPE and (
+            num_images > 0 or num_audios > 0
+        ):
             raise InvalidRequestError(
                 "Cohere2 MoE is a text-only model and does not support "
                 "image or audio input.",
+                field="messages",
+            )
+        if model_type == QWEN4_EXP_MODEL_TYPE and num_audios > 0:
+            raise InvalidRequestError(
+                "Qwen4-Exp supports text and image input but not audio.",
                 field="messages",
             )
 
@@ -2841,7 +2908,9 @@ class VLMBatchedEngine(BaseEngine):
         try:
             formatted_messages, image_message_ranges = (
                 self._format_messages_for_vlm_template(
-                    messages, num_images=num_images, num_audios=num_audios
+                    messages,
+                    num_images=num_images,
+                    num_audios=num_audios,
                 )
             )
         except Exception as e:
@@ -3031,7 +3100,11 @@ class VLMBatchedEngine(BaseEngine):
         extra_model_inputs = {
             k: v
             for k, v in inputs.items()
-            if k not in ("input_ids", "attention_mask", "pixel_values")
+            if k not in (
+                "input_ids",
+                "attention_mask",
+                "pixel_values",
+            )
             and v is not None
         }
 

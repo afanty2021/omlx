@@ -91,9 +91,7 @@ def register_attention_bias_transient(dtype_size: float | None) -> None:
     model load/swap: the setting is process-wide, like the tiled head_dim
     registry above."""
     global _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE
-    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = (
-        float(dtype_size) if dtype_size else None
-    )
+    _ATTENTION_BIAS_TRANSIENT_DTYPE_SIZE = float(dtype_size) if dtype_size else None
 
 
 def estimate_unfused_sdpa_call_bytes(
@@ -737,7 +735,9 @@ class MemoryMonitor:
             and query_tokens > 1
             and kv_len >= _SDPA_TILED_MIN_KV_LEN
         ):
-            tile_scores = n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            tile_scores = (
+                n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
+            )
             return output + tile_scores + bias
 
         return (
@@ -1057,14 +1057,7 @@ class _DeepSeekV4PrefillMemoryProfile:
         # conservative bound for the unfused MLX path.
         topk_workspace = 6 * reduced_scores
         selected = query_tokens * min(self.index_topk, pooled_tokens) * 4
-        return (
-            query
-            + keys
-            + weights
-            + materialized_scores
-            + topk_workspace
-            + selected
-        )
+        return query + keys + weights + materialized_scores + topk_workspace + selected
 
     def _indexer_native_bytes(self, query_tokens: int, pooled_tokens: int) -> int:
         """Bound the fused native indexer score and deterministic top-k path."""
@@ -1273,8 +1266,9 @@ _ROTATING_CACHE_CLASS_NAMES = frozenset(
 )
 # Fixed-state recurrent caches (GDN/Mamba). Matches
 # Scheduler._cache_tree_has_arrays_cache plus mlx-lm's MambaCache.
-_ARRAYS_CACHE_CLASS_NAMES = frozenset(
-    {"ArraysCache", "SizedArraysCache", "MambaCache"}
+_ARRAYS_CACHE_CLASS_NAMES = frozenset({"ArraysCache", "SizedArraysCache", "MambaCache"})
+_FULL_KV_CACHE_CLASS_NAMES = frozenset(
+    {"QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache"}
 )
 
 
@@ -1305,7 +1299,7 @@ def collect_kv_layer_specs(
 
     def _walk(c: Any) -> None:
         nonlocal full, arrays
-        if type(c) is KVCache:
+        if type(c) is KVCache or type(c).__name__ in _FULL_KV_CACHE_CLASS_NAMES:
             full += 1
             return
         if isinstance(c, CacheList):
@@ -1331,6 +1325,48 @@ def collect_kv_layer_specs(
 
     specs = [(count, window) for window, count in sorted(windows.items())]
     return full, specs, arrays
+
+
+def estimate_qwen4_exp_kv_bytes_per_token(
+    config: Any,
+    cache_list: Any,
+    dtype_size: float,
+) -> float | None:
+    """Price Qwen4 QSA K/V plus its raw index keys and MRoPE positions."""
+    if not str(_cfg_get(config, "model_type", "")).startswith("qwen4_exp"):
+        return None
+    if cache_list is None:
+        return None
+
+    try:
+        qsa_layers = sum(
+            1
+            for cache in cache_list
+            if type(cache).__name__
+            in {"QSAKVCache", "QSAQuantizedKVCache", "BatchQSAKVCache"}
+        )
+    except Exception:
+        return None
+    if qsa_layers <= 0:
+        return None
+
+    num_kv_heads = _cfg_get(config, "num_key_value_heads")
+    head_dim = _cfg_get(config, "head_dim")
+    indexer_head_dim = _cfg_get(config, "indexer_head_dim")
+    if not all(_pos_int(value) for value in (num_kv_heads, head_dim, indexer_head_dim)):
+        return None
+    if not isinstance(dtype_size, (int, float)) or dtype_size <= 0:
+        return None
+
+    # QSA keeps ordinary K/V, one raw index-key vector, and up to three int64
+    # MRoPE coordinates for every cached token. Text-only positions use one
+    # coordinate, but charging all three keeps image requests conservative.
+    per_layer = (
+        2 * num_kv_heads * head_dim * float(dtype_size)
+        + indexer_head_dim * float(dtype_size)
+        + 3 * 8
+    )
+    return float(qsa_layers * per_layer)
 
 
 def estimate_mla_kv_bytes_per_token(
@@ -1497,9 +1533,9 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             except Exception:
                 pass
 
-        kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
+        kv_bytes_per_token = estimate_qwen4_exp_kv_bytes_per_token(
             config, cache_list, dtype_size
-        )
+        ) or estimate_mla_kv_bytes_per_token(config, cache_list, dtype_size)
 
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
@@ -1619,7 +1655,10 @@ def raise_if_prefill_exceeds(
         request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
     logger.warning(
         "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
-        num_prompt_tokens, cached_tokens, request_id, message,
+        num_prompt_tokens,
+        cached_tokens,
+        request_id,
+        message,
     )
     raise PrefillMemoryExceededError(
         message=message,

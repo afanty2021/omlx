@@ -1264,7 +1264,6 @@ class TestProcessChatMessages:
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] is None
 
-
 # ---------------------------------------------------------------------------
 # TestPrepareVisionInputs
 # ---------------------------------------------------------------------------
