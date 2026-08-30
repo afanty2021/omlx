@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from omlx.cache.observability import BoundarySnapshotDiagnostics
 from omlx.cache.paged_cache import BlockTable, PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
@@ -314,6 +315,7 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         _cache_list_needs_boundary_snapshot=lambda cache: True,
         _boundary_cache_snapshots={},
         _boundary_snapshot_store=None,
+        _boundary_snapshot_diagnostics=BoundarySnapshotDiagnostics(),
         _boundary_snapshot_required=False,
         _stream=mx.default_stream(mx.default_device()),
         _PREFILL_SNAPSHOT_MARKER=Scheduler._PREFILL_SNAPSHOT_MARKER,

@@ -183,7 +183,6 @@ def get_effective_metal_cap_bytes() -> int:
         return sysctl_cap
     return _get_max_metal_working_set_bytes()
 
-
 def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     """Clamp and align a wired-limit recommendation to leave 5% of RAM.
 

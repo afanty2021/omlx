@@ -30,12 +30,26 @@ def test_qwen4_exp_runtime_rejects_audio_only():
         )
 
 
-def test_qwen4_exp_mlx_metadata_is_hidden_during_load(tmp_path, monkeypatch):
-    (tmp_path / "config.json").write_text(
+@pytest.mark.parametrize("symlinked", [False, True], ids=["plain", "hf-symlink"])
+def test_qwen4_exp_mlx_metadata_is_hidden_only_for_model_shards(
+    tmp_path, monkeypatch, symlinked
+):
+    model_dir = tmp_path / "snapshot"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
         json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
     )
-    weight_file = tmp_path / "model.safetensors"
-    weight_file.touch()
+    weight_file = model_dir / "model.safetensors"
+    if symlinked:
+        blob_dir = tmp_path / "blobs"
+        blob_dir.mkdir()
+        blob = blob_dir / "content-hash"
+        blob.touch()
+        weight_file.symlink_to(blob)
+    else:
+        weight_file.touch()
+    outside_file = tmp_path / "outside.safetensors"
+    outside_file.touch()
 
     class FakeHandle:
         def __enter__(self):
@@ -49,14 +63,59 @@ def test_qwen4_exp_mlx_metadata_is_hidden_during_load(tmp_path, monkeypatch):
 
     import safetensors
 
-    original = lambda *_args, **_kwargs: FakeHandle()
-    monkeypatch.setattr(safetensors, "safe_open", original)
+    def fake_safe_open(*_args, **_kwargs):
+        return FakeHandle()
 
-    with vlm_module._force_qwen4_exp_sanitize_on_load(tmp_path):
-        with safetensors.safe_open(weight_file) as handle:
-            assert handle.metadata() == {"source": "test"}
+    monkeypatch.setattr(safetensors, "safe_open", fake_safe_open)
 
-    assert safetensors.safe_open is original
+    with vlm_module._force_qwen4_exp_sanitize_on_load(model_dir):
+        target_handle = safetensors.safe_open(weight_file)
+        outside_handle = safetensors.safe_open(outside_file)
+        assert target_handle.metadata() == {"source": "test"}
+        assert outside_handle.metadata() == {"format": "mlx", "source": "test"}
+
+    assert safetensors.safe_open is fake_safe_open
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_type", "expected_lazy"),
+    [("qwen4_exp", True), ("qwen2_vl", None)],
+)
+async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
+    tmp_path, monkeypatch, model_type, expected_lazy
+):
+    import mlx_vlm.utils as vlm_utils
+
+    from omlx.utils import model_loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": model_type}), encoding="utf-8"
+    )
+    captured = {}
+
+    def stop_after_load(model_name, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(vlm_utils, "load", stop_after_load)
+    monkeypatch.setattr(vlm_module, "_patch_video_processor_bug", lambda: None)
+    monkeypatch.setattr(vlm_module, "_patch_torch_free_image_processor", lambda: None)
+    monkeypatch.setattr(vlm_module, "apply_pixtral_torch_free_patch", lambda: None)
+    monkeypatch.setattr(
+        model_loading, "maybe_apply_pre_load_patches", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        model_loading, "maybe_load_custom_quantization", lambda *a, **k: None
+    )
+
+    with pytest.raises(RuntimeError, match="stop after load"):
+        await VLMBatchedEngine(model_name=str(tmp_path)).start()
+
+    if expected_lazy is None:
+        assert "lazy" not in captured
+    else:
+        assert captured["lazy"] is expected_lazy
 
 
 def test_qwen4_exp_loader_enables_adaptive_depth_three_lightning_mtp(tmp_path):

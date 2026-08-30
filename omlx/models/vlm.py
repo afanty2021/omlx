@@ -149,6 +149,11 @@ class VLMModelAdapter(nn.Module):
         return "vlm"
 
     @property
+    def supports_skip_lm_head(self) -> bool:
+        """Whether the wrapped official language model has a cache-only pass."""
+        return self.model_type == "qwen4_exp"
+
+    @property
     def config(self):
         """Expose model config."""
         return self._vlm_model.config
@@ -338,6 +343,7 @@ class VLMModelAdapter(nn.Module):
         self,
         input_ids: mx.array,
         cache: Optional[List[Any]] = None,
+        skip_lm_head: bool = False,
         **kwargs,
     ) -> Any:
         """
@@ -359,6 +365,12 @@ class VLMModelAdapter(nn.Module):
             Model output (logits as mx.array)
         """
         return_hidden = bool(kwargs.get("return_hidden", False))
+        if skip_lm_head:
+            # Scheduler prefill chunks discard their logits. Translate the
+            # shared cache-only contract into the official Qwen model hook so
+            # those chunks do not project every token over the full vocabulary.
+            if self.model_type == "qwen4_exp":
+                kwargs["skip_logits"] = True
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
         vlm_extra.pop("_captured_rope_deltas", None)

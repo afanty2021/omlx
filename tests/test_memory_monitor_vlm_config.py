@@ -280,6 +280,23 @@ class TestMlaKvMemoryEstimate:
         assert actual == tokens * bytes_per_token
         assert actual < standard / 20
 
+    def test_nope_mla_accepts_zero_rope_and_prices_pooling_ratio(self):
+        from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+
+        apply_pooling_cache_support()
+        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
+
+        config = type(
+            "NopeMlaConfig",
+            (),
+            {"kv_lora_rank": 512, "qk_rope_head_dim": 0, "index_head_dim": 128},
+        )()
+        caches = [CacheList(KVCache(), PoolingCache(4)) for _ in range(11)]
+
+        assert estimate_mla_kv_bytes_per_token(config, caches, 2) == (
+            11 * (512 + 128 / 4) * 2
+        )
+
     def test_scheduler_passes_mla_kv_override_to_monitor(self):
         sched = _make_scheduler()
         sched.memory_monitor = MagicMock()

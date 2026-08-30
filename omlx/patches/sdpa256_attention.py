@@ -157,13 +157,26 @@ def _tiled_route_required(queries, keys) -> bool:
         return True  # headroom info unavailable -> memory-safe default
 
 
+def _broadcast_mask_5d(mask, batch, n_kv, group_size, q_len, k_len):
+    """Reshape a boolean mask for the tiled GQA attention layout."""
+    if mask.ndim == 4:
+        if mask.shape[1] == 1:
+            return mask[:, :, None]
+        return mask.reshape(batch, n_kv, group_size, q_len, k_len)
+    if mask.ndim == 3:
+        return mask[:, None, None]
+    if mask.ndim == 2:
+        return mask[None, None, None]
+    raise ValueError(f"unsupported attention mask ndim: {mask.ndim}")
+
+
 def _flash_sdpa256(queries, keys, values, scale, mask):
     """Flash-style online-softmax attention for head_dim=256 prefill.
 
     queries: [batch, n_q, q_len, head_dim]
     keys/values: [batch, n_kv, k_len, head_dim]   (n_q % n_kv == 0)
-    mask: "causal" or None. Returns [batch, n_q, q_len, head_dim] in
-    queries.dtype.
+    mask: "causal", None, or a boolean array. Returns
+    [batch, n_q, q_len, head_dim] in queries.dtype.
 
     Tiles over Q and KV, keeping a running (max m, sum denom, accumulator acc) per
     query row so the [q x full_kv] score matrix is never materialized. fp32
@@ -177,7 +190,14 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
     batch, n_q, q_len, head_dim = queries.shape
     _, n_kv, k_len, _ = keys.shape
     group_size = n_q // n_kv
-    causal = mask == "causal"
+    causal = isinstance(mask, str) and mask == "causal"
+    bool_mask = None
+    if isinstance(mask, mx.array):
+        if mask.dtype != mx.bool_:
+            raise ValueError("_flash_sdpa256 only supports boolean array masks")
+        bool_mask = _broadcast_mask_5d(
+            mask, batch, n_kv, group_size, q_len, k_len
+        )
 
     qr = queries.reshape(batch, n_kv, group_size, q_len, head_dim)
     kr = keys.reshape(batch, n_kv, 1, k_len, head_dim)
@@ -210,6 +230,9 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
             if causal:
                 k_pos = mx.arange(kj0, kj1).reshape(1, 1, 1, 1, kt)
                 s = mx.where(k_pos > q_pos, _NEG_INF, s)
+            elif bool_mask is not None:
+                tile_mask = bool_mask[..., qi0:qi1, kj0:kj1]
+                s = mx.where(tile_mask, s, _NEG_INF)
 
             m_tile = mx.max(s, axis=-1, keepdims=True)
             m_new = mx.maximum(m, m_tile)
@@ -248,7 +271,12 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
         # hasattr(cache, "bits"); let the quant-aware path handle it.
         if cache is not None and hasattr(cache, "bits"):
             return False
-        if not (mask is None or (isinstance(mask, str) and mask == "causal")):
+        mask_is_bool = isinstance(mask, mx.array) and mask.dtype == mx.bool_
+        if not (
+            mask is None
+            or (isinstance(mask, str) and mask == "causal")
+            or mask_is_bool
+        ):
             return False
         n_q = queries.shape[-3]
         n_kv = keys.shape[-3]

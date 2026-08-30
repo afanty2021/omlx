@@ -919,6 +919,10 @@ def _pos_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
 
+def _nonnegative_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
 @dataclass(frozen=True)
 class _DeepSeekV4PrefillMemoryProfile:
     """Exact-shape prefill estimator for DeepSeek V4's hybrid attention.
@@ -1379,20 +1383,21 @@ def estimate_mla_kv_bytes_per_token(
     GLM/DeepSeek MLA models do not store expanded ``num_kv_heads * head_dim``
     K/V tensors. Their main cache stores a latent key and RoPE value
     (``kv_lora_rank + qk_rope_head_dim``) with a single KV head. GLM-5.2's DSA
-    indexer adds a second cache on full-indexer layers containing only
-    ``index_head_dim`` keys and zero-width values. Falling back to the standard
-    uniform KV formula over-counts GLM-5.2 by more than an order of magnitude.
+    indexer adds a second cache on full-indexer layers. GLM-5.2 stores one
+    ``index_head_dim`` key per token, while GLM-5.3 pools those keys by the
+    cache's compression ratio. Falling back to the standard uniform KV formula
+    over-counts these models by more than an order of magnitude.
     """
     kv_lora_rank = _cfg_get(config, "kv_lora_rank")
     rope_dim = _cfg_get(config, "qk_rope_head_dim")
-    if not (_pos_int(kv_lora_rank) and _pos_int(rope_dim)):
+    if not (_pos_int(kv_lora_rank) and _nonnegative_int(rope_dim)):
         return None
 
     if cache_list is None:
         return None
 
     main_cache_layers = 0
-    indexer_cache_layers = 0
+    indexer_cache_token_ratio = 0.0
     try:
         for layer_cache in cache_list:
             caches = getattr(layer_cache, "caches", None)
@@ -1402,7 +1407,11 @@ def estimate_mla_kv_bytes_per_token(
             if n_caches >= 1:
                 main_cache_layers += 1
             if n_caches >= 2:
-                indexer_cache_layers += 1
+                indexer_cache = caches[1]
+                ratio = getattr(indexer_cache, "ratio", 1)
+                if not _pos_int(ratio):
+                    ratio = 1
+                indexer_cache_token_ratio += 1.0 / ratio
     except Exception:
         return None
 
@@ -1415,7 +1424,7 @@ def estimate_mla_kv_bytes_per_token(
 
     elems_per_token = (
         main_cache_layers * (kv_lora_rank + rope_dim)
-        + indexer_cache_layers * index_head_dim
+        + indexer_cache_token_ratio * index_head_dim
     )
     return float(elems_per_token) * float(dtype_size)
 

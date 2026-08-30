@@ -47,7 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
-from .cache.observability import CacheRateTracker
+from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
@@ -924,9 +924,52 @@ if _TQ_SINGLETON_CACHE_TYPE is not None:
         _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
+_original_make_cache = _mlx_lm_generate_module._make_cache
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
 _original_ppb_split = PromptProcessingBatch.split
 _REGULAR_SINGLETON_CACHE_TYPES = (_MLXKVCache, _MLXRotatingKVCache)
+
+
+def _patched_make_cache(model, left_padding, max_kv_size):
+    """Honor model-owned batch conversion before MLX-LM's fallbacks."""
+    if not hasattr(model, "make_cache"):
+        return _original_make_cache(model, left_padding, max_kv_size)
+
+    model_cache = model.make_cache()
+
+    def has_model_owned_conversion(cache_obj):
+        if callable(getattr(cache_obj, "to_batch", None)):
+            return True
+        sub_caches = getattr(cache_obj, "caches", None)
+        return isinstance(sub_caches, (list, tuple)) and any(
+            has_model_owned_conversion(child) for child in sub_caches
+        )
+
+    class _SingleCacheModel:
+        layers = (None,)
+
+        def __init__(self, cache_obj):
+            self.cache_obj = cache_obj
+
+        def make_cache(self):
+            return [self.cache_obj]
+
+    def convert(cache_obj):
+        to_batch = getattr(cache_obj, "to_batch", None)
+        if callable(to_batch):
+            return to_batch(left_padding)
+
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)) and any(
+            has_model_owned_conversion(child) for child in sub_caches
+        ):
+            return type(cache_obj)(*(convert(child) for child in sub_caches))
+
+        return _original_make_cache(
+            _SingleCacheModel(cache_obj), left_padding, max_kv_size
+        )[0]
+
+    return [convert(cache_obj) for cache_obj in model_cache]
 
 
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
@@ -950,6 +993,13 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
     ):
         return cache_obj.merge([cache_obj])
+    # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
+    # conversion via to_batch, which _patched_make_cache honors at creation;
+    # honor it on the continuous-batching join path too, or extend() hits a
+    # singleton without the method. A warm singleton is one unpadded row.
+    to_batch = getattr(cache_obj, "to_batch", None)
+    if callable(to_batch):
+        return to_batch([0])
     return cache_obj
 
 
@@ -1026,6 +1076,7 @@ def _patched_ppb_split(self, indices):
     return _original_ppb_split(self, indices)
 
 
+_mlx_lm_generate_module._make_cache = _patched_make_cache
 _mlx_lm_generate_module._merge_caches = _patched_merge_caches
 _mlx_lm_generate_module._extend_cache = _patched_extend_cache
 PromptProcessingBatch.split = _patched_ppb_split
@@ -1181,6 +1232,10 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
+        # Both QSA handlers support block slicing, so their growing KV and
+        # index state must not be copied into every boundary snapshot.
+        "QSAKVCache",
+        "QSAQuantizedKVCache",
     }
 )
 
@@ -1339,6 +1394,8 @@ def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> 
     if lm is None or not hasattr(lm, "_rope_deltas"):
         return
     lm._rope_deltas = mx.zeros((1, 1), dtype=mx.int64)
+    # Keep the restore-only seed concrete before the engine-stream graph uses it.
+    mx.eval(lm._rope_deltas)
 
 
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
@@ -1950,8 +2007,21 @@ class Scheduler:
         # can log their divergence point at INFO (#2333).
         self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(maxlen=4)
 
+        # Hybrid models whose recurrent state is REBOUND per decode step
+        # (ArraysCache/SizedArraysCache: MiniMax, Qwen3.5-Next, GLM-5.3, ...)
+        # never materialize those states through mx.async_eval alone. The
+        # unevaluated per-step chain pins every intermediate Metal buffer,
+        # and the allocator's per-process resource count (499,000 buffers)
+        # is exhausted long before any byte limit — the
+        # "[metal::malloc] Resource limit (499000) exceeded" failure (#3226).
+        # Periodic materialization collapses the chain; enable it for every
+        # ArraysCache hybrid, not just MiniMax.
         model_name_lower = (self.config.model_name or "").lower()
-        default_kv_eval_interval = 256 if "minimax" in model_name_lower else 0
+        default_kv_eval_interval = (
+            256
+            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            else 0
+        )
         self._decode_eval_kv_cache_interval: int = max(
             0,
             _env_int(
@@ -2021,12 +2091,14 @@ class Scheduler:
         self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
         self._boundary_snapshot_store: BoundarySnapshotSSDStore | None = None
+        self._boundary_snapshot_diagnostics = BoundarySnapshotDiagnostics()
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
         self.paged_cache_manager: PagedCacheManager | None = None
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
         self._cache_rate_tracker = CacheRateTracker()
+        self._last_prefix_cache_lookup: dict[str, Any] | None = None
         # Prefill-peak estimator used by ``_preflight_memory_check`` /
         # ``preflight_or_raise``. Only the estimator path is exercised
         # here (it reads head_dim / num_layers / num_kv_heads via
@@ -2245,9 +2317,18 @@ class Scheduler:
         the entire MLX buffer pool in one batch; gating it on accumulated
         bytes avoids producing IOGPUFamily refcount bursts when the pool
         is already small.
+
+        The memory_limit/3 term is additionally capped at 16 GiB: on
+        large-memory machines (soft limit ~438 GB on a 512 GB Studio) an
+        uncapped threshold (~146 GB) meant the periodic clear effectively
+        never fired, letting the pool hoard buffer *handles* against the
+        Metal per-process resource count even while byte usage stayed
+        modest (#3226).
         """
+        cap = 16 * 1024**3
         if self._memory_limit_bytes > 0:
-            return max(self._memory_limit_bytes // 3, 2 * 1024**3)
+            return min(max(self._memory_limit_bytes // 3, 2 * 1024**3), cap)
+
         return 2 * 1024**3
 
     def _should_periodic_clear_cache(self) -> bool:
@@ -2646,22 +2727,29 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for the Qwen3.5 architecture family."""
+        """Return the wide-prefill floor for Qwen hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
                 model_type = str(
                     getattr(getattr(self.model, "config", None), "model_type", "") or ""
                 )
-            if model_type.startswith("qwen3_5"):
+            is_qwen35 = model_type.startswith("qwen3_5")
+            is_qwen4 = model_type.startswith("qwen4_exp")
+            if is_qwen4:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Measured on the 27B (M3 Ultra, 2026-08-17): chunk 4096
-                    # beats the 2048 default +3.2% at 4k prompts / +1.0% at
-                    # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
-                    # where wider prefill regresses throughput (#2880).
+                    # Qwen4 needs its sparse native path before wider chunks
+                    # are safe. NAX/M5 stays at 2048 for both model families.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
@@ -2727,6 +2815,21 @@ class Scheduler:
             target,
         )
         self.config.paged_cache_block_size = target
+
+    def _model_has_arrays_cache(self) -> bool:
+        """Whether the model's cache layout contains ArraysCache layers."""
+        if not hasattr(self.model, "make_cache"):
+            return False
+        try:
+            cache_list = self.model.make_cache()
+        except Exception:
+            return False
+        if not cache_list:
+            return False
+
+        return any(
+            self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
+        )
 
     @staticmethod
     def _cache_tree_has_arrays_cache(cache_obj: Any) -> bool:
@@ -5410,6 +5513,7 @@ class Scheduler:
                 logger.error("Chunked prefill capacity rejected for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
+                self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
@@ -5420,6 +5524,7 @@ class Scheduler:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
+                self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
@@ -6171,14 +6276,45 @@ class Scheduler:
         ``BatchGenerator`` yet and the uid mapping does not exist —
         routing through it dropped every snapshot silently (#TBD).
         """
+        block_size = self.config.paged_cache_block_size
+        self._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id=request_id,
+            token_count=token_count,
+            block_size=block_size,
+            source="prefill",
+        )
         if self.block_aware_cache is None:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="prefix_cache_disabled",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
-        block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="unaligned_token_count",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="no_stateful_cache",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         if request_id not in self._boundary_cache_snapshots:
@@ -6186,6 +6322,14 @@ class Scheduler:
 
         # Skip if we already have a snapshot at this token count
         if token_count in self._boundary_cache_snapshots[request_id]:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="duplicate_boundary",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         # Offload snapshot to SSD if store is available, keeping only a
@@ -6207,7 +6351,17 @@ class Scheduler:
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
+                storage = "ssd"
             else:
+                self._boundary_snapshot_diagnostics.record(
+                    "ssd_fallback",
+                    reason="ssd_save_failed",
+                    request_id=request_id,
+                    token_count=token_count,
+                    block_size=block_size,
+                    source="prefill",
+                    storage="memory",
+                )
                 self._boundary_cache_snapshots[request_id][token_count] = (
                     _compact_boundary_snapshot_value(
                         self._prefill_snapshot_value(snapshot_cache),
@@ -6216,6 +6370,7 @@ class Scheduler:
                         self._stream,
                     )
                 )
+                storage = "memory"
         else:
             self._boundary_cache_snapshots[request_id][token_count] = (
                 _compact_boundary_snapshot_value(
@@ -6225,13 +6380,23 @@ class Scheduler:
                     self._stream,
                 )
             )
+            storage = "memory"
 
         self._boundary_snapshot_required = True
         self._enable_mtp_boundary_alignment()
+        self._boundary_snapshot_diagnostics.record(
+            "capture_success",
+            request_id=request_id,
+            token_count=token_count,
+            block_size=block_size,
+            source="prefill",
+            storage=storage,
+        )
         logger.debug(
-            "Captured prefill boundary cache snapshot for %s at %s tokens",
+            "Captured prefill boundary cache snapshot for %s at %s tokens (%s)",
             request_id,
             token_count,
+            storage,
         )
 
     _PREFILL_SNAPSHOT_MARKER = "__prefill_extracted__"
@@ -6455,7 +6620,10 @@ class Scheduler:
             pass
 
     def _extract_boundary_snapshot(
-        self, uid: int, expected_tokens: int | None = None
+        self,
+        uid: int,
+        expected_tokens: int | None = None,
+        request_id: str | None = None,
     ) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
@@ -6473,7 +6641,20 @@ class Scheduler:
         on hybrid models; skipping the capture merely costs a reuse
         opportunity.
         """
+        block_size = self.config.paged_cache_block_size
+
+        def record_skip(reason: str) -> None:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason=reason,
+                request_id=request_id,
+                token_count=expected_tokens,
+                block_size=block_size,
+                source="decode",
+            )
+
         if self.batch_generator is None:
+            record_skip("batch_generator_unavailable")
             return None
 
         try:
@@ -6485,6 +6666,7 @@ class Scheduler:
                 with mx.stream(self._stream):
                     result = self.batch_generator.extract_cache([uid])
                     if uid not in result:
+                        record_skip("uid_not_found")
                         return None
                     cache_list, _tokens = result[uid]
                     if expected_tokens is not None:
@@ -6505,11 +6687,12 @@ class Scheduler:
                                     offset,
                                     expected_tokens,
                                 )
+                                record_skip("cache_offset_mismatch")
                                 return None
                             break
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
-                    return [
+                    snapshot = [
                         (
                             c
                             if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
@@ -6517,10 +6700,15 @@ class Scheduler:
                         )
                         for c in cache_list
                     ]
+                    if not snapshot:
+                        record_skip("empty_snapshot")
+                        return None
+                    return snapshot
         except Exception as e:
             logger.debug(
                 f"Failed to extract boundary cache snapshot for uid={uid}: {e}"
             )
+            record_skip("extract_error")
             return None
 
     def _maybe_capture_boundary_snapshot(self, request: Request, uid: int) -> None:
@@ -6539,8 +6727,17 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
+        self._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id=request.request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+            source="decode",
+        )
         snapshot_cache = self._extract_boundary_snapshot(
-            uid, expected_tokens=total_tokens
+            uid,
+            expected_tokens=total_tokens,
+            request_id=request.request_id,
         )
         if not snapshot_cache:
             return
@@ -6560,7 +6757,17 @@ class Scheduler:
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
+                storage = "ssd"
             else:
+                self._boundary_snapshot_diagnostics.record(
+                    "ssd_fallback",
+                    reason="ssd_save_failed",
+                    request_id=request.request_id,
+                    token_count=total_tokens,
+                    block_size=block_size,
+                    source="decode",
+                    storage="memory",
+                )
                 # In-memory fallback: the store-cache worker slices this snapshot
                 # off-thread (via _BoundarySnapshotProvider -> _extract_cache_states).
                 # MLX streams are thread-local, so force the leaves concrete now on
@@ -6572,16 +6779,26 @@ class Scheduler:
                         snapshot_cache, total_tokens, block_size
                     )
                 )
+                storage = "memory"
         else:
             self._boundary_cache_snapshots[request.request_id][total_tokens] = (
                 self._decode_boundary_snapshot_value(
                     snapshot_cache, total_tokens, block_size
                 )
             )
+            storage = "memory"
 
+        self._boundary_snapshot_diagnostics.record(
+            "capture_success",
+            request_id=request.request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+            source="decode",
+            storage=storage,
+        )
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
-            f"{total_tokens} tokens"
+            f"{total_tokens} tokens ({storage})"
         )
 
     def _get_boundary_store_override(
@@ -6605,12 +6822,33 @@ class Scheduler:
             intermediate_snapshots) where intermediate_snapshots maps
             token_count -> extracted cache states for per-block storage.
         """
-        snapshots = self._boundary_cache_snapshots.get(request_id)
-        if not snapshots:
-            return None
-
         total_tokens = len(full_token_sequence)
         block_size = self.config.paged_cache_block_size
+        self._boundary_snapshot_diagnostics.record(
+            "override_attempt",
+            request_id=request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+        )
+
+        def miss(reason: str, available_boundaries: int = 0) -> None:
+            self._boundary_snapshot_diagnostics.record(
+                "override_miss",
+                reason=reason,
+                request_id=request_id,
+                token_count=total_tokens,
+                block_size=block_size,
+                available_boundaries=available_boundaries,
+            )
+
+        snapshots = self._boundary_cache_snapshots.get(request_id)
+        if not snapshots:
+            miss("no_snapshots")
+            return None
+
+        if block_size <= 0:
+            miss("invalid_block_size", len(snapshots))
+            return None
 
         # Find all valid boundary-aligned snapshot token counts
         valid_counts = sorted(
@@ -6619,6 +6857,7 @@ class Scheduler:
             if 0 < tc <= total_tokens and tc % block_size == 0
         )
         if not valid_counts:
+            miss("no_aligned_snapshots", len(snapshots))
             return None
 
         # Find the latest snapshot that leaves trailing partial tokens
@@ -6632,6 +6871,7 @@ class Scheduler:
             # provide intermediate snapshots for per-block storage.
             latest_tc = total_tokens
         else:
+            miss("latest_snapshot_not_usable", len(valid_counts))
             return None
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
@@ -6646,6 +6886,7 @@ class Scheduler:
             # Offloaded to SSD — load back.
             extracted_cache = self._boundary_snapshot_store.load(request_id, latest_tc)
             if not extracted_cache:
+                miss("ssd_load_failed", len(valid_counts))
                 return None
             # Build model_cache_config from the main request cache config
             # since the SSD snapshot doesn't carry it.
@@ -6669,8 +6910,10 @@ class Scheduler:
                     latest_snapshot
                 )
             if not extracted_cache:
+                miss("snapshot_extract_failed", len(valid_counts))
                 return None
         else:
+            miss("snapshot_value_unavailable", len(valid_counts))
             return None
 
         # Build provider for intermediate snapshots. SSD-backed snapshots remain
@@ -6714,6 +6957,13 @@ class Scheduler:
             else full_token_sequence
         )
 
+        self._boundary_snapshot_diagnostics.record(
+            "override_hit",
+            request_id=request_id,
+            token_count=latest_tc,
+            block_size=block_size,
+            available_boundaries=len(valid_counts),
+        )
         return (
             token_sequence,
             extracted_cache,
@@ -7611,7 +7861,35 @@ class Scheduler:
         logs.
         """
         prompt = request.prompt_token_ids or []
-        if not prompt or not self._cache_probe_seqs:
+        cached = request.cached_tokens or 0
+        block = max(1, self.config.paged_cache_block_size)
+        base_observation: dict[str, Any] = {
+            "request_id": request.request_id,
+            "prompt_tokens": len(prompt),
+            "reused_kv_tokens": cached,
+            "reprefill_tokens": max(0, len(prompt) - cached),
+            "block_size": block,
+            "matched_blocks": cached // block,
+        }
+        if not prompt:
+            self._last_prefix_cache_lookup = {
+                **base_observation,
+                "reason": "empty_prompt",
+                "closest_request_id": None,
+                "common_prefix_tokens": 0,
+                "comparable_tokens": 0,
+                "unreused_common_prefix_tokens": 0,
+            }
+            return
+        if not self._cache_probe_seqs:
+            self._last_prefix_cache_lookup = {
+                **base_observation,
+                "reason": "no_recent_store_probe",
+                "closest_request_id": None,
+                "common_prefix_tokens": 0,
+                "comparable_tokens": 0,
+                "unreused_common_prefix_tokens": 0,
+            }
             return
         best_id, best_seq, best_p = None, None, -1
         for ref_id, seq in list(self._cache_probe_seqs):
@@ -7620,10 +7898,16 @@ class Scheduler:
                 best_id, best_seq, best_p = ref_id, seq, p
         if best_seq is None:
             return
-        cached = request.cached_tokens or 0
         reusable = min(len(prompt), len(best_seq))
-        block = max(1, self.config.paged_cache_block_size)
         reprefill = len(prompt) - cached
+        self._last_prefix_cache_lookup = {
+            **base_observation,
+            "reason": "closest_recent_store",
+            "closest_request_id": best_id,
+            "common_prefix_tokens": best_p,
+            "comparable_tokens": reusable,
+            "unreused_common_prefix_tokens": max(0, best_p - cached),
+        }
         if reprefill >= self._REPREFILL_INFO_MIN_TOKENS and best_p >= block:
             logger.info(
                 "prefix cache: request %s re-prefills %d of %d tokens "
@@ -7955,6 +8239,32 @@ class Scheduler:
         else:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
+
+        # Lightning-MTP has a small prompt-history cache separate from the
+        # backbone KV restored above.  Bind an exact full-block sidecar (when
+        # one exists) to this singleton timeline before any uncached suffix is
+        # forwarded.  The hook is intentionally best-effort/fail-closed:
+        # ordinary inference and prefix reuse stay valid if MTP is disabled,
+        # the sidecar was evicted, or this model family does not support it.
+        try:
+            from .patches.mlx_lm_mtp import prompt_priming
+
+            prompt_priming.prepare_prefix_context(
+                self.model,
+                request_id=request.request_id,
+                prompt_tokens=request.prompt_token_ids,
+                cached_tokens=request.cached_tokens,
+                prefix_cache=self.block_aware_cache,
+                extra_keys=request.vlm_extra_keys_for_cache,
+                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            )
+        except Exception as exc:
+            logger.debug(
+                "MTP prefix-history preparation failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
 
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
@@ -9089,6 +9399,26 @@ class Scheduler:
             return 1
         return max(1, self.config.max_num_seqs)
 
+    def _drop_boundary_snapshots_for_request(self, request_id: str) -> None:
+        """Release a failed request's boundary snapshots (RAM and SSD).
+
+        The in-memory dict values can hold live mx.arrays (the SSD-store
+        fallback path), and the store keeps a per-request snapshot dir on
+        disk. Both are normally released in _cleanup_finished; error paths
+        must do the same or every failure strands a snapshot set until
+        process exit (#3226).
+        """
+        self._boundary_cache_snapshots.pop(request_id, None)
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            except Exception as e:
+                logger.debug(
+                    "Boundary snapshot store cleanup failed for %s: %s",
+                    request_id,
+                    e,
+                )
+
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
 
@@ -9165,6 +9495,16 @@ class Scheduler:
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
+        # Drop boundary snapshots and paged-cache reservations for every
+        # failed request. Without this, each engine-loop failure strands a
+        # full per-request snapshot set (live mx.arrays for the in-memory
+        # fallback, orphaned snapshot dirs on SSD) and its block refs until
+        # process exit — a Metal buffer/byte ratchet across failures (#3226).
+        # failed_ids excludes _inflight_store_futures ids, so snapshots the
+        # async store worker still reads are left intact.
+        for rid in failed_ids:
+            self._drop_boundary_snapshots_for_request(rid)
+            self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
         # with it; survivors re-register at re-insert.
         _unregister_uid_rows_for_model(self.model)
@@ -10996,13 +11336,27 @@ class Scheduler:
                                 f"{len(request.output_token_ids)} output)"
                             )
                         except _BoundaryStoreUnavailable:
-                            logger.debug(
-                                "Skipping cache store for %s: no boundary-aligned "
-                                "snapshot for non-sliceable cache state (all "
-                                "captures skipped, e.g. by the speculative-decode "
-                                "skew guard); storing live state would corrupt "
+                            available_boundaries = len(
+                                self._boundary_cache_snapshots.get(request_id, {})
+                            )
+                            self._boundary_snapshot_diagnostics.record(
+                                "store_skip",
+                                reason="boundary_snapshot_unavailable",
+                                request_id=request_id,
+                                token_count=len(cacheable_sequence),
+                                block_size=self.config.paged_cache_block_size,
+                                available_boundaries=available_boundaries,
+                            )
+                            logger.info(
+                                "Skipping cache store for %s: reason=%s "
+                                "tokens=%d block_size=%d available_boundaries=%d; "
+                                "storing live non-sliceable state would corrupt "
                                 "later prefix hits",
                                 request_id,
+                                "boundary_snapshot_unavailable",
+                                len(cacheable_sequence),
+                                self.config.paged_cache_block_size,
+                                available_boundaries,
                             )
                             block_table = None
                             if self.paged_cache_manager:
@@ -11182,6 +11536,8 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._boundary_snapshot_diagnostics.clear()
+        self._last_prefix_cache_lookup = None
 
         # Clear UID mappings
         _unregister_uid_rows_for_model(self.model)
@@ -11693,6 +12049,13 @@ class Scheduler:
                     if self._tokens_since_clear_cache >= 1024:
                         _sync_and_clear_cache(self._stream)
                         self._tokens_since_clear_cache = 0
+                        # Refresh the executor-owned MLX active-memory sample.
+                        # The background enforcer reads this cached value
+                        # during active decode; without a decode-side refresh
+                        # it stays frozen at the last prefill's reading for
+                        # the whole generation, blinding the hard-watermark
+                        # abort to decode-time growth (#3226).
+                        self._current_usage_bytes()
 
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.
@@ -11934,6 +12297,8 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._boundary_snapshot_diagnostics.clear()
+        self._last_prefix_cache_lookup = None
 
         # Clear detokenizers
         self._request_detokenizers.clear()
@@ -12915,6 +13280,13 @@ class Scheduler:
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()
             stats["prefix_cache"] = prefix_stats
+            stats["boundary_snapshots"] = (
+                self._boundary_snapshot_diagnostics.snapshot()
+            )
+            if self._last_prefix_cache_lookup is not None:
+                stats["last_prefix_lookup"] = dict(
+                    self._last_prefix_cache_lookup
+                )
             specprefill_cache_stats = {
                 "target_static_hits": prefix_stats["exact_prefix_hits"],
                 "target_static_misses": prefix_stats["exact_prefix_misses"],
