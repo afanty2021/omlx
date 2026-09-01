@@ -1958,6 +1958,9 @@ class TestSchedulerReset:
             "executor_shutdown",
             "drain",
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        fake_executor.submit.assert_called_once_with(
+            scheduler_module.clear_thread_streams
+        )
         fake_executor.shutdown.assert_called_once_with(wait=False)
 
     def test_shutdown_closes_boundary_snapshot_store(
@@ -5884,6 +5887,34 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_not_called()
+
+    def test_schedule_waiting_uses_first_captured_rope_delta(self, mock_tokenizer):
+        """Per-request capture must tolerate a stale multi-row delta array."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        mock_bg = MagicMock()
+        mock_bg.insert = MagicMock(return_value=[42])
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="vlm-multi-rope-delta",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        request.vlm_inputs_embeds = mx.zeros((1, 5, 64))
+        request.vlm_extra_kwargs = {
+            "_captured_rope_deltas": mx.array([[-42.0], [-7.0]])
+        }
+
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler._schedule_waiting()
+
+        assert request.rope_deltas == -42.0
 
     def test_schedule_waiting_clears_text_only_position_state(self, mock_tokenizer):
         """Text-only request in _schedule_waiting should clear position state.

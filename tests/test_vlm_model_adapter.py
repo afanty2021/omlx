@@ -583,6 +583,9 @@ class TestPerRequestMRoPEDecode:
         vlm.language_model._rope_deltas = mx.array(-42.0)
         assert adapter.get_last_rope_deltas() == -42.0
 
+        vlm.language_model._rope_deltas = mx.array([[-42.0], [-7.0]])
+        assert adapter.get_last_rope_deltas() == -42.0
+
         vlm.language_model._rope_deltas = None
         assert adapter.get_last_rope_deltas() == 0.0
 

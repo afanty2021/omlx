@@ -330,6 +330,8 @@ class VLMModelAdapter(nn.Module):
         rd = getattr(self._language_model, "_rope_deltas", None)
         if rd is None:
             return 0.0
+        if isinstance(rd, mx.array):
+            return float(rd.reshape(-1)[0].item())
         if hasattr(rd, "item"):
             return float(rd.item())
         return float(rd)
