@@ -5850,10 +5850,12 @@ class TestVLMPositionStateClearing:
                 "clear_vlm_position_state",
                 "parameters",
                 "make_cache",
+                "set_batch_rope_deltas",
             ]
         )
         model.clear_vlm_position_state = MagicMock()
         model.make_cache.return_value = []
+        model.set_batch_rope_deltas = MagicMock()
         return model
 
     def test_schedule_waiting_preserves_vlm_position_state(self, mock_tokenizer):
@@ -5944,6 +5946,39 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+    def test_external_text_prefill_rebinds_mrope_before_every_chunk(
+        self, mock_tokenizer
+    ):
+        """Concurrent decode or cleanup cannot leak adapter position state."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=512),
+        )
+        request = Request(
+            request_id="text-mrope-chunks",
+            prompt="chunked",
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        request.prompt_token_ids = list(range(1025))
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.rope_deltas = 7.0
+
+        scheduler._do_external_prefill(
+            request,
+            tokens=request.prompt_token_ids,
+            existing_cache=[],
+            vlm_embeds=None,
+        )
+
+        assert model.call_count == 2
+        assert model.set_batch_rope_deltas.call_count == 2
+        for mock_call in model.set_batch_rope_deltas.call_args_list:
+            delta = mock_call.args[0]
+            assert delta.shape == (1,)
+            assert delta.item() == 7.0
 
     def test_cached_text_only_prefill_seeds_zero_mrope_delta(self, mock_tokenizer):
         """Cached text-only mRoPE suffixes must start at the restored offset."""

@@ -249,7 +249,6 @@ class MemoryMonitor:
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
-
         # PagedCacheManager for KV cache memory measurement
         self._paged_cache_manager: Optional["PagedCacheManager"] = None
         self._block_size: int = 256  # Default block size
@@ -688,8 +687,11 @@ class MemoryMonitor:
         if num_tokens <= 0:
             return 0
         if self._prefill_memory_profile is not None:
-            return self._prefill_memory_profile.estimate_resident_kv_bytes(
-                num_tokens, chunk_tokens=chunk_tokens
+            return (
+                self._prefill_memory_profile.estimate_resident_kv_bytes(
+                    num_tokens, chunk_tokens=chunk_tokens
+                )
+                + self._fixed_state_bytes
             )
         total = self.estimate_prompt_kv_bytes(num_tokens)
 
@@ -837,7 +839,19 @@ class MemoryMonitor:
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
         return attn + kv + self._ane_prefill_transient_bytes
 
-    def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
+    def is_qwen4_gathered_prefill_profile(self) -> bool:
+        """True when this monitor prices Qwen4 QSA gathered-core prefill."""
+        return isinstance(
+            self._prefill_memory_profile, _Qwen4ExpPrefillMemoryProfile
+        )
+
+    def estimate_chunk_transient_bytes(
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool = False,
+    ) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
 
         Isolates the per-chunk attention transient — the spike that drives
@@ -852,11 +866,19 @@ class MemoryMonitor:
         and scale with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
+
+        ``gathered_core`` prices Qwen4 QSA as a gathered core instead of
+        dense Q×kv_len.
         """
         if self._prefill_memory_profile is not None:
-            return self._prefill_memory_profile.estimate_prefill_transient_bytes(
-                n_tokens, kv_len
-            )
+            profile = self._prefill_memory_profile
+            if isinstance(profile, _Qwen4ExpPrefillMemoryProfile):
+                return profile.estimate_prefill_transient_bytes(
+                    n_tokens,
+                    kv_len,
+                    gathered_core=gathered_core,
+                )
+            return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
@@ -1221,14 +1243,134 @@ class _DeepSeekV4PrefillMemoryProfile:
         return max(candidates, default=0)
 
 
+@dataclass(frozen=True)
+class _Qwen4ExpPrefillMemoryProfile:
+    """Prefill estimator for Qwen4 / Flash-Next hybrid GDN + QSA.
+
+    GDN layers keep a fixed recurrent state. QSA core attention, once the
+    gathered path is active, attends at most ``indexer_budget`` tokens.
+    The indexer still scores every compressed block (``kv_len / r``).
+    Dense ``Q x kv_len`` SDPA is the wrong price for that core.
+    """
+
+    qsa_layers: int
+    num_attention_heads: int
+    num_kv_heads: int
+    head_dim: int
+    indexer_n_heads: int
+    indexer_head_dim: int
+    indexer_budget: int
+    compress_ratio: int
+    dtype_size: float
+    score_dtype_size: float
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        if num_tokens <= 0 or self.qsa_layers <= 0:
+            return 0
+        per_layer = (
+            2 * self.num_kv_heads * self.head_dim * self.dtype_size
+            + self.indexer_head_dim * self.dtype_size
+            + 3 * 8
+        )
+        return int(self.qsa_layers * per_layer * int(num_tokens))
+
+    def estimate_prefill_transient_bytes(
+        self,
+        query_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool = False,
+    ) -> int:
+        if query_tokens <= 0 or kv_len <= 0:
+            return 0
+        query_tokens = int(query_tokens)
+        kv_len = int(kv_len)
+        pooled = max(kv_len // max(self.compress_ratio, 1), 1)
+        indexer = int(
+            self.indexer_n_heads * query_tokens * pooled * 4
+            + self.indexer_n_heads * query_tokens * self.indexer_head_dim * 4
+        )
+        core_kv = kv_len
+        if gathered_core and kv_len > self.indexer_budget:
+            core_kv = min(kv_len, self.indexer_budget + self.compress_ratio - 1)
+        core = estimate_unfused_sdpa_call_bytes(
+            self.num_attention_heads,
+            query_tokens,
+            core_kv,
+            self.head_dim,
+            self.score_dtype_size,
+        )
+        return indexer + core
+
+
+def _make_qwen4_exp_prefill_memory_profile(
+    config: Any,
+    *,
+    compute_dtype_size: float,
+) -> PrefillMemoryProfile | None:
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    num_attention_heads = _cfg_get(config, "num_attention_heads")
+    num_kv_heads = _cfg_get(config, "num_key_value_heads")
+    head_dim = _cfg_get(config, "head_dim")
+    indexer_n_heads = _cfg_get(config, "indexer_n_heads")
+    indexer_head_dim = _cfg_get(config, "indexer_head_dim")
+    indexer_budget = _cfg_get(config, "indexer_budget")
+    compress_ratio = _cfg_get(config, "indexer_compress_ratio")
+    required = (
+        num_layers,
+        num_attention_heads,
+        num_kv_heads,
+        head_dim,
+        indexer_n_heads,
+        indexer_head_dim,
+        indexer_budget,
+        compress_ratio,
+    )
+    if not all(_pos_int(value) for value in required):
+        return None
+    if not isinstance(compute_dtype_size, (int, float)) or compute_dtype_size <= 0:
+        return None
+    layer_types = _cfg_get(config, "layer_types") or ()
+    qsa_layers = sum(
+        1
+        for kind in layer_types
+        if kind in {"qwen_sparse_attention", "full_attention"}
+    )
+    if qsa_layers <= 0:
+        interval = _cfg_get(config, "full_attention_interval") or 4
+        if not _pos_int(interval):
+            return None
+        qsa_layers = int(num_layers) // int(interval)
+    if qsa_layers <= 0:
+        return None
+    return _Qwen4ExpPrefillMemoryProfile(
+        qsa_layers=qsa_layers,
+        num_attention_heads=int(num_attention_heads),
+        num_kv_heads=int(num_kv_heads),
+        head_dim=int(head_dim),
+        indexer_n_heads=int(indexer_n_heads),
+        indexer_head_dim=int(indexer_head_dim),
+        indexer_budget=int(indexer_budget),
+        compress_ratio=int(compress_ratio),
+        dtype_size=float(compute_dtype_size),
+        score_dtype_size=float(compute_dtype_size),
+    )
+
+
 def make_prefill_memory_profile(
     config: Any,
     *,
     compute_dtype_size: float,
     wsdpa_dtype_supported: bool = False,
 ) -> PrefillMemoryProfile | None:
-    """Build the one model-specific prefill strategy currently required."""
+    """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
+    if model_type.startswith("qwen4_exp"):
+        return _make_qwen4_exp_prefill_memory_profile(
+            config, compute_dtype_size=compute_dtype_size
+        )
     if not model_type.startswith("deepseek_v4"):
         return None
 

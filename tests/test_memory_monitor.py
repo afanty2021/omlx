@@ -700,6 +700,40 @@ class TestEstimateResidentKvBytes:
         assert m.fixed_state_bytes == 0
         assert m.estimate_resident_kv_bytes(100) == base
 
+    def test_fixed_state_added_on_qwen4_profile_path(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = SimpleNamespace(
+            model_type="qwen4_exp",
+            num_hidden_layers=48,
+            num_attention_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_n_heads=4,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+            full_attention_interval=4,
+            layer_types=None,
+        )
+        profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+        m = MemoryMonitor(max_kv_cache_memory=2 * 1024**3)
+        m.set_model_info(
+            num_layers=48,
+            num_kv_heads=2,
+            head_dim=256,
+            dtype_size=2,
+            num_attention_heads=24,
+            compute_dtype_size=2,
+            prefill_memory_profile=profile,
+        )
+        assert m.is_qwen4_gathered_prefill_profile() is True
+        base = m.estimate_resident_kv_bytes(100)
+        prompt_kv = m.estimate_prompt_kv_bytes(100)
+        m.set_fixed_state_bytes(123_456_789)
+        assert m.estimate_resident_kv_bytes(100) == base + 123_456_789
+        assert m.estimate_prompt_kv_bytes(100) == prompt_kv
+
     def test_zero_tokens_returns_zero(self):
         m = self._make(num_kv_cache_layers=30)
         m.set_fixed_state_bytes(999)
