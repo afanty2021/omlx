@@ -4938,3 +4938,84 @@ class TestNakedQwenFollowup:
         assert cleaned == "After mentioning </tool_call> in prose."
         filt = ToolCallStreamFilter(self.tokenizer())
         assert "".join(filt.feed(c) for c in raw) + filt.finish() == " " + cleaned
+
+
+@pytest.fixture
+def final_qwen_parser():
+    from types import SimpleNamespace
+
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    tok = SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        tool_parser=parse_tool_call,
+    )
+    tools = [
+        {
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"],
+                },
+            }
+        }
+    ]
+    return tok, tools
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "안녕하세요 🌍",
+        "literal </tool_call> and </function> tags",
+        "<parameter=x>literal</parameter>",
+        'quote " and slash \\',
+        "x" * 50000,
+    ],
+)
+def test_final_qwen_outer_recovery_preserves_parameter_bytes(final_qwen_parser, value):
+    tok, tools = final_qwen_parser
+    raw = (
+        f"<tool_call><function=write><parameter=content>{value}</parameter></function>"
+    )
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.parse_errors
+    assert json.loads(result.tool_calls[0].function.arguments) == {"content": value}
+    assert result.cleaned_text == ""
+
+
+@pytest.mark.parametrize("suffix", ["", "</tool_call>"])
+def test_final_qwen_naked_function_does_not_leave_orphan_close(
+    final_qwen_parser, suffix
+):
+    tok, tools = final_qwen_parser
+    raw = "<function=write><parameter=content>ok</parameter></function>" + suffix
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert result.cleaned_text == ""
+    assert len(result.tool_calls) == 1
+
+
+def test_final_qwen_does_not_promote_unknown_reasoning_call(final_qwen_parser):
+    tok, tools = final_qwen_parser
+    thinking = "<tool_call><function=unknown></function></tool_call>"
+    result = extract_tool_calls_with_thinking(
+        thinking, "Answer", tok, tools, finish_reason="stop"
+    )
+    assert not result.tool_calls
+    assert result.cleaned_text == "Answer"
+
+
+@pytest.mark.parametrize("parameter", ["", '<parameter=content>{"x": 1</parameter>'])
+def test_final_qwen_recovery_requires_complete_schema_valid_arguments(
+    final_qwen_parser, parameter
+):
+    tok, tools = final_qwen_parser
+    tools[0]["function"]["parameters"]["properties"]["content"]["type"] = "object"
+    raw = f"<tool_call><function=write>{parameter}</function>"
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ("malformed",)

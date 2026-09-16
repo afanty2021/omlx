@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import regex
-from jsonschema import ValidationError, validate
+from jsonschema import SchemaError, ValidationError, validate
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
@@ -216,6 +216,7 @@ class ToolCallExtraction:
     tool_calls: Optional[List[ToolCall]]
     cleaned_thinking: str
     tool_calls_from_thinking: bool = False
+    parse_errors: tuple[str, ...] = ()
 
 
 # Declared-type buckets for schema-aware parameter coercion, mirroring
@@ -1967,11 +1968,117 @@ def _extract_tool_names(tools: List) -> set:
     return names
 
 
+def parse_qwen_tool_calls(
+    text: str, tokenizer: Any, tools: list, finish_reason: str
+) -> tuple[str, list[ToolCall] | None, tuple[str, ...]]:
+    """Recover only complete functions missing their outer close at normal EOF.
+
+    Report failed envelopes while preserving successfully parsed siblings.
+    Never close a parameter value or infer missing argument bytes.
+    """
+    calls, prose, errors = [], [], []
+    pos = 0
+    while match := _QWEN_OPEN_RE.search(text, pos):
+        start = match.start()
+        prose.append(text[pos:start])
+        paired = match.group() == "<tool_call>"
+        found = (
+            _find_marker_span_end(text, match.end(), "</tool_call>") if paired else None
+        )
+        recovered = False
+        function_start = _skip_ws(text, match.end()) if paired else start
+        function_end = None
+        if text.startswith(_XML_FUNCTION_OPEN, function_start):
+            scan_end = found[0] if found else len(text)
+            relative_end = _NakedFunctionBoundary().feed(
+                text[function_start:scan_end], len(_XML_FUNCTION_OPEN)
+            )
+            if relative_end is not None:
+                function_end = function_start + relative_end
+            elif (
+                paired
+                and found
+                and finish_reason == "stop"
+                and _QWEN_OPEN_RE.search(text, function_start + len(_XML_FUNCTION_OPEN))
+                is None
+            ):
+                # A literal close tag can hide the last function's missing outer close.
+                # Do not scan through a later call to recover it.
+                relative_end = _NakedFunctionBoundary().feed(
+                    text[function_start:], len(_XML_FUNCTION_OPEN)
+                )
+                if relative_end is not None:
+                    candidate_end = function_start + relative_end
+                    if not text[candidate_end:].strip():
+                        function_end = candidate_end
+                        found = None
+        if paired and found is not None:
+            end = found[1]
+            envelope = text[start:end]
+        else:
+            end = function_end
+            if end is None or (
+                paired and (finish_reason != "stop" or text[end:].strip())
+            ):
+                errors.append("incomplete")
+                pos = len(text)
+                break
+            envelope = "<tool_call>" + text[function_start:end] + "</tool_call>"
+            recovered = paired
+        if (
+            paired
+            and found
+            and text.startswith(_XML_FUNCTION_OPEN, function_start)
+            and (function_end is None or function_end > found[0])
+        ):
+            parsed = None
+        elif recovered:
+            _, parsed = _parse_xml_tool_calls(envelope, tools)
+        else:
+            _, parsed = parse_tool_calls(envelope, tokenizer, tools)
+        if recovered and parsed:
+            # Recovery requires a declared tool and complete, schema-valid arguments.
+            schemas = {
+                t["function"]["name"]: t["function"].get("parameters", {})
+                for t in tools
+                if isinstance(t, dict) and "function" in t
+            }
+            for call in parsed:
+                if call.function.name not in schemas:
+                    parsed = None
+                    break
+                try:
+                    schema = schemas[call.function.name]
+                    properties = schema.get("properties", {})
+                    for key, value in _iter_xml_parameters(text[function_start:end]):
+                        if properties.get(key, {}).get("type") in ("object", "array"):
+                            json.loads(value)
+                    validate(json.loads(call.function.arguments), schema)
+                except (SchemaError, ValidationError, ValueError, RecursionError):
+                    parsed = None
+                    break
+        if not parsed:
+            errors.append("malformed")
+        calls.extend(parsed or [])
+        pos = end
+        if not paired:
+            after = _skip_ws(text, pos)
+            if text.startswith("</tool_call>", after):
+                pos = after + len("</tool_call>")
+    prose.append(text[pos:])
+    if pos == 0:
+        cleaned, parsed = parse_tool_calls(text, tokenizer, tools)
+        return cleaned, parsed, ()
+    return "".join(prose).strip(), calls or None, tuple(errors)
+
+
 def extract_tool_calls_with_thinking(
     thinking_content: str,
     regular_content: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    *,
+    finish_reason: str | None = None,
 ) -> ToolCallExtraction:
     """Extract tool calls while keeping a sanitized reasoning transcript.
 
@@ -1988,7 +2095,18 @@ def extract_tool_calls_with_thinking(
       Calls whose name matches a provided tool are promoted regardless
       of whether regular text was also produced.
     """
-    cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+    parse_errors = ()
+    parser = getattr(tokenizer, "tool_parser", None)
+    if (
+        finish_reason is not None
+        and tools
+        and getattr(parser, "__module__", None) == "mlx_lm.tool_parsers.qwen3_coder"
+    ):
+        cleaned_text, tool_calls, parse_errors = parse_qwen_tool_calls(
+            regular_content, tokenizer, tools, finish_reason
+        )
+    else:
+        cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
     tool_calls_from_thinking = False
 
@@ -2021,7 +2139,9 @@ def extract_tool_calls_with_thinking(
                     tool_calls_from_thinking = False
             else:
                 valid_names = _extract_tool_names(tools)
-                tool_calls = [tc for tc in tool_calls if tc.function.name in valid_names]
+                tool_calls = [
+                    tc for tc in tool_calls if tc.function.name in valid_names
+                ]
                 if not tool_calls:
                     tool_calls = None
                     tool_calls_from_thinking = False
@@ -2031,6 +2151,7 @@ def extract_tool_calls_with_thinking(
         tool_calls=tool_calls,
         cleaned_thinking=cleaned_thinking,
         tool_calls_from_thinking=tool_calls_from_thinking,
+        parse_errors=parse_errors,
     )
 
 

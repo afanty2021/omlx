@@ -158,14 +158,15 @@ from .api.responses_utils import (
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
+    ToolCallExtraction,
     ToolCallStreamSegment,
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
-    parse_tool_calls,
     parse_json_output,
+    parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
@@ -849,6 +850,7 @@ def _is_api_route(request: FastAPIRequest) -> bool:
     classified as non-API. Switch to ``request.scope.get("route")``
     matching at that point.
     """
+
     return request.url.path.startswith("/v1/")
 
 
@@ -883,7 +885,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        content = _openai_error_body(
+            exc.detail, exc.status_code, code=getattr(exc, "code", None)
+        )
     else:
         content = {"detail": exc.detail}
     return JSONResponse(status_code=exc.status_code, content=content)
@@ -2740,7 +2744,11 @@ async def _with_json_keepalive(
             logger.warning(
                 "JSON keepalive request failed (%d): %s", e.status_code, e.detail
             )
-            yield json.dumps(_openai_error_body(e.detail, e.status_code))
+            yield json.dumps(
+                _openai_error_body(
+                    e.detail, e.status_code, code=getattr(e, "code", None)
+                )
+            )
             return
         if result is not None:
             yield result
@@ -4407,9 +4415,12 @@ async def create_chat_completion(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
@@ -5144,6 +5155,29 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+class _ToolCallGenerationError(HTTPException):
+    """Keep generation failure codes through JSON keepalive responses."""
+
+    def __init__(self, error: dict):
+        super().__init__(status_code=500, detail=error["message"])
+        self.code = error["code"]
+
+
+def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
+    failed = extraction.parse_errors
+    if not failed:
+        return None
+    code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
+    message = (
+        "Model output contains an unrecoverable tool call. "
+        "Previously delivered tool calls must not be executed again on retry."
+    )
+    logger.warning(
+        "Tool call generation failed: code=%s, failed_calls=%d", code, len(failed)
+    )
+    return _openai_error_body(message, 500, code=code)
+
+
 def _registered_tool_names(tools: object) -> set[str]:
     """Return nonempty function names explicitly registered by the request."""
 
@@ -5167,8 +5201,8 @@ def _registered_tool_names(tools: object) -> set[str]:
 def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
     """Canonical name/JSON-object identity, or ``None`` when malformed.
 
-    This is syntactic validation plus the separate registered-name check at the
-    call site; it is deliberately not full JSON Schema argument validation.
+    Unknown names remain callable output for client-side error feedback.
+    This is syntactic validation, not full JSON Schema argument validation.
     """
 
     function = getattr(tool_call, "function", None)
@@ -5433,10 +5467,11 @@ async def stream_chat_completion(
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
-                        _cleaned, completed_calls = parse_tool_calls(
+                        _, completed_calls, _ = parse_qwen_tool_calls(
                             segment.text,
                             engine.tokenizer,
                             kwargs.get("tools"),
+                            finish_reason="stop",
                         )
                         completed_calls = completed_calls or []
                         completed_keys = [
@@ -5445,11 +5480,6 @@ async def stream_chat_completion(
                         if (
                             not completed_calls
                             or any(key is None for key in completed_keys)
-                            or any(
-                                key[0] not in registered_tool_names
-                                for key in completed_keys
-                                if key is not None
-                            )
                         ):
                             stream_tool_sequence_safe = False
                             continue
@@ -5493,6 +5523,9 @@ async def stream_chat_completion(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
+
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
@@ -5571,6 +5604,7 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -5586,25 +5620,12 @@ async def stream_chat_completion(
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
-        if tool_calls and qwen_tool_envelope_streaming_capable:
-            # Raw-text parsing is never allowed to promote malformed or
-            # unregistered functions on the explicitly capability-gated qwen
-            # early-stream path. Other parser families retain their existing
-            # terminal semantics; engine-native structured calls above are
-            # authoritative and intentionally bypass this API-layer filter.
-            tool_calls = [
-                tool_call
-                for tool_call in tool_calls
-                if (
-                    (key := _tool_call_semantic_key(tool_call)) is not None
-                    and key[0] in registered_tool_names
-                )
-            ]
-
         # Process response_format if specified
         if request.response_format and not tool_calls:
             cleaned_text, parsed_json, is_valid, error = parse_json_output(
@@ -5655,7 +5676,7 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5758,6 +5779,11 @@ async def stream_chat_completion(
             event = f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
             mark_visible_delta()
             yield event
+
+    if tool_failure:
+        yield f"data: {json.dumps(tool_failure)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Final chunk with finish_reason
     finish_reason = (
@@ -6003,8 +6029,9 @@ async def stream_anthropic_messages(
     )
 
     # 3. Stream content with thinking/content separation
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             last_output = output  # Keep reference for tool_calls and token counts
 
             if first_token_time is None and output.new_text:
@@ -6092,6 +6119,9 @@ async def stream_anthropic_messages(
         yield create_message_stop_event()
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
     if thinking_delta:
@@ -6167,6 +6197,7 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    tool_failure = None
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -6179,14 +6210,16 @@ async def stream_anthropic_messages(
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
 
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -6263,6 +6296,22 @@ async def stream_anthropic_messages(
             )
             # Close tool block
             yield create_content_block_stop_event(index=i)
+
+    if tool_failure:
+        error = tool_failure["error"]
+        yield format_sse_event(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": error["message"],
+                    "code": error["code"],
+                },
+            },
+        )
+        yield create_message_stop_event()
+        return
 
     # 6. Send message_delta with stop_reason and actual token counts
     stop_reason = map_finish_reason_to_stop_reason(
@@ -6678,9 +6727,12 @@ async def create_anthropic_message(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=internal_tools,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -7224,9 +7276,12 @@ async def create_response(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -7603,8 +7658,9 @@ async def stream_responses_api(
         else:
             stream_content = False
 
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -7670,6 +7726,9 @@ async def stream_responses_api(
         )
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining content from parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
@@ -7726,6 +7785,7 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -7737,9 +7797,11 @@ async def stream_responses_api(
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
             for ev in _emit_reasoning_delta(cleaned_thinking):
@@ -7771,7 +7833,7 @@ async def stream_responses_api(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
@@ -7981,6 +8043,23 @@ async def stream_responses_api(
             output_items.append(completed_fc)
             output_index += 1
             next_output_index = output_index
+
+    if tool_failure:
+        seq += 1
+        yield format_sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "output": output_items,
+                    "error": tool_failure["error"],
+                },
+                "sequence_number": seq,
+            },
+        )
+        return
 
     # Record metrics
     usage_data = None
