@@ -4053,6 +4053,7 @@ async def create_chat_completion(
                 engine.tokenizer,
                 native_reasoning_content=native_reasoning,
                 consolidate_system_messages=False,
+                model_name=request.model,
             )
 
         # Detect and strip partial mode at the API boundary — exactly once,

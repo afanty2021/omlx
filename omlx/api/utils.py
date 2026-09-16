@@ -950,6 +950,7 @@ def extract_text_content(
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
     consolidate_system_messages: bool = True,
+    model_name: str | None = None,
 ) -> List[dict]:
     """
     Extract text content from OpenAI-format messages.
