@@ -61,6 +61,11 @@ def _path_resolves_to_app_managed_cli() -> bool:
 def is_homebrew() -> bool:
     """Return True if running inside a Homebrew-installed virtualenv."""
     prefix = sys.prefix
+    # Caskroom prefixes (e.g. the miniconda cask) are cask-managed apps,
+    # not Homebrew formula environments — a conda env installed under
+    # /opt/homebrew/Caskroom is a pip/conda install, not a brew one.
+    if "/Caskroom/" in prefix:
+        return False
     return "/Cellar/" in prefix or "/homebrew/" in prefix
 
 
