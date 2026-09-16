@@ -56,6 +56,7 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
     "kind,per_expert",
     [
         ("qwen4_exp", False),
+        ("qwen3_5_moe", False),
         ("gemma4", False),
         ("olmoe", False),
         ("olmoe", True),
@@ -94,7 +95,7 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
 
 
 @pytest.mark.parametrize(
-    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4", "qwen3_5_moe"]
+    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4"]
 )
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
     _checkpoint(tmp_path, kind)
