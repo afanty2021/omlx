@@ -859,8 +859,7 @@ def test_qwen4_adapter_cache_only_prefill_skips_vocab_projection():
     assert offsets and max(offsets) == 4
 
 
-
-def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
+def test_qwen4_batch_join_honors_model_owned_cache_conversion():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
 
@@ -881,7 +880,10 @@ def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
             return [qsa_cache]
 
     generate = importlib.import_module("mlx_lm.generate")
-    caches = generate._make_cache(Model(), [0], None)
+    caches = [
+        omlx.scheduler._to_batched_cache_layer(c)
+        for c in generate._merge_caches([Model().make_cache()])
+    ]
 
     assert len(caches) == 1
     assert isinstance(caches[0], BatchQSAKVCache)
@@ -935,6 +937,13 @@ def test_qwen4_qsa_cache_round_trip_preserves_greedy_decode():
         else:
             restored.append(handler.reconstruct_cache(state))
 
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    restored = VLMModelAdapter(SimpleNamespace(language_model=model)).restore_cache(
+        restored
+    )
     resumed = model(mx.array([[5]], dtype=mx.int32), cache=restored)
     expected = mx.argmax(full.logits[:, -1], axis=-1)
     actual = mx.argmax(resumed.logits[:, -1], axis=-1)
@@ -970,7 +979,7 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
 
     assert mx.array_equal(verified_tokens, singleton_tokens).item()
     assert verified.hidden_states[0].shape == (1, 2, 64)
-    assert len(verified.gdn_states) == 1
+    assert verified.gdn_states.active
 
     model.rollback_speculative_cache(
         verify_cache,
@@ -1064,9 +1073,7 @@ def test_qwen4_ple_partial_rollback_and_accept_match_sequential_replay():
 
 
 def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
-    """A fully accepted verify cycle never calls rollback. The snapshot it armed
-    must be dropped by the next ordinary forward so it cannot be mistaken for the
-    current committed position by a later rollback."""
+    """Commit a full verify window before the next ordinary forward."""
     config = _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
@@ -1075,10 +1082,12 @@ def test_qwen4_ple_ordinary_forward_disarms_stale_snapshot():
     ple_cache = cache[0]
     model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache)
 
-    model(mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True)
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32), cache=cache, return_hidden=True
+    )
     assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is not None
+    model.rollback_speculative_cache(cache, verified.gdn_states, 1, 2)
 
-    # ordinary decode forward (no verify): the stale snapshot must be gone
     model(mx.array([[7]], dtype=mx.int32), cache=cache)
     assert getattr(ple_cache, "_qwen4_exp_ple_speculative_state", None) is None
 
@@ -1803,7 +1812,9 @@ def test_ngram_prefetch_computes_the_next_chunks_indices():
             seen["prefetch"] = indices
 
     embedding.ngram_embedding = Recorder()
-    cache = [None, None, None, None]
+    from mlx_vlm.models.cache import ArraysCache
+
+    cache = ArraysCache(4)
     chunk1 = mx.array([[5, 9, 2, 7, 1, 4, 4, 8]], dtype=mx.int64)
     chunk2 = mx.array([[3, 3, 6, 1, 9]], dtype=mx.int64)
     mx.eval(embedding(chunk1, cache))
@@ -1917,3 +1928,24 @@ def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
     embedding.prefetch(mx.array([[4]], dtype=mx.int32))
     assert not embedding._pending
     embedding.close()
+
+
+def test_mtp_batched_positions_match_for_identical_rows():
+    config = _tiny_config().text_config
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
+    import mlx.nn as nn
+
+    mx.random.seed(17)
+    head = Qwen4ExpMTPModule(config)
+    head.eval()
+    embed = nn.Embedding(config.vocab_size, config.hidden_size)
+    hidden = mx.repeat(
+        mx.random.normal((1, 5, config.hidden_size * config.hc_count)), 2, axis=0
+    )
+    tokens = mx.array([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
+    cache = [QSAKVCache()]
+    for _ in range(2):
+        output, _ = head(hidden, tokens, embed, cache)
+        mx.eval(output)
+        assert mx.allclose(output[0], output[1], atol=1e-6).item()
+    assert cache[0].offset == 10

@@ -256,6 +256,7 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
@@ -844,6 +845,38 @@
                 this.syncTabStateToUrl();
             },
 
+            handleMainTabKeydown(event) {
+                if (!event.target.matches('[role="tab"]')
+                    || event.altKey || event.ctrlKey || event.metaKey) return;
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+                    .filter(tab => !tab.disabled && tab.getClientRects().length);
+                const index = tabs.indexOf(event.target);
+                if (index < 0) return;
+                event.preventDefault();
+                let next;
+                if (event.key === 'Home') next = 0;
+                else if (event.key === 'End') next = tabs.length - 1;
+                else next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                this.modelsDropdown = this.settingsDropdown = this.benchDropdown = false;
+                tabs[next].focus();
+                tabs[next].click();
+            },
+
+            trapDialogFocus(event) {
+                const dialog = event.currentTarget;
+                const controls = Array.from(dialog.querySelectorAll(
+                    'a[href], button, input, select, textarea, [tabindex]'
+                )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+                    && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                const index = controls.indexOf(document.activeElement);
+                if (!controls.length || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+                    event.preventDefault();
+                    const target = event.shiftKey ? controls.at(-1) : controls[0];
+                    (target || dialog.querySelector('[autofocus]')).focus();
+                }
+            },
+
             setSettingsTab(tab) {
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
@@ -890,7 +923,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -965,6 +1063,8 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
@@ -998,6 +1098,7 @@
             },
 
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1052,6 +1153,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
@@ -1113,6 +1215,10 @@
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1563,6 +1669,12 @@
 
             showTip(el, text) {
                 if (!text) return;
+                // A tooltip must share the dialog's top layer to remain visible.
+                const tooltip = this.$refs.floatingTooltip;
+                const container = el.closest('dialog') || this.$root;
+                if (tooltip.parentElement !== container) {
+                    Alpine.mutateDom(() => container.appendChild(tooltip));
+                }
                 const rect = el.getBoundingClientRect();
                 this.tip = {
                     visible: true,
@@ -2956,6 +3068,162 @@
                 }
             },
 
+            // Snapshot actions in the settings modal header. All three go
+            // through server endpoints that decode, validate and persist, so
+            // the form is rebuilt from the returned settings.
+            openSettingsApply(mode) {
+                this.settingsApply = {
+                    open: true,
+                    mode,
+                    phase: mode === 'recipe' ? 'input' : (mode === 'reset' ? 'confirm' : 'loading'),
+                    recipeText: '',
+                    result: null,
+                    candidates: null,
+                    error: '',
+                };
+                if (mode === 'optimal') this.loadOptimalCandidates();
+            },
+
+            closeSettingsApply() {
+                if (this.settingsApply.phase === 'loading') return;
+                this.settingsApply.open = false;
+            },
+
+            async _settingsActionRequest(method, path, body) {
+                if (!this.selectedModel) return null;
+                const url = `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings/${path}`;
+                const init = { method };
+                if (body !== undefined) {
+                    init.headers = { 'Content-Type': 'application/json' };
+                    init.body = JSON.stringify(body);
+                }
+                this.settingsApply.phase = 'loading';
+                this.settingsApply.error = '';
+                try {
+                    const response = await fetch(url, init);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return null;
+                    }
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.phase = 'error';
+                        return null;
+                    }
+                    return data;
+                } catch (err) {
+                    console.error('Settings snapshot request failed:', err);
+                    this.settingsApply.error = window.t('js.error.settings_apply_failed');
+                    this.settingsApply.phase = 'error';
+                    return null;
+                }
+            },
+
+            async loadOptimalCandidates() {
+                const data = await this._settingsActionRequest('GET', 'optimal');
+                if (!data) return;
+                this.settingsApply.result = data;
+                if (!data.found) {
+                    this.settingsApply.phase = 'none';
+                    return;
+                }
+                this.settingsApply.candidates = data;
+                this.settingsApply.phase = 'choose';
+            },
+
+            async applyOptimalCandidate(benchmarkId) {
+                const data = await this._settingsActionRequest('POST', 'optimal', { benchmark_id: benchmarkId });
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            async runSettingsApply() {
+                const mode = this.settingsApply.mode;
+                const data = mode === 'recipe'
+                    ? await this._settingsActionRequest('POST', 'recipe', { recipe: this.settingsApply.recipeText.trim() })
+                    : await this._settingsActionRequest('POST', 'reset');
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            settingsApplyTitle() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.apply_title_recipe');
+                return window.t('modal.model_settings.actions.apply_title_optimal');
+            },
+
+            settingsApplyLoadingText() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.loading_reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.loading_recipe');
+                return this.settingsApply.candidates
+                    ? window.t('modal.model_settings.actions.loading_apply')
+                    : window.t('modal.model_settings.actions.loading_optimal');
+            },
+
+            settingsApplyDoneText() {
+                const mode = this.settingsApply.mode;
+                const result = this.settingsApply.result;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.done_reset');
+                if (result && result.changed === false) return window.t('modal.model_settings.actions.no_change');
+                return mode === 'recipe'
+                    ? window.t('modal.model_settings.actions.done_recipe')
+                    : window.t('modal.model_settings.actions.done_optimal');
+            },
+
+            settingsApplyGroups() {
+                const c = this.settingsApply.candidates;
+                if (!c) return [];
+                return [
+                    { key: 'pp', label: window.t('modal.model_settings.actions.group_pp'), items: c.by_pp || [] },
+                    { key: 'tg', label: window.t('modal.model_settings.actions.group_tg'), items: c.by_tg || [] },
+                ].filter(g => g.items.length);
+            },
+
+            settingsApplyJson() {
+                const result = this.settingsApply.result;
+                return result && result.applied ? JSON.stringify(result.applied, null, 2) : '';
+            },
+
+            settingsApplyStats(item) {
+                if (!item || item.pp_tps == null) return '';
+                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} tok/s`];
+                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} tok/s`);
+                if (item.memory_gb != null) parts.push(`${item.memory_gb} GB`);
+                if (item.quantization) parts.push(item.quantization);
+                if (item.omlx_version) parts.push(`oMLX ${item.omlx_version}`);
+                if (item.created_at) parts.push(String(item.created_at).slice(0, 10));
+                return parts.join(' · ');
+            },
+
+            async _applySettingsResponse(data) {
+                if (data.settings && this.selectedModel) {
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, data.settings);
+                    this.activeProfileName = data.settings.active_profile_name || null;
+                    if (!this.modelSettings.is_diffusion_model) this.computeDrift();
+                }
+                await this.loadModels();
+                if (this.selectedModel) {
+                    const fresh = (this.models || []).find(m => m.id === this.selectedModel.id);
+                    if (fresh) this.selectedModel = fresh;
+                }
+                if (data.requires_reload) {
+                    if (data.auto_reloaded) {
+                        alert(window.t('js.info.model_settings_auto_reloaded'));
+                    } else if (data.auto_unloaded) {
+                        alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else {
+                        alert(window.t('js.info.model_type_reload_required'));
+                    }
+                }
+            },
+
             async loadGenerationDefaults() {
                 if (!this.selectedModel) return;
                 this.loadingGenDefaults = true;
@@ -3513,6 +3781,11 @@
 
             get piCommand() {
                 return this._launchCmd('pi');
+            },
+
+            get markitdownOcrModelMissing() {
+                const id = this.globalSettings.integrations.markitdown_pdf_processing_engine;
+                return id !== 'markitdown' && !(this.models || []).some(model => model.id === id);
             },
 
             get markitdownOcrModels() {

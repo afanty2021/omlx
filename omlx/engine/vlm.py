@@ -176,20 +176,14 @@ def _is_missing_chat_template_error(exc: ValueError) -> bool:
 
 
 def _capture_vlm_position_state(lm: Any, extra_kwargs: dict[str, Any]) -> None:
-    """Copy the language model's per-request mRoPE state into extra_kwargs.
+    """Capture returned position metadata before consulting model-owned state.
 
-    get_input_embeddings() leaves ``_position_ids`` and ``_rope_deltas`` lazy
-    on the executor's default stream. They are materialized here because a
-    lazy default-stream input inside the engine-stream prefill graph deadlocks
-    the Qwen ANE prefill primitive on restored-prefix requests (#3305, the
-    same class as the text-only seed in #3279).
+    Materialize it on the executor stream to prevent cross-stream ANE prefill deadlocks.
     """
-    if lm is None:
-        return
-    pid = getattr(lm, "_position_ids", None)
+    pid = extra_kwargs.get("position_ids", getattr(lm, "_position_ids", None))
     if pid is not None and "position_ids" not in extra_kwargs:
         extra_kwargs["position_ids"] = pid
-    rd = getattr(lm, "_rope_deltas", None)
+    rd = extra_kwargs.get("rope_deltas", getattr(lm, "_rope_deltas", None))
     if rd is not None:
         extra_kwargs["_captured_rope_deltas"] = rd
     lazy_state = [v for v in (pid, rd) if isinstance(v, mx.array)]
@@ -662,6 +656,51 @@ def _has_audio_weights(model_dir: Path) -> bool:
     return False
 
 
+# Text-only oQ checkpoints can retain embed_vision without a vision tower.
+_VISION_TOWER_MARKER = "vision_tower"
+_VISION_TENSOR_MARKERS = (_VISION_TOWER_MARKER, "embed_vision")
+
+
+def _is_vision_tensor_key(key: str) -> bool:
+    """True for parameter paths under `vision_tower` / `embed_vision`."""
+    return any(marker in key.split(".") for marker in _VISION_TENSOR_MARKERS)
+
+
+def _is_vision_tower_key(key: str) -> bool:
+    """Exclude orphan projection weights when detecting a vision tower."""
+    return _VISION_TOWER_MARKER in key.split(".")
+
+
+def _has_vision_tower_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains vision_tower weights."""
+    import safetensors
+
+    weight_files = list(model_dir.glob("*.safetensors"))
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
+        weight_files.append(sidecar)
+
+    for sf in weight_files:
+        with safetensors.safe_open(str(sf), framework="np") as f:
+            if any(_is_vision_tower_key(k) for k in f.keys()):
+                return True
+    return False
+
+
+def _vision_config_is_orphaned(model_dir: Path) -> bool:
+    """Require absent vision config and readable shards without a tower."""
+    try:
+        raw = json.loads((model_dir / "config.json").read_text())
+    except Exception:
+        return False
+    if raw.get("vision_config"):
+        return False
+    try:
+        return not _has_vision_tower_weights(model_dir)
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _strip_audio_config_if_orphaned(model_dir: Path):
     """Drop `audio_config` from `mlx_vlm.utils.load_config` results when the
@@ -721,6 +760,63 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+@contextlib.contextmanager
+def _strip_vision_config_if_orphaned(model_dir: Path):
+    """Suppress inferred vision modules and orphan weights for text-only loads."""
+    if not _vision_config_is_orphaned(model_dir):
+        yield
+        return
+
+    import mlx.nn as _nn
+    import mlx_vlm.utils as _vu
+
+    original_update_module_configs = _vu.update_module_configs
+    original_load_weights = _nn.Module.load_weights
+    warned = False
+
+    def _patched_update_module_configs(model_config, model_class, config, modules):
+        model_config = original_update_module_configs(
+            model_config, model_class, config, modules
+        )
+        # Clear the deserialized config; the raw dict must stay valid for quantization.
+        if hasattr(model_config, "vision_config") and not config.get(
+            "vision_config"
+        ):
+            model_config.vision_config = None
+        return model_config
+
+    def _vision_filtering_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal warned
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        # MLX-format checkpoints skip upstream sanitize, leaving orphan projections.
+        owned = {k for k, _ in _nn.utils.tree_flatten(self.parameters())}
+        kept = []
+        dropped = 0
+        for key, value in weights_items:
+            if _is_vision_tensor_key(key) and key not in owned:
+                dropped += 1
+                continue
+            kept.append((key, value))
+        if dropped and not warned:
+            warned = True
+            logger.warning(
+                "vision_tower weights missing for %s; loading without "
+                "vision support",
+                model_dir.name,
+            )
+        return original_load_weights(self, kept, *args, **kwargs)
+
+    _vu.update_module_configs = _patched_update_module_configs
+    _nn.Module.load_weights = _vision_filtering_load_weights
+    try:
+        yield
+    finally:
+        _vu.update_module_configs = original_update_module_configs
+        _nn.Module.load_weights = original_load_weights
 
 
 @contextlib.contextmanager
@@ -1801,25 +1897,14 @@ class VLMBatchedEngine(BaseEngine):
             return False
 
     def _detect_diffusion_family(self) -> str | None:
-        """Return the mlx-vlm diffusion generation family for loaded models."""
-        try:
-            from mlx_vlm.generate.diffusion import diffusion_generation_family
-
-            family = diffusion_generation_family(self._vlm_model)
-            if family == "block":
-                return family
-            if family is not None:
-                logger.warning(
-                    "Unsupported diffusion generation family for %s: %s",
-                    self._model_name,
-                    family,
-                )
-            return None
-        except Exception as e:
-            logger.debug("mlx-vlm diffusion family detection skipped: %s", e)
+        """Route canvas diffusion models to the serial generation lane."""
+        from mlx_vlm.generate.diffusion import is_diffusion_model
 
         config = getattr(self._vlm_model, "config", None)
-        if getattr(config, "canvas_length", None) is not None:
+        if (
+            getattr(config, "canvas_length", None) is not None
+            and is_diffusion_model(self._vlm_model)
+        ):
             return "block"
         return None
 
@@ -1894,6 +1979,7 @@ class VLMBatchedEngine(BaseEngine):
             apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
@@ -1974,6 +2060,12 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        from ..models.vlm import restore_bonsai_quantized_modules
+
+        restored = restore_bonsai_quantized_modules(self._vlm_model)
+        if restored:
+            logger.info("Restored oMLX Bonsai kernel paths for %d modules", restored)
 
         if self.model_type == "unlimited-ocr":
             from ..utils.tokenizer import (
@@ -2290,7 +2382,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
 
                 apply_qwen35_q4_mlp_patch()
-                apply_qwen35_q4_prefill_linear_patch()
+                apply_qwen35_q4_prefill_linear_patch(self._vlm_model)
                 # Muse Glimmer rides the same native qmm tile (MLP plus the
                 # q/gate/o attention projections); no-op unless the muse
                 # compat patch installed the vendored module.
@@ -2662,10 +2754,10 @@ class VLMBatchedEngine(BaseEngine):
         """Inject tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
+        tool_parser, etc). We prefer mlx_vlm.tools.parsers which is a superset of
         mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
         and loads the correct per-model parser.  Falls back to mlx_lm if the
-        mlx_vlm.tool_parsers package is not present.
+        mlx_vlm.tools.parsers package is not present.
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
@@ -2686,9 +2778,9 @@ class VLMBatchedEngine(BaseEngine):
             logger.info("VLM tool calling enabled: parser=minimax_m3")
             return
 
-        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
+        # Prefer mlx_vlm.tools.parsers (superset; knows about Gemma4 etc.)
         try:
-            from mlx_vlm.tool_parsers import (
+            from mlx_vlm.tools.registry import (
                 _infer_tool_parser,
                 load_tool_module,
             )
@@ -2711,7 +2803,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
             except ImportError:
                 return
-            tool_parser_type = _mlx_lm_infer(chat_template)
+            tool_parser_type = _mlx_lm_infer(tokenizer)
             if tool_parser_type is None:
                 return
             try:
@@ -2942,6 +3034,10 @@ class VLMBatchedEngine(BaseEngine):
         model = self._vlm_model
         model_type = self.model_type or ""
 
+        if model_type == "deepseek_v4":
+            features = model.encode_images(pixel_values, **extra_model_inputs)
+            return mx.concatenate(features, axis=0)
+
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
             image_grid_thw = extra_model_inputs.get("image_grid_thw")
@@ -3058,6 +3154,18 @@ class VLMBatchedEngine(BaseEngine):
         Returns a list of per-image feature tensors, or None if the model
         architecture does not support splitting.
         """
+        if self.model_type == "deepseek_v4":
+            grid = extra_model_inputs["image_grid_hw"].tolist()
+            ratio = self._vlm_model.config.vision_downsample_ratio
+            counts = [
+                ((h + ratio - 1) // ratio) * ((w + ratio - 1) // ratio)
+                for h, w in grid
+            ]
+            if len(counts) != num_images or sum(counts) != features.shape[0]:
+                raise ValueError("DeepSeek V4 cached features do not match image grids")
+            offsets = [sum(counts[:i + 1]) for i in range(len(counts))]
+            return list(mx.split(features, offsets[:-1], axis=0))
+
         if num_images <= 1:
             return [features]
 
@@ -3654,6 +3762,14 @@ class VLMBatchedEngine(BaseEngine):
                             "Vision feature computation failed, using full pipeline",
                             exc_info=True,
                         )
+
+            if (
+                self.model_type == "deepseek_v4"
+                and "cached_image_features" in call_kwargs
+            ):
+                call_kwargs["cached_image_features"] = self._split_vision_features(
+                    call_kwargs["cached_image_features"], num_images, extra_model_inputs
+                )
 
             # Run vision encoder + embedding merge.
             # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
