@@ -43,7 +43,7 @@ def _inspect(path, signature):
             return True, ""
         return False, "The checkpoint has no offloadable routed experts."
 
-    from .moe_expert_offload import CheckpointExpertStore
+    from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
 
     text = raw.get("text_config", raw)
     count = int(text.get("num_experts") or 0)
@@ -66,14 +66,18 @@ def _inspect(path, signature):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind in ("qwen4_exp", "qwen3_5_moe"):
-            # qwen3_5_moe shares qwen4_exp's checkpoint layout:
-            # language_model.model.layers.{n}.mlp.switch_mlp.{gate,up,down}_proj
-            # (mlx-lm Qwen3NextSparseMoeBlock wraps a stock SwitchGLU).
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         else:
             parent = f"language_model.model.layers.{layer}.experts"
             prefix = parent + ".switch_glu"
+        if kind == "qwen3_5_moe":
+            prefix = _qwen35_checkpoint_prefix(store, prefix)
+            if not store.has(prefix + ".gate_proj.weight"):
+                return (
+                    False,
+                    f"Checkpoint is missing expert tensor: {prefix}.gate_proj.weight",
+                )
         per_expert = not store.has(prefix + ".gate_proj.weight")
         for proj in ("gate_proj", "up_proj", "down_proj"):
             key = prefix + "." + proj

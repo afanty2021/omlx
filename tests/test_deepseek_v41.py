@@ -317,7 +317,7 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
 
     from omlx.patches.deepseek_v41.model import Model
 
-    c = tiny(
+    vision_defaults = dict(
         vision_n_layers=1 if vision else 0,
         vision_dim=32,
         vision_n_heads=4,
@@ -326,8 +326,9 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
         vision_min_pixels=64,
         vision_max_n_token=32,
         image_token_id=63,
-        **config_overrides,
     )
+    vision_defaults.update(config_overrides)
+    c = tiny(**vision_defaults)
     model = Model(c)
     source = tmp_path / "source"
     source.mkdir()
@@ -350,13 +351,13 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
     }
     if vision:
         config["vision_config"] = {
-            "num_hidden_layers": 1,
-            "hidden_size": 32,
-            "num_attention_heads": 4,
-            "intermediate_size": 32,
-            "patch_size": 2,
-            "max_image_tokens": 32,
-            "min_pixels": 64,
+            "num_hidden_layers": vision_defaults["vision_n_layers"],
+            "hidden_size": vision_defaults["vision_dim"],
+            "num_attention_heads": vision_defaults["vision_n_heads"],
+            "intermediate_size": vision_defaults["vision_inter_dim"],
+            "patch_size": vision_defaults["vision_patch_size"],
+            "max_image_tokens": vision_defaults["vision_max_n_token"],
+            "min_pixels": vision_defaults["vision_min_pixels"],
         }
     (source / "config.json").write_text(json.dumps(config))
     (source / "model.safetensors.index.json").write_text(
@@ -391,6 +392,72 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
         additional_special_tokens=special[6:] + [vocabulary[-1]],
     )
     tokenizer.save_pretrained(source)
+    return source, model
+
+
+def write_affine_checkpoint(
+    tmp_path,
+    vision=False,
+    bits=2,
+    group_size=64,
+    index_order="sorted",
+    **config_overrides,
+):
+    """Write mixed dense/affine weights with mlx_lm quantization metadata."""
+    import json
+
+    source, model = write_checkpoint(
+        tmp_path,
+        vision=vision,
+        dim=64,
+        moe_inter_dim=64,
+        vision_dim=64,
+        vision_inter_dim=64,
+        **config_overrides,
+    )
+    originals = dict(mx.load(str(source / "model.safetensors")))
+    tensors, quantized = {}, {}
+    for name, value in originals.items():
+        base = name.removesuffix(".weight") if name.endswith(".weight") else ""
+        # Keep the router dense and preserve linear biases beside packed weights.
+        if (
+            base
+            and not base.endswith("ffn.gate")
+            and value.ndim == 2
+            and value.shape[-1] % group_size == 0
+            and value.shape[-1] >= group_size
+        ):
+            weight, scales, biases = mx.quantize(
+                value.astype(mx.bfloat16),
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+            base = name.removesuffix(".weight")
+            tensors[base + ".weight"] = weight
+            tensors[base + ".scales"] = scales
+            tensors[base + ".biases"] = biases
+            quantized[base] = {"bits": bits, "group_size": group_size, "mode": "affine"}
+        else:
+            tensors[name] = value
+            if name.endswith(".weight"):
+                quantized[name.removesuffix(".weight")] = False
+    # Materialize lazy reads before overwriting their source file.
+    mx.eval(list(tensors.values()))
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    # Match mlx_lm's sorted index by default, with biases before weights.
+    keys = sorted(tensors) if index_order == "sorted" else list(tensors)
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in keys}})
+    )
+    config = json.loads((source / "config.json").read_text())
+    config["quantization"] = config["quantization_config"] = {
+        "bits": bits,
+        "group_size": group_size,
+        "mode": "affine",
+        **quantized,
+    }
+    (source / "config.json").write_text(json.dumps(config))
     return source, model
 
 

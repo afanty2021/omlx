@@ -94,9 +94,7 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
-@pytest.mark.parametrize(
-    "kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4"]
-)
+@pytest.mark.parametrize("kind", ["glm5_next", "glm_moe_dsa", "deepseek_v4"])
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
     _checkpoint(tmp_path, kind)
     assert moe_offload_compatibility(tmp_path)[0] is False
@@ -191,3 +189,66 @@ def test_admin_uses_adjusted_residency_for_offload_models(tmp_path, kind):
     assert model["moe_expert_offload_supported"] is True
     assert model[prefix + "_ssd_offload_forced"] is False
     assert model[prefix + "_resident_bytes"] == 450
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_qwen35_loader_paths_match_offload_admission(tmp_path, flat):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.qwen3_5_moe import Model, ModelArgs
+    from mlx_lm.utils import load_model
+
+    from omlx.patches.moe_expert_offload import (
+        apply_moe_expert_offload,
+        estimate_offload_admission_bytes,
+    )
+
+    config = dict(
+        model_type="qwen3_5_moe",
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        vocab_size=128,
+        num_experts=16,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+        full_attention_interval=1,
+    )
+    model = Model(ModelArgs.from_dict(config))
+    nn.quantize(model, group_size=32, bits=4)
+    weights = dict(tree_flatten(model.parameters()))
+    expert_bytes = sum(v.nbytes for k, v in weights.items() if ".switch_mlp." in k)
+    if flat:
+        weights = {k.removeprefix("language_model."): v for k, v in weights.items()}
+    config["quantization"] = {"group_size": 32, "bits": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    checkpoint = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(checkpoint), weights)
+
+    loaded, _ = load_model(tmp_path, lazy=True)
+    inputs = mx.array([[1, 2, 3]])
+    expected = loaded(inputs)
+    mx.eval(expected)
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    assert apply_moe_expert_offload(loaded, tmp_path, 0.25) == 2
+    actual = loaded(inputs)
+    mx.eval(actual)
+    assert mx.array_equal(expected, actual).item()
+    # The minimum capacity keeps eight of sixteen experts per layer.
+    full = checkpoint.stat().st_size
+    assert (
+        estimate_offload_admission_bytes(tmp_path, full, 0.25)
+        == full - expert_bytes // 2
+    )
+
+    weights.pop(
+        next(k for k in weights if "layers.1.mlp.switch_mlp.gate_proj.weight" in k)
+    )
+    mx.save_safetensors(str(checkpoint), weights)
+    assert moe_offload_compatibility(tmp_path)[0] is False
+    full = checkpoint.stat().st_size
+    assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full

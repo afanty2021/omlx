@@ -26,7 +26,7 @@ larger than physical memory load at all.
 ## Enabling it
 
 Per model, in the admin dashboard: **Model Settings → MoE Expert Offload**,
-with a resident-fraction selector (12.5% – 75%). Or via the settings API:
+with a resident-fraction field accepting 5% to 95%, including fractional percentages such as 12.5%. The API accepts any fraction in (0, 1]. Values outside the UI range are preserved until the field is edited. The following example uses the settings API.
 
 ```json
 {"moe_expert_offload_enabled": true, "moe_expert_offload_resident_fraction": 0.25}
@@ -84,13 +84,15 @@ A call's misses are read in parallel with `os.pread` on a shared thread pool. `e
 
 ## Supported models
 
-The experimental toggle is available for `deepseek_v41`, `qwen4_exp`,
-`gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes
-validation. Dense Gemma models and other model types do not show the toggle.
-The settings API and model loader use the same eligibility check.
+The experimental toggle is available for `deepseek_v41`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
+
+Qwen3.5/3.6 supports stacked expert projections under `language_model.model.layers.*.mlp.switch_mlp` and `model.layers.*.mlp.switch_mlp`. The offload adapter resolves the original checkpoint path after the loader normalizes the text-only naming layout.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
+Both are read from either an MXFP checkpoint or a community `mlx_lm` affine
+conversion, whose projections carry a U32 weight with float scales and biases
+and declare their format in the checkpoint's own `quantization` dict.
 All backbone layers must have the expected tensor names, shapes, storage
 dtypes, and quantization metadata. Fused or renamed projections, missing
 experts, unquantized weights, and per-expert linear bias are rejected.
@@ -131,12 +133,14 @@ where the kernel path is identical, rounding-bounded where it is not.
 
 ## DeepSeek V4.1
 
-DeepSeek V4.1 uses its own expert adapter and loader. Both the original
-checkpoint and oMLX converted MXFP/oQ checkpoints are supported. Expert
-weights stay in the existing safetensors files. The resident fraction applies
-to the routed experts in each backbone layer, with capacity floored at the
-number selected by one token. Shared experts, attention, and other backbone
-weights remain resident.
+DeepSeek V4.1 uses its own expert adapter and loader. The original checkpoint,
+oMLX converted MXFP/oQ checkpoints, and community `mlx_lm` affine conversions
+are supported. Expert weights stay in the existing safetensors files; an
+affine source reports its format in the checkpoint's `quantization` dict and
+counts its packed weight plus BF16 scales and biases toward the resident set.
+The resident fraction applies to the routed experts in each backbone layer,
+with capacity floored at the number selected by one token. Shared experts,
+attention, and other backbone weights remain resident.
 
 Non-resident experts are read with positional `pread` calls on a small
 reader pool of their own, not through the Engram row-gather mapping: an

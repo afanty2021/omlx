@@ -550,9 +550,25 @@ class OffloadSwitchGLU(nn.Module):
         for start, end in zip(cuts[:-1], cuts[1:]):
             chunk_ids = sorted_ids[start:end]
             c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
+            n_routes = end - start
+            padded_routes = n_routes
+            # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
+            # (E = resident slots); below that, padding would change kernels.
+            if n_routes >= max(16, 4 * c.capacity):
+                # Power-of-two sizes repeat across layers, so the Metal pool
+                # reuses those buffers instead of keeping one per size.
+                padded_routes = 1 << (n_routes - 1).bit_length()
+            token_ids = order[start:end] // k
+            if padded_routes != n_routes:
+                chunk_ids = np.pad(
+                    chunk_ids, (0, padded_routes - n_routes), mode="edge"
+                )
+                token_ids = np.pad(
+                    token_ids, (0, padded_routes - n_routes), mode="edge"
+                )
             slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
             slots = slots.reshape(-1, 1)
-            t_idx = mx.array(order[start:end] // k, dtype=mx.int32)
+            t_idx = mx.array(token_ids, dtype=mx.int32)
             xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
             inv = None
             if do_sort:
@@ -561,8 +577,8 @@ class OffloadSwitchGLU(nn.Module):
             gate = c.qmm("gate_proj", xe, slots, do_sort)
             o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
             if do_sort:
-                o = _scatter_unsort(o, inv, (end - start, 1))
-            o = o.squeeze(-2)[:, 0, :]
+                o = _scatter_unsort(o, inv, (padded_routes, 1))
+            o = o.squeeze(-2)[:n_routes, 0, :]
             mx.eval(o)
             outs.append(o)
         out = mx.concatenate(outs, axis=0)
@@ -667,6 +683,17 @@ def _iter_switch_glus(model):
     yield from walk(None, None, model, "")
 
 
+def _qwen35_checkpoint_prefix(store, path):
+    # Qwen's loader adds language_model. to text-only checkpoint keys.
+    if path.startswith("language_model.model.layers.") and not store.has(
+        path + ".gate_proj.weight"
+    ):
+        flat = path.removeprefix("language_model.")
+        if store.has(flat + ".gate_proj.weight"):
+            return flat
+    return path
+
+
 def _resolve_store_view(
     glu: SwitchGLU, store: CheckpointExpertStore, path: str
 ) -> tuple[_GLUStoreView | None, str | None]:
@@ -746,6 +773,12 @@ def apply_moe_expert_offload(
     if model_dir is None:
         return 0
     minimum = _minimum_experts(model_dir)
+    config_path = Path(model_dir) / "config.json"
+    kind = (
+        json.loads(config_path.read_text()).get("model_type")
+        if config_path.exists()
+        else None
+    )
     store = CheckpointExpertStore(model_dir)
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
@@ -754,7 +787,10 @@ def apply_moe_expert_offload(
     wrapped = 0
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
-        view, reason = _resolve_store_view(glu, store, path)
+        checkpoint_path = (
+            _qwen35_checkpoint_prefix(store, path) if kind == "qwen3_5_moe" else path
+        )
+        view, reason = _resolve_store_view(glu, store, checkpoint_path)
         if view is None:
             logger.info("moe expert offload: skipping %s (%s)", path, reason)
             continue
@@ -823,6 +859,11 @@ def estimate_offload_admission_bytes(
             kind = json.loads(config_path.read_text()).get("model_type", "")
             if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
                 return full_size
+            if kind == "qwen3_5_moe":
+                from .moe_offload_compat import moe_offload_compatibility
+
+                if not moe_offload_compatibility(model_dir)[0]:
+                    return full_size
         # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the

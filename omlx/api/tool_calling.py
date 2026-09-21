@@ -2022,6 +2022,23 @@ def _parse_tool_calls_impl(
                     for p in items:
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
+                        if (
+                            getattr(tool_parser, "__module__", None)
+                            == "mlx_lm.tool_parsers.qwen3_coder"
+                            and isinstance(arguments, dict)
+                        ):
+                            props = _tool_param_properties(name, tools)
+                            # Use XML values to avoid decoding parsed strings twice.
+                            for key, val in _iter_xml_parameters(match):
+                                spec = props.get(key)
+                                if (
+                                    isinstance(spec, dict)
+                                    and "type" not in spec
+                                    and isinstance(arguments.get(key), str)
+                                ):
+                                    arguments[key] = _coerce_param_value(
+                                        val, key, props, name
+                                    )
                         _built = _build_tool_call(name, arguments)
                         if _built is not None:
                             tool_calls.append(_built)
