@@ -512,6 +512,9 @@ class _PrefillState:
     sm: Any = None
     per_row_lps: Any = None
     qwen4_gathered_core: bool | None = None
+    # Tail snapshot plan, see _prefill_tail_plan.
+    tail_at: int | None = None
+    end_tail: bool = False
 
 
 @dataclass
@@ -1242,6 +1245,10 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
 )
 
 
+# The one snapshot source allowed off the block grid.
+_TAIL_SNAPSHOT_SOURCE = "prefill_tail"
+
+
 def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
     return type(cache_obj).__name__ in _TURBOQUANT_KV_CACHE_TYPES
 
@@ -1640,6 +1647,7 @@ class SchedulerConfig:
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
+    paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
     # Store top-level ArraysCache recurrent state as SSD sidecars while the
@@ -1699,12 +1707,15 @@ class _BoundarySnapshotProvider:
         valid_tcs: list[int],
         in_memory_snapshots: dict[int, Any],
         paged_ssd_manager: Any | None = None,
+        tail_terminal_token_count: int | None = None,
     ) -> None:
         self._store = store
         self._request_id = request_id
         self._valid_tcs = set(valid_tcs)
         self._in_memory = in_memory_snapshots
         self._paged_ssd_manager = paged_ssd_manager
+        # Set when the stored sequence ends on a tail snapshot, not a boundary.
+        self.tail_terminal_token_count = tail_terminal_token_count
 
     def __contains__(self, tc: int) -> bool:
         return tc in self._valid_tcs
@@ -2523,6 +2534,9 @@ class Scheduler:
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
                     _safe_sync_stream(self._stream)
+                store_tail_terminal = getattr(
+                    intermediate_snapshots, "tail_terminal_token_count", None
+                ) == len(token_sequence_to_store)
                 if hot_cache_write_back:
                     block_table = self.block_aware_cache.store_cache(
                         request_id,
@@ -2533,6 +2547,7 @@ class Scheduler:
                         extra_keys=extra_keys,
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
+                        _store_tail_terminal=store_tail_terminal,
                     )
                 else:
                     block_table = self.block_aware_cache.store_cache(
@@ -2545,6 +2560,7 @@ class Scheduler:
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
+                        _store_tail_terminal=store_tail_terminal,
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -3679,6 +3695,9 @@ class Scheduler:
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: dict[int, int] = {}
+        tail_at, end_tail = self._prefill_tail_plan(
+            request, base_size, n_tokens, boundary_enabled
+        )
 
         # The full prompt length is known here; hand it to the QSA indexer so
         # its arrays are sized once instead of doubling mid-prefill.
@@ -3706,6 +3725,9 @@ class Scheduler:
                     cache_tokens=base_size + processed_tokens,
                     block_size=block_size,
                 )
+            # Stop once more at the tail position so its state is captured.
+            if tail_at is not None and base_size + processed_tokens < tail_at:
+                n_to_process = min(n_to_process, tail_at - base_size - processed_tokens)
 
             atomic_prefix = minimum_prefix if processed_tokens == 0 else 0
             if atomic_prefix:
@@ -3865,6 +3887,10 @@ class Scheduler:
                         request, prompt_cache, total_tokens
                     )
                     emitted_boundaries[request.request_id] = total_tokens
+                elif tail_at is not None and total_tokens == tail_at:
+                    self._emit_prefill_tail_snapshot(
+                        request, prompt_cache, total_tokens
+                    )
 
             # Memory monitoring — use max(active, phys_footprint) so MLX
             # cache pool and IOAccelerator-backed allocations that don't
@@ -3996,7 +4022,8 @@ class Scheduler:
                     max(0.0, _trace_total_ms - _trace_model_ms),
                 )
 
-        # Emit final boundary snapshot if prompt lands exactly on boundary.
+        # Emit final boundary snapshot if prompt lands exactly on boundary,
+        # otherwise capture the tail state the prefill just produced.
         if boundary_enabled:
             total_tokens = base_size + processed_tokens
             if should_emit_prefill_boundary(
@@ -4007,6 +4034,8 @@ class Scheduler:
                 self._emit_prefill_boundary_snapshot(
                     request, prompt_cache, total_tokens
                 )
+            elif end_tail and processed_tokens > 0 and total_tokens % block_size != 0:
+                self._emit_prefill_tail_snapshot(request, prompt_cache, total_tokens)
 
         Scheduler._clear_cache(self)
 
@@ -4427,7 +4456,8 @@ class Scheduler:
                 n_tokens, kv_len, gathered_core=gathered_core
             ) / n_tokens
             safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
-            n_fit = max(min_chunk, min(n_tokens, safe_n))
+            # Never enlarge a short boundary or tail slice past its end.
+            n_fit = min(n_tokens, max(min_chunk, safe_n))
         # Same quantization as the adaptive throttle: an off-grid size here
         # would reintroduce the near-miss buffers _snap_chunk_size exists to
         # avoid.
@@ -5457,7 +5487,7 @@ class Scheduler:
         with mx.stream(self._stream):
             input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
 
-        return _PrefillState(
+        state = _PrefillState(
             request=request,
             cache=prompt_cache,
             tokens_remaining=input_arr,
@@ -5469,6 +5499,10 @@ class Scheduler:
             block_size=block_size,
             total_length=len(tokens),
         )
+        state.tail_at, state.end_tail = self._prefill_tail_plan(
+            request, base_size, len(tokens), boundary_enabled
+        )
+        return state
 
     def _announce_first_prefill_chunk(self, tokens, base_size, boundary_enabled, block_size, embeds_array) -> None:
         """Let a gather-ahead model start on the first chunk before the loop reaches it (empty current chunk)."""
@@ -5537,6 +5571,10 @@ class Scheduler:
                 cache_tokens=state.base_size + state.tokens_processed,
                 block_size=state.block_size,
             )
+        # Stop once more at the tail position so its state is captured.
+        cache_tokens = state.base_size + state.tokens_processed
+        if state.tail_at is not None and cache_tokens < state.tail_at:
+            n = min(n, state.tail_at - cache_tokens)
 
         # Adaptive throttle — see _adaptive_chunk_size docstring. Raises
         # if even prefill_min_chunk_tokens would exceed the cap; #1405
@@ -5645,6 +5683,10 @@ class Scheduler:
                     state.request, state.cache, total_tokens
                 )
                 state.emitted_boundaries[rid] = total_tokens
+            elif state.tail_at is not None and total_tokens == state.tail_at:
+                self._emit_prefill_tail_snapshot(
+                    state.request, state.cache, total_tokens
+                )
 
         # Progress callback so the admin UI prefilling list advances during
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
@@ -5764,7 +5806,7 @@ class Scheduler:
         return state.tokens_remaining.shape[1] == 0
 
     def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:
-        """Emit a final boundary snapshot if the prefill landed on a boundary."""
+        """Emit a final boundary snapshot, or a tail snapshot off the grid."""
         if not state.boundary_enabled:
             return
         total_tokens = state.base_size + state.tokens_processed
@@ -5777,6 +5819,12 @@ class Scheduler:
             self._emit_prefill_boundary_snapshot(
                 state.request, state.cache, total_tokens
             )
+        elif (
+            state.end_tail
+            and state.tokens_processed > 0
+            and total_tokens % state.block_size != 0
+        ):
+            self._emit_prefill_tail_snapshot(state.request, state.cache, total_tokens)
 
     def _finalize_chunked_prefill_cache_for_insert(
         self, request: "Request", prompt_cache: list[Any] | None
@@ -6238,6 +6286,74 @@ class Scheduler:
                 if snapshot_block_size != self.config.paged_cache_block_size
                 else {}
             ),
+        )
+
+    def _resolve_generation_prompt_start(self, request: "Request") -> None:
+        """Locate the generation prompt; accept it only if its tokens end the prompt."""
+        suffix = getattr(request, "generation_prompt_text", None)
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if not suffix or not token_ids:
+            return
+        try:
+            suffix_ids = self.tokenizer.encode(suffix, add_special_tokens=False)
+        except TypeError:
+            suffix_ids = self.tokenizer.encode(suffix)
+        n = len(suffix_ids)
+        if 0 < n < len(token_ids) and list(token_ids[-n:]) == list(suffix_ids):
+            request.generation_prompt_start = len(token_ids) - n
+
+    def _minimum_prefill_prefix(self, request: "Request") -> int:
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
+        minimum_prefix = (
+            prefix_hook(prompt_token_ids)
+            if callable(prefix_hook) and prompt_token_ids is not None
+            else 0
+        )
+        return minimum_prefix if isinstance(minimum_prefix, int) else 0
+
+    def _prefill_tail_plan(
+        self,
+        request: "Request",
+        base_size: int,
+        n_tokens: int,
+        boundary_enabled: bool,
+    ) -> tuple[int | None, bool]:
+        """Return ``(stop_at, end_tail)`` for this prefill's tail snapshot.
+
+        The tail ends at the generation prompt when it lies inside the prefill,
+        at the prefill end for raw prompts, and nowhere once the marker is cached.
+        """
+        if not boundary_enabled:
+            return None, False
+        gen_start = getattr(request, "generation_prompt_start", 0) or 0
+        prefill_end = base_size + n_tokens - 1
+        if gen_start <= 0 or gen_start == prefill_end:
+            return None, True
+        if base_size < gen_start < prefill_end:
+            if gen_start < self._minimum_prefill_prefix(request):
+                return None, False
+            return gen_start, False
+        return None, False
+
+    def _emit_prefill_tail_snapshot(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        total_tokens: int,
+    ) -> None:
+        """Capture the prefill state off the block grid as a tail snapshot."""
+        block_size = self.config.paged_cache_block_size
+        if block_size <= 0 or total_tokens <= 0 or total_tokens % block_size == 0:
+            return
+        if total_tokens < self._minimum_prefill_prefix(request):
+            return
+        snapshot_cache = [
+            c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
+            for c in prompt_cache
+        ]
+        self._on_prefill_boundary_snapshot(
+            request.request_id, snapshot_cache, total_tokens, source="prefill_tail"
         )
 
     def _build_sampler_and_processors(
@@ -6799,7 +6915,11 @@ class Scheduler:
             )
             return
 
-        if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
+        if (
+            block_size <= 0
+            or token_count <= 0
+            or (token_count % block_size != 0 and source != _TAIL_SNAPSHOT_SOURCE)
+        ):
             self._boundary_snapshot_diagnostics.record(
                 "capture_skipped",
                 reason="unaligned_token_count",
@@ -7362,29 +7482,29 @@ class Scheduler:
             miss("invalid_block_size", len(snapshots))
             return None
 
-        # Find all valid boundary-aligned snapshot token counts
+        # The newest tail competes with aligned snapshots for the terminal slot.
+        # Unless the template keeps the generation prompt, stop at the marker.
+        limit = total_tokens
+        request = self.requests.get(request_id)
+        marker = getattr(request, "generation_prompt_start", 0) or 0
+        if 0 < marker < limit and not getattr(
+            request, "generation_prompt_persists", False
+        ):
+            limit = marker
         valid_counts = sorted(
-            tc
-            for tc in snapshots.keys()
-            if 0 < tc <= total_tokens and tc % block_size == 0
+            tc for tc in snapshots if 0 < tc <= limit and tc % block_size == 0
         )
-        if not valid_counts:
+        tail_counts = [
+            tc for tc in snapshots if 0 < tc <= limit and tc % block_size != 0
+        ]
+        if not valid_counts and not tail_counts:
             miss("no_aligned_snapshots", len(snapshots))
             return None
 
-        # Find the latest snapshot that leaves trailing partial tokens
-        # (or equals total if it's block-aligned).
-        latest_tc = valid_counts[-1]
-        if latest_tc < total_tokens:
-            # Trailing partial tokens exist — use this snapshot for truncation
-            pass
-        elif latest_tc == total_tokens and total_tokens % block_size == 0:
-            # Exactly block-aligned — no truncation needed but we still
-            # provide intermediate snapshots for per-block storage.
-            latest_tc = total_tokens
-        else:
-            miss("latest_snapshot_not_usable", len(valid_counts))
-            return None
+        latest_aligned = valid_counts[-1] if valid_counts else 0
+        latest_tail = max(tail_counts) if tail_counts else 0
+        tail_terminal = latest_tail > latest_aligned
+        latest_tc = latest_tail if tail_terminal else latest_aligned
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
         #
@@ -7461,6 +7581,7 @@ class Scheduler:
             valid_tcs=provider_tcs,
             in_memory_snapshots=extracted_in_memory,
             paged_ssd_manager=self.paged_ssd_cache_manager,
+            tail_terminal_token_count=latest_tc if tail_terminal else None,
         )
 
         token_sequence = (
@@ -7720,10 +7841,11 @@ class Scheduler:
     def _capture_finished_boundary_snapshot(
         self, request: Request, cache: list[Any]
     ) -> None:
-        """Preserve a verified terminal boundary after the generator drops its UID."""
+        """Preserve a verified terminal boundary after the generator drops its UID.
+
+        Only an aligned end qualifies; a prefill tail below it does not block it.
+        """
         if getattr(request, "skip_cache_store", False):
-            return
-        if self._boundary_cache_snapshots.get(request.request_id):
             return
         token_count = (
             request.num_tokens
@@ -7737,6 +7859,9 @@ class Scheduler:
             or token_count % block_size
             or not self._detect_boundary_snapshot_need()
         ):
+            return
+        existing = self._boundary_cache_snapshots.get(request.request_id)
+        if existing and max(existing) >= token_count:
             return
 
         # Composite caches use their leading token-position leaf; later
@@ -8981,6 +9106,7 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+        self._resolve_generation_prompt_start(request)
 
         if self.block_aware_cache is not None:
             # Arm MTP boundary alignment now: a prompt shorter than a block meets
@@ -9065,6 +9191,7 @@ class Scheduler:
                 draft_ssd = PagedSSDCacheManager(
                     cache_dir=Path(self.config.paged_ssd_cache_dir),
                     max_size_bytes=self.config.paged_ssd_cache_max_size,
+                    auto_size=self.config.paged_ssd_cache_auto_size,
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
                     hot_cache_write_through=self.config.hot_cache_write_through,
@@ -11974,11 +12101,21 @@ class Scheduler:
                                                 model_cache_config = (
                                                     boundary_model_config
                                                 )
+                                            tail_tc = getattr(
+                                                intermediate_snapshots,
+                                                "tail_terminal_token_count",
+                                                None,
+                                            )
+                                            terminal_kind = (
+                                                "tail terminal"
+                                                if tail_tc
+                                                else "block aligned"
+                                            )
                                             logger.info(
                                                 f"Using boundary cache snapshot for {request_id}: "
                                                 f"storing {len(token_sequence_to_store)}/"
                                                 f"{len(full_token_sequence)} tokens "
-                                                f"(skipping trailing partial block, "
+                                                f"({terminal_kind}, "
                                                 f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                                 f"intermediate snapshots)"
                                             )
@@ -13782,6 +13919,7 @@ class Scheduler:
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
+                auto_size=self.config.paged_ssd_cache_auto_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_write_through=self.config.hot_cache_write_through,
@@ -13843,7 +13981,7 @@ class Scheduler:
                 logger.info(
                     f"paged SSD cache enabled: "
                     f"cache_dir={self.config.paged_ssd_cache_dir}, "
-                    f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
+                    f"max_size={self._format_bytes(self.paged_ssd_cache_manager.max_size)}, "
                     f"block_size={self.config.paged_cache_block_size} tokens"
                 )
             return True

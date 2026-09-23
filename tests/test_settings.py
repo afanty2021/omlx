@@ -458,13 +458,21 @@ class TestCacheSettings:
         base_path = Path("/tmp/omlx")
         assert settings.get_ssd_cache_dir(base_path) == Path("/custom/cache")
 
-    def test_get_ssd_cache_max_size_bytes_auto(self):
-        """Test auto SSD cache size calculation."""
+    def test_get_ssd_cache_max_size_bytes_auto(self, tmp_path):
         settings = CacheSettings(ssd_cache_max_size="auto")
-        base_path = Path("/tmp/omlx")
-        cache_dir = settings.get_ssd_cache_dir(base_path)
-        expected = int(get_ssd_capacity(cache_dir) * 0.1)
-        assert settings.get_ssd_cache_max_size_bytes(base_path) == expected
+        cache_dir = settings.get_ssd_cache_dir(tmp_path)
+        (cache_dir / "a").mkdir(parents=True)
+        (cache_dir / "a" / "block.safetensors").write_bytes(b"x" * 60)
+        sidecars = cache_dir / "_gdn_sidecars" / ("b" * 64)
+        sidecars.mkdir(parents=True)
+        (sidecars / "state.safetensors").write_bytes(b"x" * 40)
+        (cache_dir / "unrelated").write_bytes(b"x" * 100)
+        with patch("omlx.settings.shutil.disk_usage") as usage:
+            usage.return_value.free = 200
+            assert settings.get_ssd_cache_max_size_bytes(tmp_path) == 150
+            config = GlobalSettings(base_path=tmp_path).to_scheduler_config()
+            assert config.paged_ssd_cache_auto_size is True
+            assert config.paged_ssd_cache_max_size == 150
 
     def test_get_ssd_cache_max_size_bytes_explicit(self):
         """Test explicit SSD cache size."""

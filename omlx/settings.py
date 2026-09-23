@@ -130,6 +130,30 @@ def get_ssd_capacity(path: str | Path) -> int:
         return 500 * 1024**3
 
 
+def get_auto_ssd_cache_size(cache_dir: Path) -> int:
+    """Estimate the automatic budget before the runtime cache index is loaded."""
+    check_path = cache_dir
+    while not check_path.exists() and check_path.parent != check_path:
+        check_path = check_path.parent
+    free_bytes = shutil.disk_usage(check_path).free
+    cache_bytes = 0
+    roots = [cache_dir / prefix for prefix in "0123456789abcdef"]
+    roots.append(cache_dir / "_gdn_sidecars")
+    for root in roots:
+        if root.is_symlink():
+            continue
+        for directory, _, names in os.walk(root, followlinks=False):
+            for name in names:
+                path = Path(directory) / name
+                if path.suffix != ".safetensors" or path.is_symlink():
+                    continue
+                try:
+                    cache_bytes += path.stat().st_size
+                except FileNotFoundError:
+                    pass  # A runtime writer can evict files during the scan.
+    return (free_bytes + cache_bytes) // 2
+
+
 # Burst Decode UI modes -> (decode_burst_max_steps, decode_burst_budget_single_s).
 # These mirror the OMLX_DECODE_BURST_* env vars read by EngineConfig
 # (engine_core.py). "off" fully disables bursting via max_steps=1; the on-levels
@@ -344,7 +368,7 @@ class CacheSettings:
     enabled: bool = True
     hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
-    ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
+    ssd_cache_max_size: str = "auto"  # "auto" reserves half of available cache space
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     # When True (and the hot cache is enabled), every saved block is kept in
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
@@ -419,11 +443,11 @@ class CacheSettings:
             base_path: Base oMLX directory.
 
         Returns:
-            Max SSD cache size in bytes (10% of SSD if "auto").
+            Max SSD cache size in bytes (half of free space plus existing cache for "auto").
         """
         if self.ssd_cache_max_size.lower() == "auto":
             cache_dir = self.get_ssd_cache_dir(base_path)
-            return int(get_ssd_capacity(cache_dir) * 0.1)
+            return get_auto_ssd_cache_size(cache_dir)
         return parse_size(self.ssd_cache_max_size)
 
     def get_hot_cache_max_size_bytes(self) -> int:
@@ -1835,6 +1859,7 @@ class GlobalSettings:
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
                 self.base_path
             ),
+            paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),

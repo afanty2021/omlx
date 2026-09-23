@@ -3836,6 +3836,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         """Apply chat template for text-only messages (no images).
 
@@ -3845,6 +3846,8 @@ class VLMBatchedEngine(BaseEngine):
                 ``partial`` key is cleaned from message dicts but no detection
                 is performed.  ``None`` (default) — auto-detect from messages
                 for direct engine callers.
+            add_generation_prompt: Overrides the partial-derived default, used
+                to render the same messages without the generation prompt.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
@@ -3854,9 +3857,11 @@ class VLMBatchedEngine(BaseEngine):
                 # so the chat template never sees the non-standard field.
                 for msg in messages:
                     msg.pop("partial", None)
+            if add_generation_prompt is None:
+                add_generation_prompt = not is_partial
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": not is_partial,
+                "add_generation_prompt": add_generation_prompt,
             }
             if is_partial:
                 template_kwargs["continue_final_message"] = True
@@ -3901,7 +3906,7 @@ class VLMBatchedEngine(BaseEngine):
                 return get_chat_template(
                     self._processor,
                     messages,
-                    add_generation_prompt=True,
+                    add_generation_prompt=add_generation_prompt,
                 )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -3922,6 +3927,8 @@ class VLMBatchedEngine(BaseEngine):
             "specprefill_keep_pct",
             "specprefill_threshold",
             "specprefill_system_end",
+            "generation_prompt_text",
+            "generation_prompt_persists",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -4275,6 +4282,9 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
         (
             prompt,
             vlm_embeds,
@@ -4292,6 +4302,10 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         return await self.generate(
             prompt=prompt,
@@ -4503,6 +4517,9 @@ class VLMBatchedEngine(BaseEngine):
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
         loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
         (
             prompt,
             vlm_embeds,
@@ -4520,6 +4537,10 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         async for output in self.stream_generate(
             prompt=prompt,
