@@ -7,6 +7,7 @@ import sys
 import types
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 
@@ -743,3 +744,51 @@ def test_oq_preserves_mtp_shards_and_calibrates_all_heads(tmp_path, layout):
         assert mx.allclose(mx.array(actual_energy), expected_energy, atol=1e-5).item()
     finally:
         collector.restore(loaded)
+
+
+def _quantized_moe(mimo, T, top_k=8):
+    cfg = mimo.ModelArgs.from_dict(
+        _minimal_config(n_routed_experts=16, num_experts_per_tok=top_k)
+    )
+    moe = mimo.MoE(cfg)
+    mx.random.seed(0)
+    moe.gate.weight = mx.random.normal(moe.gate.weight.shape) * 0.1
+    moe.gate.e_score_correction_bias = mx.zeros_like(moe.gate.e_score_correction_bias)
+    nn.quantize(moe.switch_mlp, group_size=64, bits=4)
+    x = mx.random.normal((1, T, 128)).astype(mx.bfloat16)
+    mx.eval(moe.parameters(), x)
+    return moe, x
+
+
+def _unfused_combine(moe, x):
+    inds, scores = moe.gate(x)
+    y = moe.switch_mlp(x, inds)
+    if y.ndim == x.ndim + 1:
+        y = (y * scores[..., None]).sum(axis=-2)
+    return y.astype(x.dtype)
+
+
+@pytest.mark.parametrize("T", [4, 96])
+def test_moe_fused_combine_matches_unfused_combine(T):
+    """Top-8 routing combines through glm_moe_weighted_sum (sorted prefill)."""
+    moe, x = _quantized_moe(_load_patch_module(), T)
+    assert moe._fused_combine
+    out = moe(x)
+    ref = _unfused_combine(moe, x)
+    mx.eval(out, ref)
+    assert out.shape == ref.shape == x.shape
+    assert out.dtype == x.dtype
+    assert mx.allclose(
+        out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2
+    ).item()
+
+
+def test_moe_unsupported_top_k_uses_plain_switch_glu():
+    moe, x = _quantized_moe(_load_patch_module(), 96, top_k=2)
+    assert not moe._fused_combine
+    out = moe(x)
+    ref = _unfused_combine(moe, x)
+    mx.eval(out, ref)
+    assert mx.allclose(
+        out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2
+    ).item()

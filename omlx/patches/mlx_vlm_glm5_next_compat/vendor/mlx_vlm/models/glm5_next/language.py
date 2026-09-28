@@ -1,6 +1,8 @@
 import logging
+from functools import partial
 from typing import Any, Optional
 
+from omlx.utils.layer_pipeline import LayerPipeline
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -11,10 +13,13 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, CacheList, KVCache
-from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
+from ..deepseek_v4.hyper_connection import HyperConnection as _HyperConnection
+from ..deepseek_v4.hyper_connection import hc_expand as _hc_expand
+from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
 from omlx.patches import glm53_kda_prework
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
     group_expert_select,
@@ -24,12 +29,22 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     q8_vup_flat,
     sparse_mla_attention,
 )
+from omlx.patches.glm_moe_dsa.indexer_nax import (
+    indexer_scores_nax,
+    max_rows_per_call,
+    nax_indexer_available,
+)
 from .config import ModelConfig, TextConfig
+from . import hc_prefill
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+
+
+# Causal row blocks of the dense-prefix attention (1 = one call).
+_DENSE_ROW_BLOCKS = 8
 
 
 def _cache_parts(cache):
@@ -50,6 +65,30 @@ def glm5_next_cast_predicate(key: str) -> bool:
         or key.endswith("dt_bias")
         or key.endswith("mlp.gate.weight")
     )
+
+
+class HyperConnection(_HyperConnection):
+    """mlx-vlm's hyper-connection with fused, batch-invariant prefill kernels.
+
+    Blocks longer than ``DECODE_BLOCK_SIZE`` take ``hc_prefill.hc_pre``;
+    decode and short verify blocks keep the canonical path.
+    """
+
+    def __call__(self, x: mx.array):
+        if x.ndim == 4 and x.shape[1] > DECODE_BLOCK_SIZE:
+            fused = hc_prefill.hc_pre(self, x)
+            if fused is not None:
+                return fused
+        return super().__call__(x)
+
+
+def hc_expand(x, residual, post, comb, **kwargs):
+    """``hc_expand`` with a single-pass kernel for prefill-length blocks."""
+    if x.ndim == 3 and x.shape[1] > DECODE_BLOCK_SIZE and not kwargs:
+        fused = hc_prefill.hc_expand(x, residual, post, comb)
+        if fused is not None:
+            return fused
+    return _hc_expand(x, residual, post, comb, **kwargs)
 
 
 class Glm5NextRMSNormGated(nn.Module):
@@ -170,9 +209,11 @@ class Glm5NextLinearAttention(nn.Module):
         self.fuse_in = True
         self._fused_ready = False
 
-    def _fused_in_proj(self, inputs):
+    def _fused_in_proj(self, inputs, split=True):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
         # output-axis concat of the (quantized) weights, built once and cached.
+        # split=False returns (unsplit output, split points), or None when the
+        # projections cannot be fused.
         if not self._fused_ready:
             mods = [
                 self.q_proj,
@@ -184,12 +225,16 @@ class Glm5NextLinearAttention(nn.Module):
             ]
             quantized = [hasattr(m, "scales") for m in mods]
             if any(quantized) and not all(quantized):
+                if not split:
+                    return None
                 return tuple(linear_forward(m, inputs) for m in mods)
             if all(quantized):
                 specs = {
                     (m.group_size, m.bits, getattr(m, "mode", "affine")) for m in mods
                 }
                 if len(specs) != 1:
+                    if not split:
+                        return None
                     return tuple(linear_forward(m, inputs) for m in mods)
             pts, acc = [], 0
             for m in mods[:-1]:
@@ -214,6 +259,8 @@ class Glm5NextLinearAttention(nn.Module):
             )
         else:
             out = inputs @ self._fw.T
+        if not split:
+            return out, self._split_pts
         return mx.split(out, self._split_pts, axis=-1)
 
     def __call__(
@@ -431,6 +478,7 @@ class Glm5NextIndexer(nn.Module):
                 valid_cur = mx.ones((B, S), dtype=mx.bool_)
                 total_max = after
         else:
+            before = 0
             before_a = mx.zeros((B,), dtype=mx.int32)
             valid_cur = mx.ones((B, S), dtype=mx.bool_)
             usable = (S // self.index_kpool) * self.index_kpool
@@ -460,8 +508,30 @@ class Glm5NextIndexer(nn.Module):
         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
         output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
 
+        # Tensor-unit scores with the causal pool mask folded in, for all
+        # scored rows of the chunk at once (single sequence).
+        before_s = before[0] if isinstance(before, list) and B == 1 else before
+        pool_len_s = (
+            pool_lengths[0]
+            if isinstance(pool_lengths, list) and B == 1
+            else pool_lengths
+        )
+        nax_scores = (
+            B == 1
+            and isinstance(before_s, int)
+            and isinstance(pool_len_s, int)
+            and select_k == 512
+            and self.n_heads == 32
+            and self.head_dim == 128
+            and q.dtype == mx.bfloat16
+            and pool_keys.dtype == mx.bfloat16
+            and nax_indexer_available()
+        )
         tail_rows = S - score_from
-        chunk = 512 if tail_rows > 512 else tail_rows
+        if nax_scores:
+            chunk = min(tail_rows, max_rows_per_call(P))
+        else:
+            chunk = 512 if tail_rows > 512 else tail_rows
         out = []
         for c0 in range(score_from, S, chunk):
             c1 = min(c0 + chunk, S)
@@ -469,25 +539,48 @@ class Glm5NextIndexer(nn.Module):
             q_chunk = q[:, c0:c1]
             weights = linear_forward(self.weights_proj, x[:, c0:c1])
             weights = (weights * self.weight_scale).astype(q_chunk.dtype)
-            index_scores = self._native_scores(q_chunk, pool_keys, weights)
-            if index_scores is None:
-                head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
-                index_scores = mx.sum(
-                    weights[..., None]
-                    * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
-                    axis=2,
-                )
             query_pos = before_a[:, None] + mx.arange(c0, c1)[None]
-            valid_candidates = (
-                pool_idx[None, None] < pool_lengths_a[:, None, None]
-            ) & (pool_end[None, None] <= query_pos[..., None])
-            index_scores = mx.where(valid_candidates, index_scores, -1e30)
+            index_scores = None
+            if nax_scores:
+                index_scores = indexer_scores_nax(
+                    q_chunk[0],
+                    pool_keys[0],
+                    weights[0],
+                    before_s + c0,
+                    pool_len_s,
+                    self.index_kpool,
+                )
+            if index_scores is not None:
+                index_scores = index_scores[None]
+                valid_candidates = None
+            else:
+                index_scores = self._native_scores(q_chunk, pool_keys, weights)
+                if index_scores is None:
+                    head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
+                    index_scores = mx.sum(
+                        weights[..., None]
+                        * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
+                        axis=2,
+                    )
+                valid_candidates = (
+                    pool_idx[None, None] < pool_lengths_a[:, None, None]
+                ) & (pool_end[None, None] <= query_pos[..., None])
+                index_scores = mx.where(valid_candidates, index_scores, -1e30)
             selected = self._native_topk(index_scores, select_k)
             if selected is None:
                 selected = mx.argpartition(-index_scores, kth=select_k - 1, axis=-1)[
                     ..., :select_k
                 ]
-            selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
+            if valid_candidates is None:
+                # Same validity rule as valid_candidates, evaluated only at
+                # the selected pools.
+                selected_valid = (selected < pool_lengths_a[:, None, None]) & (
+                    (selected + 1) * self.index_kpool - 1 <= query_pos[..., None]
+                )
+            else:
+                selected_valid = mx.take_along_axis(
+                    valid_candidates, selected, axis=-1
+                )
             selected_indices = (
                 selected[..., None] * self.index_kpool
                 + mx.arange(self.index_kpool)[None, None, None]
@@ -610,6 +703,15 @@ class Glm5NextSparseAttention(nn.Module):
         Uses the expanded per-head K/V of the short-context path. The fused
         SDPA kernel has no 512-wide head, so latent-space SDPA would
         materialize the full score matrix.
+
+        With an explicit boolean mask (the engine's prefill; SDPA runs its
+        unfused fallback: scores, masked select, softmax, P x V) the rows run
+        in causal blocks: block ``[a, b)`` only takes keys ``[0, past_len +
+        b)``. Every key past that is masked for all rows of the block, i.e.
+        gets probability exactly 0, and the softmax maps each score to the
+        same thread whatever the row length, so each block reproduces its
+        rows of the one-call result bitwise while skipping ~44% of the
+        score / value work (8 blocks).
         """
         kv_rows = kv_latent[:, :, : past_len + rows]
         k = self.embed_q(kv_rows, transpose=False)
@@ -618,12 +720,32 @@ class Glm5NextSparseAttention(nn.Module):
         if k.dtype != q_rows.dtype:
             k = k.astype(q_rows.dtype)
             v = v.astype(q_rows.dtype)
-        dense_mask = (
-            "causal" if mask is None else mask[..., :rows, : past_len + rows]
-        )
-        out = mx.fast.scaled_dot_product_attention(
-            q_rows, k, v, scale=self.scale, mask=dense_mask
-        )
+        n_blocks = _DENSE_ROW_BLOCKS if mask is not None else 1
+        n_blocks = max(1, min(n_blocks, rows // 256))
+        if n_blocks == 1:
+            dense_mask = (
+                "causal" if mask is None else mask[..., :rows, : past_len + rows]
+            )
+            out = mx.fast.scaled_dot_product_attention(
+                q_rows, k, v, scale=self.scale, mask=dense_mask
+            )
+        else:
+            bounds = [0]
+            bounds += [(rows * i // n_blocks) // 64 * 64 for i in range(1, n_blocks)]
+            bounds.append(rows)
+            outs = []
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                end = past_len + b
+                outs.append(
+                    mx.fast.scaled_dot_product_attention(
+                        q_rows[:, :, a:b],
+                        k[:, :, :end],
+                        v[:, :, :end],
+                        scale=self.scale,
+                        mask=mask[..., a:b, :end],
+                    )
+                )
+            out = mx.concatenate(outs, axis=2)
         return out.transpose(0, 2, 1, 3).reshape(q.shape[0], rows, -1)
 
     def _finish(self, flat, out_dense):
@@ -729,11 +851,15 @@ class Glm5NextSparseAttention(nn.Module):
                     mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
                 )
                 q_latent = q_latent.astype(native_dtype)
-                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
                 kv_latent_native = kv_latent.astype(native_dtype)
-                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
-                output = None
-                if Kv >= 4096:
+                # Tensor-unit kernel (M5): same fp32 math as the native
+                # kernel, at any context the indexer runs for.
+                output = sparse_mla_attention_nax(
+                    q_latent, kv_latent_native, topk_indices, self.scale
+                )
+                if output is None and Kv >= 4096:
+                    q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
+                    k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
                     output = sparse_mla_attention(
                         q_latent,
                         q_pe,
@@ -835,6 +961,16 @@ class Glm5NextSparseAttention(nn.Module):
         return output
 
 
+@partial(mx.compile, shapeless=True)
+def _clamped_swiglu(x_up: mx.array, x_gate: mx.array, limit: float) -> mx.array:
+    # One fused elementwise kernel instead of clip/clip/silu/multiply passes
+    # over the expert activations; the same ops in the same dtypes, so the
+    # result is bit-identical to the eager chain.
+    x_gate = mx.clip(x_gate, a_min=None, a_max=limit)
+    x_up = mx.clip(x_up, a_min=-limit, a_max=limit)
+    return nn.silu(x_gate) * x_up
+
+
 class Glm5NextClampedSwiGLU(nn.Module):
     def __init__(self, limit: Optional[float]):
         super().__init__()
@@ -842,8 +978,7 @@ class Glm5NextClampedSwiGLU(nn.Module):
 
     def __call__(self, x_up: mx.array, x_gate: mx.array) -> mx.array:
         if self.limit is not None:
-            x_gate = mx.clip(x_gate, a_min=None, a_max=self.limit)
-            x_up = mx.clip(x_up, a_min=-self.limit, a_max=self.limit)
+            return _clamped_swiglu(x_up, x_gate, float(self.limit))
         return nn.silu(x_gate) * x_up
 
 
@@ -860,8 +995,9 @@ class Glm5NextMLP(nn.Module):
         gate = linear_forward(self.gate_proj, x)
         up = linear_forward(self.up_proj, x)
         if self.limit is not None:
-            gate = mx.clip(gate, a_min=None, a_max=self.limit)
-            up = mx.clip(up, a_min=-self.limit, a_max=self.limit)
+            return linear_forward(
+                self.down_proj, _clamped_swiglu(up, gate, float(self.limit))
+            )
         return linear_forward(self.down_proj, nn.silu(gate) * up)
 
 
@@ -1008,16 +1144,27 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        # Evaluate each layer and release cached buffers to bound prefill memory.
-        # Keep decode lazy; the MTP replacement loop must use the same policy.
+        # Evaluate layer by layer to bound prefill memory, but pipelined: the
+        # GPU runs layer i while the host builds layer i + 1 (at most two
+        # layers in flight). Keep decode lazy; the MTP replacement loop must
+        # use the same policy.
         prefill = h.shape[1] >= 256
+        # Each completed layer is waited for and the allocator cache is
+        # released (layer-specific buffer sizes would otherwise accumulate).
+        # The last layer stays lazy: a prefill chunk only needs its cache update.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if prefill
+            else None
+        )
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c)
-            if prefill:
-                mx.eval(h)
-                mx.clear_cache()
+            if pipeline is not None:
+                pipeline.push(h)
+        if pipeline is not None:
+            pipeline.drain()
 
         h = h.mean(axis=2)
         return self.norm(h)

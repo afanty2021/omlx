@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import sys
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -4153,6 +4154,51 @@ class TestSchedulerArraysCacheBlockAlignment:
             scheduler.shutdown()
 
     @pytest.mark.parametrize(
+        ("nax_sparse_mla", "memory_gb", "expected"),
+        [(True, 256, 4096), (True, 96, 4096), (True, 48, 0), (False, 256, 0)],
+    )
+    def test_glm5_next_nax_host_prefill_step(
+        self, mock_tokenizer, tmp_path, nax_sparse_mla, memory_gb, expected
+    ):
+        """On NAX hosts GLM-5.3 takes 4096-token chunks (and blocks) when the
+        tensor-unit sparse MLA path is available."""
+        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
+        with (
+            patch.dict(
+                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
+            ),
+            patch(
+                "omlx.settings.get_system_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = expected or 2048
+            assert scheduler._qwen35_prefill_floor == expected
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
+            assert scheduler.config.paged_cache_block_size == step
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize(
         ("native_available", "symbol_available"),
         [(False, False), (True, False)],
     )
@@ -4222,15 +4268,56 @@ class TestSchedulerArraysCacheBlockAlignment:
         try:
             step = scheduler._prefill_step_size_for_progress
             assert scheduler._qwen4_wide_prefill_step == 8192
-            assert step(0, 16384) == 2048
-            # Prompts shorter than one narrow plus one wide chunk stay narrow.
-            assert step(2048, 8191) == 2048
+            # Resident PLE (no gather-ahead): the first chunk is wide too.
+            assert scheduler._qwen4_wide_first_chunk is True
+            assert step(0, 16384) == 8192
+            assert step(0, 4095) == 8192
             if paged:
-                # The block clamp ends each wide request on the 8192 grid.
+                # After the first chunk the rest runs wide; the block clamp
+                # ends each wide request on the 8192 grid.
                 assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 2047) == 8192
+                assert step(2048, 2048) == 8192
+                assert step(2048, 8191) == 8192
                 assert step(2048, 14336) == 8192
             else:
+                # Without the clamp the wide step itself ends on the 8192 grid.
+                assert step(2048, 2047) == 6144
+                assert step(2048, 2048) == 6144
+                assert step(2048, 8191) == 6144
                 assert step(2048, 14336) == 6144
+        finally:
+            scheduler.shutdown()
+
+    def test_qwen4_gather_ahead_ple_keeps_narrow_first_chunk(
+        self, mock_tokenizer, tmp_path
+    ):
+        model = self._hybrid_model(model_type="qwen4_exp_text")
+        model.prefetch_ple = lambda next_ids, current_ids: None
+        model.ple_gathers_ahead = lambda: True
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=model,
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(prefill_step_size=2048),
+            )
+
+        try:
+            step = scheduler._prefill_step_size_for_progress
+            assert scheduler._qwen4_wide_first_chunk is False
+            assert step(0, 16384) == 2048
+            assert step(2048, 14336) == 6144
         finally:
             scheduler.shutdown()
 

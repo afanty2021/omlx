@@ -2049,6 +2049,28 @@ class TestMtpCompatibilityHelpers:
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, None) is False
 
 
+class TestRowExactVerifyGate:
+    @pytest.mark.parametrize("batch, armed", [(1, True), (4, False)])
+    def test_row_exact_verify_arms_single_stream_only(self, monkeypatch, batch, armed):
+        # B > 1 verify has no one-row decode to match, and row-exact would run
+        # its B x R rows one by one.
+        calls = []
+        monkeypatch.setattr(
+            bg,
+            "_set_verify_qmm_armed",
+            lambda flag, *, row_exact=False: calls.append((flag, row_exact)),
+        )
+
+        class _Model:
+            _omlx_mtp_row_exact_verify = True
+
+            def __call__(self, inputs, **kwargs):
+                return mx.zeros((*inputs.shape, 8)), mx.zeros((*inputs.shape, 4))
+
+        bg._call_backbone(_Model(), mx.zeros((batch, 4), dtype=mx.int32), [])
+        assert calls[0] == (True, armed)
+
+
 class TestPreLoadPatchDispatch:
     def test_dispatch_skips_when_mtp_disabled(self, tmp_path):
         config_path = tmp_path / "config.json"
