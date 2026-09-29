@@ -21,6 +21,10 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 # Qwen3.8-Flash-Next oQ5e: 512 experts, top-10, hidden 2560, expert width 640.
 HIDDEN, INTER, EXPERTS = 2560, 640, 512
+# Quantized blocks keep the expert shape but not the count: 512 experts peak
+# past the CI runner's memory. The fused router needs HIDDEN < 16 x experts
+# and experts % 128 == 0.
+BLOCK_EXPERTS = 256
 
 
 class _FakeQwen4Model:
@@ -58,7 +62,19 @@ def _patched(monkeypatch):
 _BLOCKS: dict = {}
 
 
-def _block(seed=0, bits=5, experts=EXPERTS):
+def _quantized_experts(experts, out_dims, in_dims, bits, chunk=32):
+    """Stacked gs64 expert weights, quantized a few experts at a time so the
+    FP32 draws never exceed one chunk."""
+    scale = in_dims**-0.5
+    parts = []
+    for _ in range(0, experts, chunk):
+        w = mx.random.uniform(-scale, scale, (chunk, out_dims, in_dims)).astype(mx.bfloat16)
+        parts.append(mx.quantize(w, 64, bits))
+        mx.eval(parts[-1])
+    return tuple(mx.concatenate(p) for p in zip(*parts, strict=True))
+
+
+def _block(seed=0, bits=5, experts=BLOCK_EXPERTS):
     """A real-shape oQ block: quantized routed experts, 8-bit gs128 shared
     expert, 8-bit gs64 shared-expert gate, bf16 router."""
     key = (seed, bits, experts)
@@ -80,7 +96,11 @@ def _block(seed=0, bits=5, experts=EXPERTS):
     block.set_dtype(mx.bfloat16)
     sm = block.switch_mlp
     for name in ("gate_proj", "up_proj", "down_proj"):
-        setattr(sm, name, getattr(sm, name).to_quantized(64, bits))
+        layer = getattr(sm, name).to_quantized(64, bits)
+        layer.weight, layer.scales, layer.biases = _quantized_experts(
+            experts, layer.output_dims, layer.input_dims, bits
+        )
+        setattr(sm, name, layer)
     shared = block.shared_expert
     for name in ("gate_proj", "up_proj", "down_proj"):
         setattr(shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), 128, 8))
@@ -181,17 +201,18 @@ def test_router_ties_and_high_experts(engaged):
     end of the stacked weights are read past the bound one-expert view."""
     block = _block(3)
     weight = block.gate.weight
-    # Exact ties: 64 distinct router rows, each repeated 8 times.
-    tied = mx.concatenate([weight[:64]] * 8)[mx.random.permutation(EXPERTS)]
-    # Near ties: 32 rows repeated 16 times, each copy one weight element
-    # about one bf16 ulp away, so logits tie or differ in the last bit.
-    column = (mx.arange(EXPERTS) * 7) % HIDDEN
+    experts = BLOCK_EXPERTS
+    # Exact ties: experts / 8 distinct router rows, each repeated 8 times.
+    tied = mx.concatenate([weight[: experts // 8]] * 8)[mx.random.permutation(experts)]
+    # Near ties: experts / 16 rows repeated 16 times, each copy one weight
+    # element about one bf16 ulp away, so logits tie or differ in the last bit.
+    column = (mx.arange(experts) * 7) % HIDDEN
     bump = (mx.arange(HIDDEN)[None, :] == column[:, None]).astype(mx.float32) * 2**-13
-    near = mx.concatenate([weight[:32]] * 16) + bump
+    near = mx.concatenate([weight[: experts // 16]] * 16) + bump
     # High experts: the last 14 router rows lean on a direction the inputs
-    # carry, so every row routes to experts 498..511.
+    # carry, so every row routes to the last 14 experts.
     direction = mx.random.normal((HIDDEN,))
-    last = (mx.arange(EXPERTS) >= EXPERTS - 14)[:, None]
+    last = (mx.arange(experts) >= experts - 14)[:, None]
     high = weight + mx.where(last, 0.02 * direction, 0.0)
     for gate, lean in ((tied, 0.0), (near, 0.0), (high, 1.0)):
         block.gate.weight = gate.astype(weight.dtype)
@@ -203,7 +224,7 @@ def test_router_ties_and_high_experts(engaged):
                 if lean:
                     logits = router.router_gemv(block.gate.weight)(x.reshape(rows, HIDDEN))
                     inds, _ = router.softmax_topk_rows(logits, 10)
-                    assert mx.min(inds).item() >= EXPERTS - 14
+                    assert mx.min(inds).item() >= experts - 14
     block.gate.weight = weight
 
 

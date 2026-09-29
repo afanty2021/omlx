@@ -19,8 +19,9 @@ qsa_fast = importlib.import_module("mlx_vlm.models.qwen4_exp.qsa_fast")
 
 
 @pytest.fixture(autouse=True)
-def _vendored_qwen4():
+def _vendored_qwen4(monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    monkeypatch.setattr(qsa_fast, "_DECODE_SELECT_FAILED", {})
 
 
 def _tiny_text_config():
@@ -909,6 +910,17 @@ def _head_scores(blocks: int, kind: str, seed: int) -> np.ndarray:
     raise ValueError(kind)
 
 
+def _require_selection(result):
+    """The selection kernel's result; skip where the GPU caps the pipeline
+    below its 1024-thread threadgroup (larger PER on some GPUs)."""
+    if result is None and any(
+        "threads per threadgroup" in error for error in qsa_fast._DECODE_SELECT_FAILED.values()
+    ):
+        pytest.skip("decode selection threadgroup exceeds this GPU's pipeline limit")
+    assert result is not None
+    return result
+
+
 @pytest.mark.parametrize(
     "key_len",
     [
@@ -933,7 +945,7 @@ def test_decode_mask_matches_the_official_indexer_ops(key_len, kind):
     )
     expected = _official_mask(head_scores, key_len)
 
-    assert actual is not None
+    _require_selection(actual)
     assert actual.shape == expected.shape == (1, 1, 1, key_len)
     assert actual.dtype == mx.bool_
     assert mx.array_equal(actual, expected).item()
@@ -953,9 +965,38 @@ def test_cutoff_tie_keeps_the_highest_block_indices():
         compress_ratio=RATIO,
         block_topk=TOPK,
     )
-    selected = np.flatnonzero(np.asarray(mask).reshape(-1)[::RATIO])
+    selected = np.flatnonzero(np.asarray(_require_selection(mask)).reshape(-1)[::RATIO])
     expected = np.concatenate((strict, tied[-(TOPK - strict.size) :]))
     np.testing.assert_array_equal(selected, expected)
+
+
+def test_pipeline_limit_keeps_the_kernel_for_smaller_banks(monkeypatch):
+    """A PER the GPU cannot launch at 1024 threads falls back alone; smaller
+    block banks keep the kernel."""
+
+    def select(key_len):
+        blocks = key_len // RATIO
+        scores = mx.array(_head_scores(blocks, "normal", key_len).reshape(1, 4, 1, blocks))
+        kwargs = dict(head_dim=HEAD_DIM, key_tokens=key_len, compress_ratio=RATIO, block_topk=TOPK)
+        return qsa_fast.decode_block_selection_mask(scores, **kwargs), scores
+
+    _require_selection(select(2052)[0])
+    kernel = qsa_fast._DECODE_SELECT_KERNELS["mask"]
+    launches = []
+
+    def limited(*args, template, **kwargs):
+        launches.append(dict(template)["PER"])
+        if dict(template)["PER"] > 8:
+            raise ValueError("maximum allowed threads per threadgroup (832)")
+        return kernel(*args, template=template, **kwargs)
+
+    monkeypatch.setitem(qsa_fast._DECODE_SELECT_KERNELS, "mask", limited)
+    assert select(32773)[0] is None
+    assert select(32773)[0] is None
+    actual, scores = select(2055)
+    assert actual is not None
+    assert mx.array_equal(actual, _official_mask(scores, 2055)).item()
+    assert launches == [16, 8]
 
 
 def test_block_scores_round_like_maximum_sum_divide():
@@ -1168,6 +1209,6 @@ def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     )
     expected = _official_gathered_tokens(head_scores, key_len)
 
-    assert actual is not None
+    _require_selection(actual)
     assert actual.dtype == expected.dtype and actual.shape == expected.shape
     assert mx.array_equal(actual, expected).item()

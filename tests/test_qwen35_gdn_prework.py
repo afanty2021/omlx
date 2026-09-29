@@ -1319,7 +1319,16 @@ def _verify_inputs(rows, seed):
     )
 
 
+# On the paravirtual GPU of hosted macOS runners the per-op verify reference
+# drifts from serial decode in later rows; the fused verify still equals serial
+# decode there (test_qwen4_fused_verify_rows_equal_serial_decode_steps).
+_PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
+    mx.device_info().get("architecture", "")
+).startswith("applegpu")
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.skipif(_PARAVIRTUAL_GPU, reason="per-op reference is not row-exact here")
 @pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
 @pytest.mark.parametrize("seed", [3, 11])

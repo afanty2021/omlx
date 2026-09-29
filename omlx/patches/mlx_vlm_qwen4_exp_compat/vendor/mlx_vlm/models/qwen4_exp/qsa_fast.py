@@ -104,6 +104,9 @@ _DECODE_SELECT_THREADS = 1024
 _DECODE_SELECT_MAX_PER_THREAD = 32
 _DECODE_SELECT_KERNELS: dict[str, object] = {}
 _DECODE_SELECT_VALIDATED: set[tuple] = set()
+# Failed template signatures and their errors. Register use grows with PER, so
+# some GPUs cap larger-PER pipelines below TG threads; other signatures still run.
+_DECODE_SELECT_FAILED: dict[tuple, str] = {}
 _DECODE_SELECT_DIVISORS: dict[int, mx.array] = {}
 
 _DECODE_SELECT_HEADER = r"""
@@ -310,7 +313,6 @@ def _decode_block_selection(
     block_topk: int,
     tokens: bool,
 ) -> mx.array | None:
-    global _DECODE_SELECT_DISABLED
     if _DECODE_SELECT_DISABLED:
         return None
     blocks = int(head_scores.shape[-1])
@@ -332,6 +334,9 @@ def _decode_block_selection(
         return None
     heads = int(head_scores.shape[1] * head_scores.shape[2])
     output = "tokens" if tokens else "mask"
+    signature = (output, heads, block_topk, compress_ratio, tail, per_thread)
+    if signature in _DECODE_SELECT_FAILED:
+        return None
     try:
         kernel = _DECODE_SELECT_KERNELS.get(output)
         if kernel is None:
@@ -367,14 +372,13 @@ def _decode_block_selection(
             ],
             output_dtypes=[mx.int32 if tokens else mx.bool_],
         )[0]
-        signature = (output, heads, block_topk, compress_ratio, tail, per_thread)
         if signature not in _DECODE_SELECT_VALIDATED:
             # Surface a pipeline failure while the MLX ops can still take over.
             mx.eval(result)
             _DECODE_SELECT_VALIDATED.add(signature)
         return result
-    except Exception:
-        _DECODE_SELECT_DISABLED = True
+    except Exception as error:
+        _DECODE_SELECT_FAILED[signature] = str(error)
         return None
 
 

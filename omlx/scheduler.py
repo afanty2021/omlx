@@ -1654,6 +1654,48 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
             next_n = min(next_n, delta)
     return max(1, next_n)
 
+
+def _mimo_fused_full_attention() -> bool:
+    """True when MiMo's 192/128 full-attention layers run a fused kernel.
+
+    Stock mlx has no fused SDPA for these head dims; the fused route comes
+    from ``omlx.utils.fast_attention`` (native kernel when the installed mlx
+    supports the dims, else the tensor-unit kernel with padded heads).
+    """
+    try:
+        from .utils import fast_attention
+    except ImportError:
+        return False
+    try:
+        if fast_attention._native_mixed_dims_supported(192, 128):
+            return True
+        return bool(fast_attention._nax_available())
+    except Exception:
+        return False
+
+
+def _oversized_sorted_gather_ok() -> bool:
+    """True when a sorted gather_qmm above 32768 rows runs as one dispatch.
+
+    Stock mlx 0.32.2's sorted NAX kernel overflows past 32768 rows, so the
+    m5_gather_qmm reroute splits such calls into slices plus a copy unless
+    oMLX's JIT gather (m5_gather_qmm_nax) or the native NAX gather is there.
+    """
+    try:
+        from .patches import m5_gather_qmm_nax
+
+        if m5_gather_qmm_nax.enabled():
+            return True
+    except ImportError:
+        pass
+    try:
+        from .patches.m5_gather_qmm import _resolve_native_gather
+
+        return _resolve_native_gather() is not None
+    except Exception:
+        return False
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -2816,6 +2858,10 @@ class Scheduler:
     # cached prefixes floor to 2048-token multiples instead of 512.
     _POOLING_ROTATING_BLOCK_SIZE = 2048
 
+    # MiMo prefill chunk (and, with the prefix cache on, paged-cache block) on
+    # NAX hosts with at least 128 GB; other large hosts keep 4096.
+    _MIMO_NAX_PREFILL_FLOOR = 8192
+
     def _is_mimo_hybrid(self) -> bool:
         """MiMo hybrid MoE (standard softmax attn + rotating KV).
 
@@ -2876,6 +2922,12 @@ class Scheduler:
             # them for a measured ~+34% MoE prefill throughput on
             # M3 Ultra. 2048 is a multiple of the 128 window.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+            # With the cache on every chunk is clamped to the next block
+            # boundary, so a wider prefill floor (MiMo on 128 GB+ hosts)
+            # only takes effect if the block grows with it.
+            floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
+            if floor > hi and floor % window_size == 0:
+                lo = hi = floor
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -2945,6 +2997,27 @@ class Scheduler:
                 # tensor-unit sparse MLA: its attention cost per query does not
                 # depend on the chunk, so a wider chunk feeds the MoE more rows.
                 if is_glm5_next and nax_sparse_mla_available():
+                    return 4096
+            if self._is_mimo_hybrid():
+                from .custom_kernels.nax import is_nax_available
+                from .settings import get_system_memory
+
+                # MiMo's top-8-of-256 routing leaves ~64 rows per expert at a
+                # 2048-token chunk; 4096 fills the gather_qmm tiles better and
+                # the doubled activation footprint is small next to the model
+                # on hosts with this much memory. Only with fused full
+                # attention: otherwise its 9 full-attention layers (192/128
+                # head dims) materialise [heads, chunk, context] scores and
+                # the wider chunk is slower. On NAX GPUs 8192 (~256 rows per
+                # expert) lifts the expert GEMMs further when the >32768-row
+                # sorted gather runs as one dispatch (the fused attention's
+                # causal work is the same in any chunking).
+                if (
+                    get_system_memory() >= 128 * 1024**3
+                    and _mimo_fused_full_attention()
+                ):
+                    if is_nax_available() and _oversized_sorted_gather_ok():
+                        return self._MIMO_NAX_PREFILL_FLOOR
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
