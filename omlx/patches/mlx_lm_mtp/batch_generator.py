@@ -227,15 +227,19 @@ def apply() -> bool:
 
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
-                if host_state.reentry_probe:
-                    park_state = _mtp_park_state_for_batch(self)
-                    if park_state is not None:
-                        park_state.defer_probe()
-                if not _reconcile_mtp_to_standard(self, host_state):
-                    raise RuntimeError(
-                        "Lightning MTP could not restore the committed cache"
-                    )
-                _drop_mtp_state(self, "extend-reconciled")
+                # A shared batch that a finishing row just filtered to this
+                # singleton sits at a drained frontier: hand it off with at
+                # most a one-token forward instead of replaying its history.
+                if not _handoff_mtp_for_late_join(self, host_state):
+                    if host_state.reentry_probe:
+                        park_state = _mtp_park_state_for_batch(self)
+                        if park_state is not None:
+                            park_state.defer_probe()
+                    if not _reconcile_mtp_to_standard(self, host_state):
+                        raise RuntimeError(
+                            "Lightning MTP could not restore the committed cache"
+                        )
+                    _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
@@ -1595,6 +1599,19 @@ def _logprobs(logits_2d):
     import mlx.core as mx
 
     return logits_2d - mx.logsumexp(logits_2d, axis=-1, keepdims=True)
+
+
+# Serial greedy decoding (mlx-lm ``GenerationBatch._step``) samples
+# ``logits - logsumexp(logits)`` in the logits dtype, so its argmax runs over
+# rounded log-probabilities: once a logit is below half the logsumexp the
+# bf16 subtraction is inexact, two adjacent logits can land on one
+# log-probability, and the tie goes to the lower token id. Verify rows take
+# the same argmax so greedy MTP output equals MTP-off output.
+def _greedy_targets(logprobs):
+    """Greedy tokens of verify rows, as the serial greedy sampler picks them."""
+    import mlx.core as mx
+
+    return mx.argmax(logprobs, axis=-1).astype(mx.int32)
 
 
 def _accept_lp_for(sampler, lp):
@@ -4018,7 +4035,7 @@ def _run_verify_cycle_chain(
         state.stats.zero_cycles += 1
     elif is_greedy:
         if greedy_result is None:
-            targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
+            targets = _greedy_targets(combined_lp)  # (k+1,)
             matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
             m_arr = mx.cumprod(matches).sum().reshape(1)
             host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])

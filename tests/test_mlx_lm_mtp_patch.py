@@ -6,7 +6,9 @@ from __future__ import annotations
 import contextlib
 import copy
 import gc
+import importlib.util
 import json
+import sys
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -2406,6 +2408,53 @@ class TestMTPPatchSelfHealing:
         )
 
 
+def _fresh_qwen35_module(monkeypatch, name):
+    """Execute a private copy of mlx-lm's qwen3_5 so class patches stay local."""
+    import mlx_lm.models.qwen3_5 as qwen35
+
+    qualname = f"mlx_lm.models.{name}"
+    spec = importlib.util.spec_from_file_location(qualname, qwen35.__file__)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "mlx_lm.models"
+    monkeypatch.setitem(sys.modules, qualname, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gated_delta_net_body_matches_stock_qk_norm(monkeypatch):
+    """The MTP body must normalize q/k like the stock body it replaces."""
+    from omlx.patches.mlx_lm_mtp import qwen35_model
+
+    stock = _fresh_qwen35_module(monkeypatch, "_omlx_test_qwen35_stock")
+    patched = _fresh_qwen35_module(monkeypatch, "_omlx_test_qwen35_mtp")
+    qwen35_model._patch_gated_delta_net(patched)
+
+    args = stock.TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=512,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+    )
+    ref = stock.GatedDeltaNet(args)
+    # Tiny k rows make the l2norm eps visible in the output.
+    rows = mx.arange(ref.in_proj_qkv.weight.shape[0])
+    k_scale = mx.where((rows >= ref.key_dim) & (rows < 2 * ref.key_dim), 1e-3, 1.0)
+    ref.in_proj_qkv.weight = ref.in_proj_qkv.weight * k_scale[:, None]
+    gdn = patched.GatedDeltaNet(args)
+    gdn.update(ref.parameters())
+
+    x = mx.random.normal((1, 8, 128), key=mx.random.key(0))
+    assert mx.allclose(gdn(x), ref(x), atol=1e-5).item()
+
+
 # ---------------------------------------------------------------------------
 # Draft-rejection rollback atomicity
 # ---------------------------------------------------------------------------
@@ -3909,6 +3958,23 @@ def test_draft_distribution_matches_request_sampling(settings):
     assert bg._resolve_draft_sampler(row, state) is draft
 
 
+def test_greedy_verify_targets_match_the_serial_greedy_sampler():
+    """Two bf16 logits one ulp apart (3.0 at id 100, 2.984375 at id 5) below
+    half the logsumexp round to one log-probability; serial greedy decoding
+    then picks the lower id, and a verify row must pick the same token."""
+    from omlx.utils.sampling import make_sampler
+
+    row = mx.full((1, 4096), 2.0, dtype=mx.bfloat16)
+    row[0, 5] = 2.984375
+    row[0, 100] = 3.0
+    rows = mx.concatenate([row, row[:, ::-1]])
+    serial = mx.concatenate([make_sampler(temp=0.0)(bg._logprobs(r[None])) for r in rows])
+    targets = bg._greedy_targets(bg._logprobs(rows))
+    assert serial.tolist() == [5, 4095 - 100]
+    assert mx.argmax(rows, axis=-1).tolist() != serial.tolist()
+    assert targets.tolist() == serial.tolist()
+
+
 def test_stochastic_acceptance_preserves_target_marginal():
     from omlx.utils.sampling import make_sampler
 
@@ -4231,6 +4297,91 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         assert state is not None and set(state.states) == set(first + [new_uid])
     finally:
         gen.close()
+
+
+def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
+    """Finish row 0 of an active shared-MTP batch in the late join's ``next()``.
+
+    The finishing row filters the batch to a singleton MTP state inside
+    ``GenerationBatch.next``; the same ``BatchGenerator._next`` then extends
+    that singleton with the pending prompt. A one-token prompt splits into
+    generation at once, like the scheduler's externally prefilled inserts.
+    """
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=2,
+        max_tokens=max_tokens,
+    )
+    output = {}
+    try:
+        first = gen.insert(prompts)
+        for uid in first:
+            output[uid] = []
+
+        def step():
+            for response in gen.next()[1]:
+                output[response.uid].append(response.token)
+
+        for _ in range(12):
+            step()
+            active = gen._generation_batch
+            if getattr(active, "_omlx_mtp_batch_state", None):
+                break
+        assert getattr(active, "_omlx_mtp_batch_state", None)
+        # One more emitted token ends row 0 inside the next verify cycle.
+        active.max_tokens[0] = active._num_tokens[0] + 1
+        new_uid = gen.insert([joined_prompt])[0]
+        output[new_uid] = []
+        step()
+        assert first[0] not in gen._generation_batch.uids
+        assert set(gen._generation_batch.uids) == {first[1], new_uid}
+        for _ in range(64):
+            if not len(gen._generation_batch):
+                break
+            step()
+        return first, new_uid, output
+    finally:
+        gen.close()
+
+
+def test_late_join_as_batch_row_finishes_hands_off_without_replay(monkeypatch):
+    monkeypatch.setattr(
+        bg,
+        "_reconcile_mtp_to_standard",
+        lambda *args: pytest.fail("Late join replayed the surviving row's history"),
+    )
+    bg.apply()
+    cache_rollback.apply()
+    first, new_uid, output = _join_as_batch_row_finishes(
+        CountingModel(), [[1, 2], [10, 11]], [30], max_tokens=24
+    )
+    assert output[first[1]] == list(range(12, 12 + 24))
+    assert output[new_uid] == list(range(31, 31 + 24))
+
+
+@pytest.mark.parametrize("family", ["qwen", "qwen_vlm", "qwen4"])
+def test_qwen_late_join_as_batch_row_finishes_skips_history_replay(
+    family, monkeypatch
+):
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    mx.random.seed(3702)
+    model = _model(family)
+    mx.eval(model.parameters())
+    bg.apply()
+    prompts, joined = [[3, 4, 5], [7, 8, 9, 10, 11]], [12]
+    # Reference: the committed-history replay the handoff replaces.
+    with monkeypatch.context() as m:
+        m.setattr(bg, "_handoff_mtp_for_late_join", lambda *args: False)
+        _, _, replayed = _join_as_batch_row_finishes(model, prompts, joined)
+    monkeypatch.setattr(
+        bg,
+        "_reconcile_mtp_to_standard",
+        lambda *args: pytest.fail("Late join replayed the surviving row's history"),
+    )
+    first, new_uid, output = _join_as_batch_row_finishes(model, prompts, joined)
+    assert output == replayed
+    assert len(output[first[1]]) == 40 and len(output[new_uid]) == 40
 
 
 @pytest.mark.parametrize(

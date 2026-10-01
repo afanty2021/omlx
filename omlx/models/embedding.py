@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
 from .base_model import last_token_pool, mean_pooling, normalize_embeddings
 from .mlx_embeddings_compat import (
+    patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
 
@@ -100,6 +101,45 @@ class MLXEmbeddingModel:
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
+
+    # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
+    _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
+
+    def _should_promote_to_fp16(self) -> bool:
+        """Match an unquantized Qwen3-Embedding 0.6B or 8B checkpoint.
+
+        bf16 matmuls miss the 1e-3 fp32 conformance gate on these models
+        (max |delta| 0.0037 vs 0.0006 in fp16). Other sizes are not validated.
+        """
+        try:
+            with open(Path(self.model_name) / "config.json") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(cfg, dict) or cfg.get("model_type") != "qwen3":
+            return False
+        if cfg.get("quantization") or cfg.get("quantization_config"):
+            return False
+        name = f"{self.model_name} {cfg.get('_name_or_path') or ''}".lower()
+        if "qwen3-embedding" not in name:
+            return False
+        shape = (cfg.get("hidden_size"), cfg.get("num_hidden_layers"))
+        return shape in self._FP16_PROMOTE_SHAPES
+
+    def _promote_bf16_to_fp16(self, module: Any) -> None:
+        if not self._should_promote_to_fp16():
+            return
+        params = module.parameters()
+        if not any(v.dtype == mx.bfloat16 for _, v in tree_flatten(params)):
+            return
+        module.update(
+            tree_map(
+                lambda a: a.astype(mx.float16) if a.dtype == mx.bfloat16 else a,
+                params,
+            )
+        )
+        mx.eval(module.parameters())
+        logger.info("Promoted bfloat16 parameters to float16 for %s", self.model_name)
 
     # Fallbacks for MLX conversions that dropped the sentence-transformers
     # metadata. Reviewed against the concrete checkpoints on the Hub: none of
@@ -321,6 +361,7 @@ class MLXEmbeddingModel:
         # 2. Fallback to mlx-embeddings
         try:
             patch_qwen3_vl_processor_for_torch_free_image_loading()
+            patch_qwen3_vl_position_ids_recompute()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
@@ -330,6 +371,7 @@ class MLXEmbeddingModel:
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
             patch_modernbert_attention(self.model)
+            self._promote_bf16_to_fp16(self.model)
 
             if hasattr(self.model, "config"):
                 config = self.model.config

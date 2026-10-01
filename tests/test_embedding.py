@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from omlx.api.embedding_models import (
@@ -32,7 +33,7 @@ from omlx.api.embedding_utils import (
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
-from omlx.models.embedding import EmbeddingOutput
+from omlx.models.embedding import EmbeddingOutput, MLXEmbeddingModel
 
 IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -1977,3 +1978,58 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+
+
+class TestEmbeddingDtype:
+    """bf16 -> fp16 promotion for unquantized Qwen3-Embedding 0.6B / 8B."""
+
+    class _Module:
+        def __init__(self):
+            self._params = {"weight": mx.zeros((2,), dtype=mx.bfloat16)}
+
+        def parameters(self):
+            return self._params
+
+        def update(self, tree):
+            self._params = tree
+
+    @staticmethod
+    def _promoted(model_dir, **config):
+        model_dir.mkdir(parents=True)
+        cfg = {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36}
+        cfg.update(config)
+        (model_dir / "config.json").write_text(json.dumps(cfg))
+        module = TestEmbeddingDtype._Module()
+        MLXEmbeddingModel(str(model_dir))._promote_bf16_to_fp16(module)
+        return module._params["weight"].dtype == mx.float16
+
+    @pytest.mark.parametrize(
+        "name,shape",
+        [("Qwen3-Embedding-0.6B", (1024, 28)), ("Qwen3-Embedding-8B", (4096, 36))],
+    )
+    def test_promotes_validated_sizes(self, tmp_path, name, shape):
+        assert self._promoted(
+            tmp_path / name, hidden_size=shape[0], num_hidden_layers=shape[1]
+        )
+
+    def test_size_comes_from_config_not_path(self, tmp_path):
+        # HF cache snapshot hashes can contain "8b".
+        snapshot = (
+            tmp_path
+            / "models--Qwen--Qwen3-Embedding-4B"
+            / "snapshots"
+            / "5cf2132abc8bd8a4f1c2b0e7d6a9f3e1b2c4d5e6"
+        )
+        assert not self._promoted(snapshot, hidden_size=2560)
+
+    @pytest.mark.parametrize(
+        "name,config",
+        [
+            ("Qwen3-Embedding-8B-4bit", {"quantization": {"bits": 4}}),
+            ("Qwen3-VL-Embedding-8B", {"model_type": "qwen3_vl"}),
+            ("Qwen3-8B", {}),
+        ],
+    )
+    def test_leaves_other_models_untouched(self, tmp_path, name, config):
+        assert not self._promoted(tmp_path / name, **config)

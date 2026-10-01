@@ -34,11 +34,12 @@ and its softmax and top-k as one launch
 The result is bit-identical to the composed path. The quantized dot products
 reuse the MLX 0.32.2 transcription in ``moe_verify_gather`` (4, 5, 6 and
 8 bits; group size 32, 64 or 128), one instantiation per weight format. MLX
-picks ``qmv_fast`` when K % 512 == 0 and N % 8 == 0 and ``qmv`` otherwise.
+picks ``qmv_fast`` when N % 8 == 0 and K is a multiple of its kernel block
+(512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise.
 Routed experts are taken where gate+up takes ``qmv_fast`` and down takes
 ``qmv``: one bf16 token, top-k 10, affine experts with bf16 scales,
-hidden % 512 == 0 and intermediate % 512 != 0 (Qwen3.8-Flash-Next: 2560 and
-640, 4-bit or oQ5e's 5-bit). A shared expert or gate outside that format
+hidden on the ``qmv_fast`` block and intermediate off it (Qwen3.8-Flash-Next:
+2560 and 640, 4-bit or oQ5e's 5-bit). A shared expert or gate outside that format
 (unquantized, packed, ...) runs as composed launches and only its outputs
 enter the combine. Prefill, multi-row calls and every other shape keep the
 original body. If the first launch fails, the patch disables itself and the
@@ -83,7 +84,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .module_cache import cached_per_module
-from .moe_verify_gather import _BITS, _GROUP_SIZES
+from .moe_verify_gather import _BITS, _GROUP_SIZES, qmv_fast_layout
 from .moe_verify_gather import _HEADER as _QMV_HEADER
 from .qwen35_moe_router import (
     fused_router_topk,
@@ -500,7 +501,7 @@ def _mlx_format(layer, k: int, n: int) -> _Format | None:
     or None when the packed shape does not match."""
     if layer["weight"].shape[-2:] != (n, k * layer.bits // 32) or k % layer.group_size:
         return None
-    return _Format(layer.bits, layer.group_size, k % 512 == 0 and n % 8 == 0)
+    return _Format(layer.bits, layer.group_size, qmv_fast_layout(k, n, layer.bits))
 
 
 def _address(a: mx.array) -> int:
