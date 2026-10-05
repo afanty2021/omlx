@@ -302,7 +302,7 @@ class EngineEntry:
         | TTSEngine
         | None
     ) = None  # Loaded engine instance
-    last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
+    last_access: float = 0.0  # Latest load/acquire/release for LRU and TTL
     is_loading: bool = False  # Prevent concurrent loads
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
@@ -425,7 +425,7 @@ class EnginePool:
                 # Generation steps already keep the GPU busy.
                 self._gpu_keep_warm_last_active = now
                 return False
-            # last_access marks request start; long requests are caught above.
+            # Leases refresh last_access at both request start and completion.
             last_request = max(last_request, entry.last_access)
         return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
 
@@ -1570,7 +1570,9 @@ class EnginePool:
         logger.info("Removed cluster-only model registration %s", model_id)
         return True
 
-    async def prepare_cluster_reload(self, model_id: str) -> None:
+    async def prepare_cluster_reload(
+        self, model_id: str, *, local_only: bool = False
+    ) -> None:
         """Make a discovered model ready to adopt its registry deployment.
 
         An engine that was already loaded locally cannot be relabelled as a
@@ -1586,7 +1588,9 @@ class EnginePool:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
             if entry.engine is not None:
                 failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
-                if not (isinstance(failed_reason, str) and failed_reason.strip()):
+                if local_only or not (
+                    isinstance(failed_reason, str) and failed_reason.strip()
+                ):
                     self._raise_if_reload_busy(entry, "activate distributed cluster")
             pending_task = self._pending_unload_tasks.pop(model_id, None)
             if pending_task is not None and not pending_task.done():
@@ -1597,7 +1601,9 @@ class EnginePool:
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            await self._unload_engine(model_id)
+            await self._unload_engine(
+                model_id, **({"local_only": True} if local_only else {})
+            )
             self._clear_load_failure(entry)
 
     def _clear_load_failure(self, entry: EngineEntry) -> None:
@@ -2413,11 +2419,13 @@ class EnginePool:
         if entry is not None and not entry.pending_unload_reason:
             if entry.in_use > 0:
                 entry.in_use -= 1
+                entry.last_access = time.time()
             return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+                e.last_access = time.time()
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
@@ -2933,11 +2941,15 @@ class EnginePool:
                 return True
         return False
 
-    async def _unload_engine(self, model_id: str) -> None:
+    async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
         if model_id in self._unloading_models:
             raise ModelBusyError(model_id, "unload while teardown is in progress")
         self._unloading_models.add(model_id)
-        task = asyncio.create_task(self._stop_and_unload_engine(model_id))
+        task = asyncio.create_task(
+            self._stop_and_unload_engine(
+                model_id, **({"local_only": True} if local_only else {})
+            )
+        )
         cancelled = False
         try:
             while not task.done():
@@ -2951,7 +2963,9 @@ class EnginePool:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def _stop_and_unload_engine(self, model_id: str) -> None:
+    async def _stop_and_unload_engine(
+        self, model_id: str, *, local_only: bool = False
+    ) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
 
@@ -3000,7 +3014,9 @@ class EnginePool:
                 )
 
         try:
-            await entry.engine.stop()
+            await entry.engine.stop(
+                **({"local_only": True} if local_only and distributed else {})
+            )
         except Exception as e:
             if distributed:
                 # The supervisor raises (DistributedTeardownError) when the
@@ -3090,6 +3106,8 @@ class EnginePool:
         min_expected_freed = max(0, settle_size - settle_tolerance)
         settled = False
         settle_indeterminate = False
+        settle_stalled = False
+        last_freed: int | None = None
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
@@ -3126,6 +3144,23 @@ class EnginePool:
                     f"settle wait"
                 )
                 break
+            if (
+                last_freed is not None
+                and actual_freed == last_freed
+                and actual_freed > 0
+                and not footprint_pending
+            ):
+                # A non-zero plateau means gc/clear_cache stopped releasing
+                # memory. A zero plateau still gets the full barrier.
+                settle_stalled = True
+                logger.info(
+                    f"Settle for '{model_id}' stalled at "
+                    f"{format_size(actual_freed)} across two rounds "
+                    f"(need>={format_size(min_expected_freed)}); "
+                    f"skipping further settle rounds"
+                )
+                break
+            last_freed = actual_freed
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
@@ -3157,6 +3192,9 @@ class EnginePool:
             # enforcer re-poll, and pre-load admission re-reads the live gauge
             # alongside the tracked accumulator (the #1623 max() in
             # get_engine), so any unreleased memory stays visible to both.
+            pass
+        elif settle_stalled:
+            # Emergency reclaim repeats the gc/clear_cache work that just stalled.
             pass
         else:
             # Barrier timed out - try emergency reclaim
@@ -3419,6 +3457,13 @@ class EnginePool:
                             f"DFlash init failed for {model_id}: {e}. "
                             f"Falling back to default engine."
                         )
+                elif dflash_enabled:
+                    logger.warning(
+                        "DFlash enabled for %s but no draft model is set; "
+                        "loading without DFlash. Set dflash_draft_model to "
+                        "enable it.",
+                        model_id,
+                    )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py
