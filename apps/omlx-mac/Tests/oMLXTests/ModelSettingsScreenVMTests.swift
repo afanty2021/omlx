@@ -56,6 +56,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 "audio_stt",
                 "audio_tts",
                 "audio_sts",
+                "decision",
             ]
         )
     }
@@ -87,6 +88,29 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
         vm.mtpEnabled = false
         XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth])
+    }
+
+    func testLightningMtpEditIsNotSavedToGlobalProfile() async {
+        let vm = ModelSettingsScreenVM()
+        vm.resetWorkingBaseline()
+        vm.temperature = "0.7"
+        vm.markProfileDirty()
+        XCTAssertFalse(vm.hasModelSpecificEdits)
+        XCTAssertEqual(vm.defaultSaveAsScope, .global)
+
+        vm.mtpEnabled = true
+        XCTAssertTrue(vm.hasModelSpecificEdits)
+        XCTAssertEqual(vm.defaultSaveAsScope, .model)
+
+        // Global templates keep only universal keys, so both writes must stop
+        // before any request instead of dropping mtp_enabled.
+        let client = OMLXClient(host: "127.0.0.1", port: 9)
+        await vm.saveWorkingAs(scope: .global, name: "mtp", client: client)
+        XCTAssertTrue(vm.lastError?.contains("Model profile") == true)
+        vm.lastError = nil
+        await vm.updateProfileWithWorking(scope: .global, name: "mtp", client: client)
+        XCTAssertTrue(vm.lastError?.contains("Model profile") == true)
+        XCTAssertTrue(vm.profileDirty)
     }
 
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {

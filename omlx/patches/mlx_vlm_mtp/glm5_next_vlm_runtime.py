@@ -374,10 +374,6 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
         # Capture recurrent state only in KDA layers. Both attention families
         # can compile the stateless FFN at the bounded MTP verify shapes.
         residual = x
-        if g5_lang._DECODE_FUSION:
-            # Settle the eager sigmoid probe outside the compiled FFN block,
-            # which cannot run it (as the vendor call does).
-            g5_lang._decode_kernels.eager_sigmoid_precise(mx.float32)
         # Same values as attn_hc + input_layernorm (None: not covered).
         fused = g5_lang._decode_hc_pre(self.attn_hc, self.input_layernorm, x)
         if fused is None:
@@ -400,9 +396,7 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
         ):
             _check_verify_router(g5_lang, self, x)
             if self._ffn_c is None:
-                # The vendor's compile keeps the layer's weights out of the
-                # trace's constants (a leaked trace would pin them in memory).
-                self._ffn_c = g5_lang.compile_ffn_block(self, self._ffn_block)
+                self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
         return self._ffn_block(x)
 

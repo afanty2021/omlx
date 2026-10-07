@@ -118,7 +118,6 @@ class BatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
-            text_only=True,
         )
 
     @property
@@ -355,10 +354,15 @@ class BatchedEngine(BaseEngine):
         # materializing. Runs on the MLX executor because it allocates the
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
+        offload_stats = offload_release = offload_restore = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
+                moe_offload_caches,
+                moe_offload_stats,
+                release_moe_offload_slots,
+                restore_moe_offload_slots,
             )
 
             fraction = float(
@@ -392,6 +396,10 @@ class BatchedEngine(BaseEngine):
                 await loop.run_in_executor(
                     get_mlx_executor(), materialize_offload_state, self._model
                 )
+                caches = moe_offload_caches(self._model)
+                offload_stats = functools.partial(moe_offload_stats, caches=caches)
+                offload_release = functools.partial(release_moe_offload_slots, caches)
+                offload_restore = functools.partial(restore_moe_offload_slots, caches)
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
@@ -692,6 +700,7 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
         signature = getattr(self._model, "_omlx_k2_ane_signature", None)
         if signature:
             scheduler_config.model_name = (
@@ -715,6 +724,9 @@ class BatchedEngine(BaseEngine):
 
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
+        scheduler.moe_offload_stats = offload_stats
+        scheduler.moe_offload_release = offload_release
+        scheduler.moe_offload_restore = offload_restore
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,

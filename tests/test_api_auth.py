@@ -633,6 +633,7 @@ class TestUnauthenticatedInference:
             "/v1/messages/count_tokens",
             "/v1/embeddings",
             "/v1/rerank",
+            "/v1/systemone",
             "/v1/responses",
             "/v1/audio/speech",
         ],

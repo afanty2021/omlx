@@ -237,6 +237,7 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
+| `POST /v1/systemone` | Decision モデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
 
 ### ツール呼び出し＆構造化出力
@@ -278,6 +279,7 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | エンベディング | BERT、BGE-M3、ModernBERT |
 | リランカー | ModernBERT、XLM-RoBERTa |
+| Decision | Clef、Clef-Flash、OpenJev |
 
 ## CLI 設定
 
@@ -317,7 +319,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM、連続バッチング)
     │   ├── VLMEngine (ビジョン言語モデル)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (合計メモリ制限、TTLチェック)
     │

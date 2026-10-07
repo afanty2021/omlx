@@ -110,7 +110,8 @@ logger = logging.getLogger(__name__)
 TOP_K = 10
 _GATE_UP_ROWS = 2  # gate rows (and as many up rows) per simdgroup
 _GATE_UP_SIMDGROUPS = 2
-_DOWN_ROWS = 4
+_DOWN_ROWS = 4  # down rows per simdgroup unless tuned by window width
+_DOWN_ROWS_TUNED = os.environ.get("OMLX_QWEN35_MOE_DOWN_ROWS", "1") != "0"
 _ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE", "1") != "0"
 _SHARED_FOLD = os.environ.get("OMLX_QWEN35_MOE_SHARED_FOLD", "1") != "0"
 _VIEWS_ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE_VIEWS", "1") != "0"
@@ -123,9 +124,20 @@ _TOPK_FOLD = os.environ.get("OMLX_QWEN35_MOE_TOPK_FOLD", "1") != "0"
 # four rows on the gate+up launch runs out of ALU headroom and the separate
 # routing launch is as fast or faster (M5 Ultra, oQ5e shapes).
 _TOPK_FOLD_MAX_ROWS = 3
-WINDOW_MAX_ROWS = 8
+# Row-exact verify windows up to the hyper-connection and GDN verify
+# kernels' 16-row ceiling; the kernels index rows from the grid.
+WINDOW_MAX_ROWS = 16
 _WINDOW_DISABLED = False
 _WINDOW_PROVEN = False
+
+
+def _down_rows(rows: int) -> int:
+    """Down rows per simdgroup for a ``rows``-row launch. Every output row keeps
+    its arithmetic under any grouping, so this only shapes the grid: one-token
+    decode runs faster on more, smaller threadgroups (two rows); verify windows
+    keep four, which served windows measured fastest on (M5 Ultra, oQ5e).
+    OMLX_QWEN35_MOE_DOWN_ROWS=0 keeps four rows everywhere."""
+    return 2 if rows == 1 and _DOWN_ROWS_TUNED else _DOWN_ROWS
 
 
 class _Format(NamedTuple):
@@ -213,10 +225,10 @@ METAL_FUNC void qmv_rows(
 _COMMON = r"""
 using namespace metal;
 
-// MLX 0.32.2 Sigmoid, evaluated in T as the compiled swiglu does.
+// MLX 0.32.3 Sigmoid, evaluated in T as the compiled swiglu does.
 template <typename U>
 inline U omlx_mlx_sigmoid(U x) {
-  auto y = 1 / (1 + metal::exp(metal::abs(x)));
+  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
 
@@ -618,7 +630,6 @@ class _Plan(NamedTuple):
     down_kernel: object
     down_operands: tuple
     down_template: list
-    down_grid: tuple
     down_threadgroup: tuple
     shared_gate_up_operands: tuple = ()  # gate_proj, up_proj, gate (fold)
     shared_down_operands: tuple = ()  # down_proj (fold)
@@ -713,7 +724,6 @@ def _build_plan(block) -> _Plan | None:
         ("T", mx.bfloat16),
         ("K", inter),
         ("N", hidden),
-        ("RPS", _DOWN_ROWS),
     ]
     if shared is None:
         return _Plan(
@@ -728,7 +738,6 @@ def _build_plan(block) -> _Plan | None:
             down_kernel=_down_kernel(d_fmt, None),
             down_operands=down_operands,
             down_template=down_template + [("NPART", TOP_K)],
-            down_grid=(32, TOP_K * hidden // _DOWN_ROWS, 1),
             down_threadgroup=(32, TOP_K, 1),
             topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None) if _TOPK_FOLD else None,
             topk_blocks=1 + TOP_K * inter // rows,
@@ -751,7 +760,6 @@ def _build_plan(block) -> _Plan | None:
         down_kernel=_down_kernel(d_fmt, sd_fmt),
         down_operands=down_operands,
         down_template=down_template + [("KS", width), ("NPART", TOP_K + 1)],
-        down_grid=(32, (TOP_K + 1) * hidden // _DOWN_ROWS, 1),
         down_threadgroup=(32, TOP_K + 1, 1),
         shared_gate_up_operands=shared_gate_up,
         shared_down_operands=shared_down,
@@ -785,10 +793,11 @@ def _down(plan: _Plan, h, indices, scores, shape, shared=None, gate=None):
         # The shared expert comes first in the inputs, so its launches are
         # encoded (and can run) before the router's.
         down_inputs = [shared, gate, h, *plan.down_operands, indices, scores]
+    rps = _down_rows(1)
     return plan.down_kernel(
         inputs=down_inputs,
-        template=plan.down_template,
-        grid=plan.down_grid,
+        template=plan.down_template + [("RPS", rps)],
+        grid=(32, plan.down_threadgroup[1] * plan.hidden // rps, 1),
         threadgroup=plan.down_threadgroup,
         output_shapes=[shape],
         output_dtypes=[mx.bfloat16],
@@ -843,10 +852,11 @@ def routed_decode_logits(plan: _Plan, x, logits, shared=None, gate=None):
 
 def _window_down(plan: _Plan, h, indices, scores):
     rows = indices.shape[0]
+    rps = _down_rows(rows)
     return plan.window_down_kernel(
         inputs=[h, *plan.down_operands, *plan.shared_down_operands, indices, scores],
-        template=plan.down_template + [("M", rows)],
-        grid=(32, plan.down_grid[1] * rows, 1),
+        template=plan.down_template + [("RPS", rps), ("M", rows)],
+        grid=(32, plan.down_threadgroup[1] * plan.hidden // rps * rows, 1),
         threadgroup=plan.down_threadgroup,
         output_shapes=[(rows, plan.hidden)],
         output_dtypes=[mx.bfloat16],
@@ -895,7 +905,9 @@ def routed_verify_window(block, x):
         return None
     hidden = x.shape[-1]
     rows = x.size // hidden
-    if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(x, block.num_experts):
+    if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(
+        x, block.num_experts, WINDOW_MAX_ROWS
+    ):
         return None
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
     if plan is None or plan.hidden != hidden or not plan.fold or plan.router_logits is None:
@@ -904,7 +916,7 @@ def routed_verify_window(block, x):
     logits = plan.router_logits(x)
     folded = _topk_folds(plan, logits)
     if not folded:
-        routing = softmax_topk_rows(logits, TOP_K)
+        routing = softmax_topk_rows(logits, TOP_K, WINDOW_MAX_ROWS)
         if routing is None:
             routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), TOP_K)
         inds, scores = routing
@@ -972,6 +984,12 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     def patched_call(self, x):
         global _DISABLED, _PROVEN
         plan = routed_decode_plan(self, x)
+        if plan is None and x.ndim == 3 and x.shape[1] == 1 and x.shape[0] > 1:
+            # Batched one-token decode: every row runs the one-token
+            # arithmetic of its own stream in the window launches.
+            y = routed_verify_window(self, x)
+            if y is not None:
+                return y.reshape(x.shape)
         if plan is None or not router_eligible(x, self.num_experts):
             return orig_call(self, x)
         shared = shared_gate = None

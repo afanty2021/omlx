@@ -615,7 +615,7 @@ private struct ProfilesTab: View {
                         }
                     }
                 },
-                onSaveAsNew: { openSaveAs(scope: .global) },
+                onSaveAsNew: { openSaveAs(scope: vm.defaultSaveAsScope) },
                 onRevert: {
                     Task { await vm.revertWorking(client: client) }
                 }
@@ -1096,7 +1096,7 @@ private struct BasicEditBanner: View {
                         }
                     },
                     onSaveAsNew: {
-                        saveAsScope = .global
+                        saveAsScope = vm.defaultSaveAsScope
                         saveAsName = vm.suggestSaveAsName()
                         saveAsOpen = true
                     },

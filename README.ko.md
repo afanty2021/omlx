@@ -274,6 +274,7 @@ OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 �
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 텍스트 임베딩 |
 | `POST /v1/rerank` | 문서 리랭킹 |
+| `POST /v1/systemone` | Decision 모델의 타입별 판단 (TypeSafe System One) |
 | `GET /v1/models` | 사용 가능한 모델 목록 |
 
 ### Tool calling & 구조화된 출력
@@ -315,6 +316,7 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | 임베딩 | BERT, BGE-M3, ModernBERT |
 | 리랭커 | ModernBERT, XLM-RoBERTa |
+| Decision | Clef, Clef-Flash, OpenJev |
 
 ## CLI 설정
 
@@ -365,7 +367,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM, 연속 배칭)
     │   ├── VLMEngine (비전-언어 모델)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (전체 메모리 제한, TTL 체크)
     │

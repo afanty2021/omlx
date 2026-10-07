@@ -60,6 +60,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from omlx._version import __version__
 
@@ -158,6 +159,7 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
     split_namespace_tool_name,
 )
+from .api.systemone_models import SystemOneRequest
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallExtraction,
@@ -177,6 +179,7 @@ from .api.utils import (
     detect_and_strip_partial,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
@@ -185,8 +188,10 @@ from .api.utils import (
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
+from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.decision import DecisionEngine
 from .engine_pool import EnginePool
 from .exceptions import (
     EnginePoolError,
@@ -202,6 +207,7 @@ from .exceptions import (
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -223,6 +229,7 @@ class EngineType(Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     RERANKER = "reranker"
+    DECISION = "decision"
 
 
 @dataclass
@@ -1334,15 +1341,17 @@ async def get_engine(
     engine_type: EngineType = EngineType.LLM,
     _lease: bool = False,
     _leased_out: list | None = None,
-) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
+) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine, DecisionEngine]:
     """
     Get engine for the specified model and type.
 
-    This is the unified engine getter that handles LLM, embedding, and reranker models.
+    This is the unified engine getter that handles LLM, embedding, reranker,
+    and decision models.
 
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
-        engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
+        engine_type: Type of engine to retrieve (LLM, EMBEDDING, RERANKER, or
+            DECISION)
         _lease: When True, take an atomic in-use lease on the engine that the
             pool actually loaded (eviction-proof until released). The caller
             MUST release exactly one lease per successful leased call.
@@ -1474,6 +1483,13 @@ async def get_engine(
                     detail=f"Model '{model_id}' is not a reranker model. "
                     f"Use a SequenceClassification model for reranking.",
                 )
+        elif engine_type == EngineType.DECISION:
+            if not isinstance(engine, DecisionEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{model_id}' is not a decision model. "
+                    f"Use a decision model such as Clef or OpenJev.",
+                )
         elif engine_type == EngineType.LLM:
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
             # fell through and crashed on `engine.model_type` with an unhandled
@@ -1523,7 +1539,20 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
         return "Use /v1/embeddings for embedding models."
     if isinstance(engine, RerankerEngine):
         return "Use /v1/rerank for reranker models."
+    if isinstance(engine, DecisionEngine):
+        return "Use /v1/systemone for decision models."
     return "Use the model's dedicated endpoint (see /v1/models)."
+
+
+def _reject_lone_surrogates(request: BaseModel) -> None:
+    # JSON allows lone surrogate escapes, but the tokenizer cannot encode them.
+    field = find_lone_surrogate(request.model_dump(exclude_none=True))
+    if field:
+        raise InvalidRequestError(
+            f"Invalid string in '{field}': unpaired UTF-16 surrogate "
+            "(text was likely truncated through an emoji)",
+            field=field,
+        )
 
 
 @dataclass
@@ -1697,6 +1726,28 @@ async def acquire_reranker_engine(model: str):
     leased: list = []
     engine = await get_engine(
         model, EngineType.RERANKER, _lease=True, _leased_out=leased
+    )
+    try:
+        yield engine
+    finally:
+        if leased:
+            await get_engine_pool().release_engine(leased[0])
+
+
+async def get_decision_engine(model: str) -> DecisionEngine:
+    """Get the decision engine for ``model`` (see get_engine for errors)."""
+    return await get_engine(model, EngineType.DECISION)
+
+
+@asynccontextmanager
+async def acquire_decision_engine(model: str):
+    """Acquire a decision engine with an atomic, eviction-proof in-use lease.
+
+    See acquire_embedding_engine for the lease/release contract.
+    """
+    leased: list = []
+    engine = await get_engine(
+        model, EngineType.DECISION, _lease=True, _leased_out=leased
     )
     try:
         yield engine
@@ -3844,6 +3895,79 @@ async def create_rerank(
     )
 
 
+@app.post("/v1/systemone")
+async def create_systemone(
+    request: SystemOneRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_inference_api_key),
+):
+    """
+    Answer typed questions about a state with a decision model.
+
+    TypeSafe System One compatible endpoint. Every answer carries a
+    probability for each option of a ``noul`` (yes/no), ``choice`` or
+    ``score`` question.
+
+    Example request:
+    ```json
+    {
+        "model": "clef-flash-4bit",
+        "state": "Checkout fails for every customer since the last deploy.",
+        "questions": {
+            "urgent": {"type": "noul", "instructions": "Is this urgent?"}
+        }
+    }
+    ```
+    """
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+    _reject_lone_surrogates(request)
+
+    # Tokenize and preprocess images before the keepalive response starts, so
+    # request errors keep their real status codes.
+    engine = await get_decision_engine(request.model)
+    try:
+        plan = await engine.encode(request.model_dump(), truncate=request.truncate)
+    except DecisionContextLengthError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except DecisionRequestError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    async def _decide():
+        start_time = time.perf_counter()
+        async with acquire_decision_engine(request.model) as leased_engine:
+            result = await leased_engine.systemone(plan)
+        elapsed = time.perf_counter() - start_time
+        resolved_model = resolve_model_id(request.model) or request.model
+        input_tokens = result["input_tokens"]
+        logger.info(
+            f"SystemOne: model={resolved_model}, {len(request.questions)} "
+            f"questions, {input_tokens} tokens in {elapsed:.3f}s"
+        )
+        get_server_metrics().record_request_complete(
+            prompt_tokens=input_tokens,
+            completion_tokens=0,
+            cached_tokens=0,
+            prefill_duration=elapsed,
+            model_id=resolved_model,
+            request_duration=elapsed,
+        )
+        return json.dumps(
+            {
+                "model": request.model,
+                "answers": result["answers"],
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+            ensure_ascii=False,
+        )
+
+    return await _json_response_or_keepalive(http_request, _decide())
+
+
 # =============================================================================
 # Completion Endpoints
 # =============================================================================
@@ -3856,6 +3980,7 @@ async def create_completion(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4096,6 +4221,7 @@ async def create_chat_completion(
     }
     ```
     """
+    _reject_lone_surrogates(request)
     # Log incoming request summary at debug, message content at trace
     logger.debug(
         f"Chat completion request received: model={request.model}, "
@@ -4146,6 +4272,19 @@ async def create_chat_completion(
                 request.reasoning_effort,
             ),
         )
+
+        # Auto-set enable_thinking in chat template kwargs when a positive thinking
+        # budget is active (from request or model settings).  Some chat
+        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
+        # kwarg is True.  Set it before grammar compilation, which reads the
+        # thinking state to build the reasoning phase.
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["enable_thinking"] = True
 
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -4371,20 +4510,8 @@ async def create_chat_completion(
             chat_kwargs["seed"] = request.seed
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking in chat template kwargs when a positive thinking
-        # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-        # kwarg is True.
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
@@ -4832,6 +4959,51 @@ def _patch_output_format(tag_dict: dict, user_grammar: dict) -> bool:
     return False
 
 
+def _minimax_m3_reasoning_mode(chat_template_kwargs: dict) -> str:
+    """Return the xgrammar reasoning mode that matches the M3 generation prompt.
+
+    Uses the same precedence as the M3 ``thinking_mode`` translator. The
+    template renders a missing or unknown mode as adaptive, which leaves no
+    ``<mm:think>`` opener in the prompt; xgrammar calls that mode "auto".
+    """
+    if "thinking_mode" in chat_template_kwargs:
+        mode = chat_template_kwargs["thinking_mode"]
+    elif chat_template_kwargs.get("enable_thinking") is True:
+        mode = "enabled"
+    elif chat_template_kwargs.get("enable_thinking") is False:
+        mode = "disabled"
+    else:
+        mode = None
+    return mode if mode in ("enabled", "disabled") else "auto"
+
+
+def _allow_reasoning_opener(tag_dict: dict) -> None:
+    """Let an already-open reasoning block start with its own opener.
+
+    The grammar is compiled before the prompt is rendered, so the opener may be
+    in the prompt (Qwen3.5) or left to the model (Qwen3). xgrammar 0.2.8
+    excludes it from the reasoning body, which masks the model's first token in
+    the second case.
+    """
+    fmt = tag_dict.get("format", tag_dict)
+    if fmt.get("type") != "sequence" or not fmt.get("elements"):
+        return
+    prefix = fmt["elements"][0]
+    if prefix.get("type") == "sequence" and prefix.get("elements"):
+        prefix = prefix["elements"][0]
+    end = prefix.get("end", "")
+    if (
+        prefix.get("type") != "tag"
+        or prefix.get("begin") != ""
+        or not end.startswith("</")
+    ):
+        return
+    opener = "<" + end[2:]
+    content = prefix.get("content") or {}
+    if opener in (content.get("excludes") or []):
+        content["excludes"] = [x for x in content["excludes"] if x != opener]
+
+
 def _compile_with_structural_tag(
     compiler, fmt: dict, reasoning_parser: str, chat_template_kwargs: dict | None
 ):
@@ -4846,21 +5018,27 @@ def _compile_with_structural_tag(
     _install_torch_stub()
     import xgrammar as xgr
 
-    reasoning = not (
-        chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False
-    )
+    ct_kwargs = chat_template_kwargs or {}
+    if reasoning_parser == "minimax_m3":
+        reasoning = _minimax_m3_reasoning_mode(ct_kwargs)
+    else:
+        reasoning = ct_kwargs.get("enable_thinking") is not False
     tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
     tag_dict = tag.model_dump()
+    _allow_reasoning_opener(tag_dict)
+    # Compiling the tag without the user grammar would leave the answer
+    # unconstrained, so fail and let the caller report it.
     if not _patch_output_format(tag_dict, fmt):
-        logger.warning(
-            "Could not patch output format for reasoning_parser=%s, "
-            "compiling structural tag as-is",
-            reasoning_parser,
+        raise ValueError(
+            f"reasoning_parser={reasoning_parser!r} has no output slot for "
+            "the requested format"
         )
     from .api.grammar import mark_grammar_thinking_phase
 
     return mark_grammar_thinking_phase(
-        compiler.compile_structural_tag(tag_dict), enabled=reasoning
+        compiler.compile_structural_tag(tag_dict),
+        enabled=reasoning not in (False, "disabled"),
+        optional=reasoning == "auto",
     )
 
 
@@ -6564,6 +6742,7 @@ async def create_anthropic_message(
 
     Streaming is supported with `stream: true`.
     """
+    _reject_lone_surrogates(request)
     logger.debug(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
@@ -6593,6 +6772,7 @@ async def create_anthropic_message(
             request.chat_template_kwargs,
         )
         forced_keys = forced_ct_keys(ms)
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
@@ -6602,8 +6782,14 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
-
-        _entry = get_engine_pool().get_entry(resolved_model)
+                # MiniMax M3 templates have a separate adaptive thinking_mode.
+                if (
+                    thinking_type == "adaptive"
+                    and "thinking_mode" not in forced_keys
+                    and getattr(_entry, "config_model_type", None)
+                    in MINIMAX_M3_MODEL_TYPES
+                ):
+                    merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -6962,6 +7148,7 @@ async def count_anthropic_tokens(
 
     This is compatible with Anthropic's token counting API.
     """
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -7082,6 +7269,7 @@ async def create_response(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -7161,6 +7349,16 @@ async def create_response(
                 ),
             ),
         )
+
+        # Auto-set enable_thinking when a positive thinking budget is active.
+        # Set it before grammar compilation, which reads the thinking state.
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["enable_thinking"] = True
 
         _entry = get_engine_pool().get_entry(resolved_model)
 
@@ -7313,17 +7511,8 @@ async def create_response(
             chat_kwargs["seed"] = request.seed
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking when a positive thinking budget is active.
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
 
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
@@ -7640,8 +7829,8 @@ async def stream_responses_api(
         output=[],
         tools=request.tools or [],
         tool_choice=request.tool_choice or "auto",
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
         max_output_tokens=request.max_output_tokens,
         previous_response_id=request.previous_response_id,
     )
@@ -8334,8 +8523,8 @@ async def stream_responses_api(
             if request.tools
             else []
         ),
-        "temperature": request.temperature,
-        "top_p": request.top_p,
+        "temperature": kwargs.get("temperature"),
+        "top_p": kwargs.get("top_p"),
         "max_output_tokens": request.max_output_tokens,
     }
     if truncated:

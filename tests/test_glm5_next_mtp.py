@@ -1433,11 +1433,13 @@ def test_fused_verify_cycles_under_armed_verify_qmm_routing_are_bitwise_referenc
     verify forward. A KDA layer whose projections do not share one
     quantization (a 5-bit v_proj among 8-bit ones) runs them as separate
     QuantizedLinear calls in the reference body, which the routes take for
-    3+ rows; the fused verify path must give the same values there too."""
+    3+ rows; the fused verify path must give the same values there too.
+    Blocks whose shared-expert projections stay on the stock qmm (2-3 rows
+    here) keep the shared expert in the fused MoE kernel."""
     used = check_verify_matches_reference(
         23, 300, _CYCLES, KDA_BITS["mixed-v/4-bit"], armed=True
     )
-    assert {"kda", "hc_mix"} <= used, used
+    assert {"kda", "hc_mix", "moe_shared_wide"} <= used, used
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")

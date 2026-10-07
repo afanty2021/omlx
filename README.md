@@ -277,6 +277,7 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | Text embeddings |
 | `POST /v1/rerank` | Document reranking |
+| `POST /v1/systemone` | Typed decisions with decision models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
 
 ### Tool Calling & Structured Output
@@ -321,6 +322,7 @@ Models are auto-detected by type. You can also download models directly from the
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
+| Decision | Clef, Clef-Flash, OpenJev |
 
 ## CLI Configuration
 
@@ -380,7 +382,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLMs, continuous batching)
     │   ├── VLMEngine (vision-language models)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (total memory limit, TTL checks)
     │
@@ -403,7 +406,7 @@ FastAPI Server (OpenAI / Anthropic API)
 git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e ".[dev]"
-pytest -m "not slow"
+pytest
 ```
 
 ### macOS App

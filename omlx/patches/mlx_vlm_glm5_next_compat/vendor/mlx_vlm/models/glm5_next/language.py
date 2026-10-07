@@ -34,6 +34,7 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
 )
 from omlx.patches.qwen35_verify_qmm import _is_armed as _verify_qmm_armed
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed as _row_exact_armed
+from omlx.patches.qwen35_verify_qmm import takes_verify_route as _takes_verify_route
 from omlx.patches.glm_moe_dsa.indexer_nax import (
     indexer_scores_nax,
     max_rows_per_call,
@@ -216,54 +217,6 @@ def _decode_hc_pre_deferred(connection, norm, x):
     post, comb, mm = dk.hc_post_mm(connection, mixes, h)
     xn = mx.depends(xn, [post])
     return xn, h, post, comb, mm
-
-
-def _array_slots(tree, slots: list) -> list:
-    """Append ``(container, key)`` for every array held in ``tree``: the items
-    of a module (a dict) and of its nested dicts and lists."""
-    items = tree.items() if isinstance(tree, dict) else enumerate(tree)
-    for key, value in items:
-        if isinstance(value, mx.array):
-            slots.append((tree, key))
-        elif isinstance(value, (dict, list)):
-            _array_slots(value, slots)
-    return slots
-
-
-def compile_ffn_block(layer, method):
-    """``mx.compile(method)`` for a decoder layer's FFN half, with the arrays
-    of the modules it reads traced as inputs rather than as constants.
-
-    MLX 0.32.2 leaks every multi-output primitive that is an intermediate of a
-    compiled trace: rewiring the trace releases the old outputs by assignment,
-    which skips the sibling-cycle break their destructor runs (fixed upstream
-    in ml-explore/mlx#4453), so each such group stays allocated together with
-    everything it references. The one-token FFN is built from such kernels
-    (router logits, the route-selecting gate/up, the HC pre/post), so with the
-    weights as trace constants every compiled MoE layer kept its routed and
-    shared gate/up weights alive after the model was unloaded: ~2.5 GB per
-    layer, 40-80 GB of GLM-5.3's 169 GB. Traced as inputs, the weights are
-    shape-only placeholders in the trace and a leaked group holds no weight
-    memory. Every call passes the same arrays, so the compiled graph and its
-    values are unchanged.
-    """
-    slots = []
-    for module in (layer.ffn_hc, layer.post_attention_layernorm, layer.mlp):
-        _array_slots(module, slots)
-    arrays = [container[key] for container, key in slots]
-
-    def traced(arrays, *args):
-        saved = [container[key] for container, key in slots]
-        for (container, key), value in zip(slots, arrays):
-            container[key] = value
-        try:
-            return method(*args)
-        finally:
-            for (container, key), value in zip(slots, saved):
-                container[key] = value
-
-    compiled = mx.compile(traced)
-    return lambda *args: compiled(arrays, *args)
 
 
 def _mla_head_proj(layer, x: mx.array) -> mx.array:
@@ -1778,7 +1731,12 @@ class Glm5NextMoE(nn.Module):
             y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
         else:
             fused = None
-            if shared is not None:
+            # A shared projection on an armed verify route leaves the
+            # multi-row qmv_wide arithmetic, so the expert runs as the module.
+            if shared is not None and not any(
+                _takes_verify_route(p, T, x.dtype)
+                for p in (shared.gate_proj, shared.up_proj, shared.down_proj)
+            ):
                 # One dispatch also computes the shared expert's gate/up with
                 # the multi-row qmv_wide arithmetic its own T > 1 call uses.
                 fused = dk.moe_gate_up_swiglu(
@@ -1841,11 +1799,6 @@ class Glm5NextDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         defer: bool = False,
     ) -> mx.array:
-        if _DECODE_FUSION:
-            # Settle (eagerly, once) how MLX's eager fp32 sigmoid evaluates;
-            # the fused router inside the compiled FFN block follows it and
-            # cannot probe while being traced.
-            _decode_kernels.eager_sigmoid_precise(mx.float32)
         # One-token decode can leave this layer's last HC expand to the next
         # layer's fused HC pre (``defer``: returns an _HCDeferred); an
         # _HCDeferred input is always accepted.
@@ -1870,7 +1823,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # weights), so those shapes take the eager path.
         if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
             if self._ffn_c is None:
-                self._ffn_c = compile_ffn_block(self, self._ffn_block)
+                self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
         return self._ffn_block(x)
 
@@ -1906,7 +1859,7 @@ class Glm5NextDecoderLayer(nn.Module):
         r = self.self_attn(xn, mask, cache)
         if self.compile_ffn:
             if self._ffn_dc is None:
-                self._ffn_dc = compile_ffn_block(self, self._ffn_block_deferred)
+                self._ffn_dc = mx.compile(self._ffn_block_deferred)
             return _HCDeferred(*self._ffn_dc(r, h, post, comb, mm))
         return _HCDeferred(*self._ffn_block_deferred(r, h, post, comb, mm))
 

@@ -517,15 +517,15 @@ def router_logits_row(x, weight):
     return None if launch is None else launch(x)
 
 
-def softmax_topk_eligible(logits) -> bool:
+def softmax_topk_eligible(logits, max_rows: int = _MAX_ROWS) -> bool:
     """Whether ``softmax_topk_rows`` reproduces the routing of ``logits``
-    ([..., NE], 1..``_MAX_ROWS`` rows), so a launch may run its source:
+    ([..., NE], 1..``max_rows`` rows), so a launch may run its source:
     bf16 rows of MLX's single-row block softmax with whole simdgroups (NE %
     128 == 0, NE <= 4096), unless OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0."""
     ne = logits.shape[-1]
     return (
         not _SOFTMAX_FOLD_DISABLED
-        and logits.size // ne <= _MAX_ROWS
+        and logits.size // ne <= max_rows
         and ne % 128 == 0
         and ne <= 4096
         and logits.dtype == mx.bfloat16
@@ -584,8 +584,8 @@ _SOFTMAX_TOPK_ROWS_SOURCE = (
 _SOFTMAX_TOPK_ROWS_KERNEL = None
 
 
-def softmax_topk_rows(logits, top_k: int):
-    """``softmax_topk_row`` for each of 1..``_MAX_ROWS`` rows of bf16 gate
+def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
+    """``softmax_topk_row`` for each of 1..``max_rows`` rows of bf16 gate
     logits ``[..., NE]``, in one launch; None where ``softmax_topk_row``
     declines."""
     global _SOFTMAX_TOPK_ROWS_KERNEL
@@ -593,7 +593,7 @@ def softmax_topk_rows(logits, top_k: int):
     rows = logits.size // ne
     if rows == 1:
         return softmax_topk_row(logits, top_k)
-    if not softmax_topk_eligible(logits):
+    if not softmax_topk_eligible(logits, max_rows):
         return None
     if _SOFTMAX_TOPK_ROWS_KERNEL is None:
         _SOFTMAX_TOPK_ROWS_KERNEL = mx.fast.metal_kernel(
@@ -684,12 +684,12 @@ def fused_moe_combine(routed, scores, shared, gate):
     )[0]
 
 
-def router_eligible(x, num_experts: int) -> bool:
+def router_eligible(x, num_experts: int, max_rows: int = _MAX_ROWS) -> bool:
     rows = 1
     for d in x.shape[:-1]:
         rows *= d
     return (
-        rows <= _MAX_ROWS
+        rows <= max_rows
         and num_experts % 32 == 0
         and x.dtype in (mx.bfloat16, mx.float16)
     )
