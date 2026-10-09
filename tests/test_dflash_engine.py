@@ -2506,6 +2506,107 @@ async def test_park_yield_window_caps_parking(monkeypatch, caplog, streaming):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
+async def test_park_resubmit_keeps_parked_job_visible_as_waiter(
+    monkeypatch, caplog, streaming
+):
+    """Regression (2026-10-09 14:09 incident): a parked job resubmitted to
+    the FIFO tail must hold a waiter token while it sits requeued.
+
+    Without the re-acquire, the job it yielded to observes
+    ``_dflash_waiter_count() == 0`` and runs its own (often multi-minute)
+    fresh prefill to completion without ever yielding back -- production
+    starved a requeued request 282s behind a 26k fresh prefill.
+    """
+    import logging
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import (
+        DFlashEngine,
+        _dflash_waiter_count,
+        _dflash_waiter_enter,
+    )
+
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    caplog.set_level(logging.INFO, logger="omlx.engine.dflash")
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+
+    summary = SummaryEvent(
+        elapsed_us=1000,
+        prompt_token_count=1,
+        generated_token_ids=(42, 42, 42),
+        generation_tokens=3,
+        accepted_from_draft=0,
+        acceptance_ratio=0.0,
+        cycles_completed=1,
+        phase_timings_us={},
+    )
+
+    def events(**kwargs):
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield summary
+
+    engine._stream_dflash_events = lambda **kwargs: (events(), None, set())
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+
+    counts_at_submit = []
+    fake_waiter = _dflash_waiter_enter()
+
+    class RecordingExecutor:
+        """Records the global waiter count at every submit. On the second
+        submit (the first park's resubmit) it releases the external waiter
+        so the resumed run finds no waiters and runs to completion."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def submit(self, fn, *args):
+            counts_at_submit.append(_dflash_waiter_count())
+            if len(counts_at_submit) == 2:
+                fake_waiter.leave()
+            return self._real.submit(fn, *args)
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._real.__exit__(*exc)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as real_executor:
+            recorder = RecordingExecutor(real_executor)
+            monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: recorder)
+            async with asyncio.timeout(5):
+                if streaming:
+                    outputs = [o async for o in engine.stream_generate([1])]
+                    assert "".join(o.new_text for o in outputs) == "hello"
+                    assert outputs[-1].finish_reason == "stop"
+                else:
+                    output = await engine.generate([1])
+                    assert output.text == "hello"
+                    assert output.finish_reason == "stop"
+    finally:
+        fake_waiter.leave()
+
+    # First submit is the initial job (its own token is still held).
+    assert len(counts_at_submit) >= 2, counts_at_submit
+    assert counts_at_submit[0] >= 1, counts_at_submit
+    # Second submit is the park's resubmit: the re-acquired token must be
+    # held at that point (external waiter + parked job's token).
+    assert counts_at_submit[1] == 2, counts_at_submit
+    assert "DFlash parked" in caplog.text
+    assert not engine._active_stop_events
+    assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
 async def test_park_resubmit_failure_unblocks_consumer(monkeypatch, caplog, streaming):
     """Executor shutdown between parks must not hang or leak either path.
 

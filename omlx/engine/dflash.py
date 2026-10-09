@@ -1679,9 +1679,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         """
         from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
+        # Released at every (re)start: between resubmit and start the
+        # token must be held, or the requeued job is invisible to the
+        # running one and fairness rotation breaks (14:09 incident: a
+        # requeued request starved 282s behind a 26k fresh prefill).
+        if waiter_token is not None:
+            waiter_token.leave()
         if state is None:
-            if waiter_token is not None:
-                waiter_token.leave()
             state = {"last_park": time.monotonic(), "parks": 0}
         parked = False
         event_iter = state.get("event_iter")
@@ -1950,8 +1954,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         def _run(state: dict | None = None):
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
+            # Released at every (re)start: between resubmit and start
+            # the token must be held, or the requeued job is invisible to
+            # the running one and fairness rotation breaks.
+            waiter_token.leave()
             if state is None:
-                waiter_token.leave()
                 state = {"last_park": time.monotonic(), "parks": 0}
             parked = False
             event_iter = state.get("event_iter")
@@ -2095,9 +2102,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         # Parked for executor fairness: requeue behind the
                         # waiter(s) this job yielded to, then await again.
                         self._register_stop_event(stop_event)
+                        # A parked job requeued at the FIFO tail must stay
+                        # visible as a waiter, or the job it yielded to
+                        # (often itself a multi-minute fresh prefill) sees
+                        # waiter_count()==0 and never yields back.
+                        waiter_token = _dflash_waiter_enter()
                         try:
                             future = get_mlx_executor().submit(_run, result[1])
                         except Exception:
+                            waiter_token.leave()
                             # Executor shutdown between parks: the done
                             # callback that would unregister never attaches,
                             # so release here or the leaked registration
@@ -2313,10 +2326,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 # chaining keeps this flat across arbitrarily many parks.
                 try:
                     self._register_stop_event(stop_event)
+                    # A parked job requeued at the FIFO tail must stay
+                    # visible as a waiter, or the job it yielded to (often
+                    # itself a multi-minute fresh prefill) sees
+                    # waiter_count()==0 and never yields back.
+                    waiter_token = _dflash_waiter_enter()
                     resumed = get_mlx_executor().submit(
                         *_job_args, waiter_token, result
                     )
                 except Exception as e:
+                    waiter_token.leave()
                     # A parked job emits no sentinel of its own, so when the
                     # executor refuses the resubmit (e.g. shutdown between
                     # parks) unblock the consumer here or it waits on
