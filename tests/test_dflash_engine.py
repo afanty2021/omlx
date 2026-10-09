@@ -2429,6 +2429,83 @@ async def test_park_preserves_in_flight_event(monkeypatch, caplog, streaming):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
+async def test_park_yield_window_caps_parking(monkeypatch, caplog, streaming):
+    """Once a job has yielded for the max window it must stop parking.
+
+    Regression: a parked job re-queues at the FIFO tail, so a continuous
+    arrival stream starved it indefinitely (production: 1784-token request,
+    1561s wall for ~240s engine time). With a zero yield window the job
+    parks exactly once, then runs to completion with every token intact.
+    """
+    import logging
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import (
+        DFlashEngine,
+        _dflash_waiter_count,
+        _dflash_waiter_enter,
+    )
+
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_MAX_YIELD_WINDOW_S", 0)
+    # DEBUG: parks>=2 log at debug, so counting every park line needs DEBUG.
+    caplog.set_level(logging.DEBUG, logger="omlx.engine.dflash")
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+
+    summary = SummaryEvent(
+        elapsed_us=1000,
+        prompt_token_count=1,
+        generated_token_ids=(42, 42, 42),
+        generation_tokens=3,
+        accepted_from_draft=0,
+        acceptance_ratio=0.0,
+        cycles_completed=1,
+        phase_timings_us={},
+    )
+
+    def events(**kwargs):
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield summary
+
+    engine._stream_dflash_events = lambda **kwargs: (events(), None, set())
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+
+    # An extra waiter keeps waiter_count >= 1 for the whole request; with a
+    # zero park interval the uncapped code would park between every pair of
+    # events (3 parks). The zero yield window must stop it after the first.
+    fake_waiter = _dflash_waiter_enter()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+            async with asyncio.timeout(5):
+                if streaming:
+                    outputs = [o async for o in engine.stream_generate([1])]
+                    assert "".join(o.new_text for o in outputs) == "hellohellohello"
+                    assert outputs[-1].completion_tokens == 3
+                    assert outputs[-1].finish_reason == "stop"
+                else:
+                    output = await engine.generate([1])
+                    assert output.text == "hello"
+                    assert output.tokens == [42, 42, 42]
+                    assert output.completion_tokens == 3
+                    assert output.finish_reason == "stop"
+    finally:
+        fake_waiter.leave()
+    assert caplog.text.count("DFlash parked") == 1
+    assert not engine._active_stop_events
+    assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
 async def test_park_resubmit_failure_unblocks_consumer(monkeypatch, caplog, streaming):
     """Executor shutdown between parks must not hang or leak either path.
 

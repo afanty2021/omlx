@@ -273,6 +273,10 @@ def check_draft_target_precision_pairing(
 
 _DFLASH_PARK_INTERVAL_S = 2.0
 _DFLASH_MAX_PARKS = 512
+# Wall seconds from a job's first park after which it never parks again:
+# a parked job re-queues at the FIFO tail, so a continuous arrival stream
+# (client timeout-retry storm) would otherwise starve it indefinitely.
+_DFLASH_MAX_YIELD_WINDOW_S = 120.0
 _dflash_waiter_lock = threading.Lock()
 _dflash_waiter_count_v = 0
 
@@ -322,14 +326,29 @@ def _dflash_park_due(state: dict) -> bool:
     request is waiting, the running job parks (returns) between engine
     events, the FIFO queue rotates, the waiter runs, and this job is
     resubmitted at the tail. Same thread, no preemption, no new streams.
+
+    A parked job re-queues at the FIFO tail, so under a continuous arrival
+    stream (e.g. a client timeout-retry storm) newcomers can starve it
+    indefinitely -- production saw a 1784-token request take 1561s wall for
+    ~240s of engine time. The yield window bounds that: once a job has been
+    yielding for _DFLASH_MAX_YIELD_WINDOW_S (wall time since its first park)
+    it stops parking and runs to completion. Newcomers then wait for at most
+    the remainder of the current job, i.e. the pre-parking behavior.
     """
     if _dflash_waiter_count() <= 0:
         return False
     now = time.monotonic()
+    if (
+        state.get("first_park_at") is not None
+        and now - state["first_park_at"] >= _DFLASH_MAX_YIELD_WINDOW_S
+    ):
+        return False
     if now - state["last_park"] < _DFLASH_PARK_INTERVAL_S:
         return False
     if state["parks"] >= _DFLASH_MAX_PARKS:
         return False
+    if state.get("first_park_at") is None:
+        state["first_park_at"] = now
     state["last_park"] = now
     state["parks"] += 1
     return True
