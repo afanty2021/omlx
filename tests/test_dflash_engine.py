@@ -2728,6 +2728,7 @@ async def test_park_rotation_between_two_jobs(monkeypatch, caplog, streaming):
     observes waiter_count()==0 and runs to completion -- exactly one park
     line in the whole run. With rotation restored, both jobs park.
     """
+    import contextlib
     import logging
     import time
 
@@ -2778,16 +2779,27 @@ async def test_park_rotation_between_two_jobs(monkeypatch, caplog, streaming):
             output = await engine.generate([1])
             assert output.finish_reason == "stop"
 
-    async with asyncio.timeout(30):
-        task_a = asyncio.create_task(run(engine_a))
-        await asyncio.sleep(0.05)  # let A start and sit between slow events
-        task_b = asyncio.create_task(run(engine_b))
-        await asyncio.gather(task_a, task_b)
+    tasks = []
+    try:
+        async with asyncio.timeout(30):
+            task_a = asyncio.create_task(run(engine_a))
+            tasks.append(task_a)
+            await asyncio.sleep(0.05)  # let A start and sit between slow events
+            task_b = asyncio.create_task(run(engine_b))
+            tasks.append(task_b)
+            await asyncio.gather(task_a, task_b)
 
-    park_lines = [
-        r for r in caplog.records if "parked for executor fairness" in r.message
-    ]
-    assert len(park_lines) >= 2, f"no rotation: {len(park_lines)} park line(s)"
+        park_lines = [
+            r for r in caplog.records if "parked for executor fairness" in r.message
+        ]
+        assert len(park_lines) >= 2, f"no rotation: {len(park_lines)} park line(s)"
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with contextlib.suppress(BaseException):
+                await task
     assert _dflash_waiter_count() == 0
 
 
@@ -2798,10 +2810,20 @@ async def test_cancel_while_parked_and_requeued_releases_fresh_token(
 ):
     """A cancel landing while a parked job sits requeued must release the
     token acquired at resubmit (not the long-released original), else a
-    phantom waiter blocks the executor's fairness view until the queued
-    job eventually runs. Exercises clean cancellation, drain and no
-    waiter leak through that window (both transports).
+    phantom waiter outlives the request.
+
+    Deterministic recipe (re-review round 2): the park protocol itself
+    delivers the holder to the gate. B parks on its FIRST event boundary
+    -- the park-check skip applies only to the replayed pending event
+    after a park, a fresh job's first event IS checked -- rotates back,
+    and blocks inside next() on the gate with the executor frozen, so
+    the cancelled job's requeued token cannot self-heal. On the streaming
+    transport the pre-gate count==0 assertion is therefore red on any
+    build without the latest["token"] tracking; the non-streaming
+    transport releases via the closure-rebound current token after the
+    drain, and this variant pins clean cancellation + zero leak instead.
     """
+    import contextlib
     import logging
     import threading
     import time
@@ -2812,7 +2834,8 @@ async def test_cancel_while_parked_and_requeued_releases_fresh_token(
 
     assert _dflash_waiter_count() == 0  # process-global: decouple from test order
     monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
-    caplog.set_level(logging.INFO, logger="omlx.engine.dflash")
+    # parks>=2 log at DEBUG; the state-forming third park is only visible there.
+    caplog.set_level(logging.DEBUG, logger="omlx.engine.dflash")
 
     gate_b = threading.Event()
 
@@ -2837,17 +2860,18 @@ async def test_cancel_while_parked_and_requeued_releases_fresh_token(
         )
 
     def events_a(**kwargs):
-        # Throttled so A cannot finish before B registers its waiter:
-        # the parked state must be reachable deterministically.
+        # Throttled so A cannot finish before B registers its waiter.
         for _ in range(6):
             time.sleep(0.05)
             yield TokenEvent(42, 1, 1.0, 1)
         yield summary()
 
     def events_b(**kwargs):
-        # First event: the park check is skipped, so B processes it and
-        # then blocks inside next() on the gate -- B deterministically
-        # holds the executor while parked A sits requeued.
+        # First yield delayed: on the non-streaming transport the park
+        # bookkeeping runs on the event loop, so B's first boundary must
+        # not race A's resubmit -- B has to see A' registered, park (B0),
+        # rotate, and block on the gate as B'.
+        time.sleep(0.05)
         yield TokenEvent(42, 1, 1.0, 1)
         assert gate_b.wait(timeout=10)
         for _ in range(3):
@@ -2865,6 +2889,11 @@ async def test_cancel_while_parked_and_requeued_releases_fresh_token(
             await asyncio.sleep(0.01)
         return False
 
+    def park_line_count():
+        return sum(
+            1 for r in caplog.records if "parked for executor fairness" in r.message
+        )
+
     async def run(engine):
         if streaming:
             outputs = [o async for o in engine.stream_generate([1])]
@@ -2872,31 +2901,43 @@ async def test_cancel_while_parked_and_requeued_releases_fresh_token(
         return await engine.generate([1])
 
     task_a = asyncio.create_task(run(engine_a))
-    # A started once its submit-time token is released (count back to 0).
-    assert await wait_until(lambda: _dflash_waiter_count() == 0)
-    task_b = asyncio.create_task(run(engine_b))
-    # A parks for B (park line logged), B starts and releases its own
-    # token: count==1 is exactly A's resubmit-time token.
-    assert await wait_until(
-        lambda: _dflash_waiter_count() == 1
-        and any("parked for executor fairness" in r.message for r in caplog.records)
-    )
+    task_b = None
+    try:
+        # A started once its submit-time token is released (count back to 0).
+        assert await wait_until(lambda: _dflash_waiter_count() == 0)
+        task_b = asyncio.create_task(run(engine_b))
+        # Target state: parks 1 (A yields) -> 2 (B parks on its first
+        # boundary) -> 3 (A yields again); afterwards B' holds the executor
+        # blocked on the gate and exactly one token -- requeued A''s -- is
+        # outstanding.
+        assert await wait_until(
+            lambda: _dflash_waiter_count() == 1 and park_line_count() >= 3
+        ), (
+            f"never reached cancel-while-requeued state "
+            f"(parks={park_line_count()}, count={_dflash_waiter_count()})"
+        )
 
-    task_a.cancel()
-    # NOTE: the fresh-token release itself (streaming latest["token"]
-    # tracking) is deliberately NOT asserted for immediacy here: any
-    # waiter state that would keep the phantom observable also forces the
-    # park protocol to rotate it away within one park interval
-    # (self-healing, bounded by the chunk length in production), so
-    # end-to-end timing cannot deterministically separate fixed from
-    # self-healed. The load-bearing invariant -- the requeued job stays
-    # visible as a waiter -- is pinned by
-    # test_park_resubmit_keeps_parked_job_visible_as_waiter.
-    gate_b.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task_a
-    assert _dflash_waiter_count() == 0
-
-    result = await task_b
-    assert result.finish_reason == "stop"
+        task_a.cancel()
+        if streaming:
+            # The gate freezes the executor, so requeued A'' cannot start
+            # and self-heal its token: only the consumer finally's
+            # latest["token"] release can bring the count down here.
+            assert await wait_until(lambda: _dflash_waiter_count() == 0), (
+                "phantom waiter survived cancel-while-requeued (streaming)"
+            )
+        gate_b.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task_a
+        assert await wait_until(lambda: _dflash_waiter_count() == 0)
+        result = await task_b
+        assert result.finish_reason == "stop"
+    finally:
+        gate_b.set()
+        for task in (task_a, task_b):
+            if task is not None and not task.done():
+                task.cancel()
+        for task in (task_a, task_b):
+            if task is not None:
+                with contextlib.suppress(BaseException):
+                    await task
     assert _dflash_waiter_count() == 0
