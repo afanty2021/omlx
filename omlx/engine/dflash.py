@@ -2324,13 +2324,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 # Parked for executor fairness: requeue at the FIFO tail so
                 # the waiter(s) this job yielded to run first. Callback
                 # chaining keeps this flat across arbitrarily many parks.
+                self._register_stop_event(stop_event)
+                # A parked job requeued at the FIFO tail must stay visible
+                # as a waiter, or the job it yielded to (often itself a
+                # multi-minute fresh prefill) sees waiter_count()==0 and
+                # never yields back. Acquired outside the try so a failed
+                # enter() cannot mask the original error with an
+                # UnboundLocalError in the except below.
+                waiter_token = _dflash_waiter_enter()
                 try:
-                    self._register_stop_event(stop_event)
-                    # A parked job requeued at the FIFO tail must stay
-                    # visible as a waiter, or the job it yielded to (often
-                    # itself a multi-minute fresh prefill) sees
-                    # waiter_count()==0 and never yields back.
-                    waiter_token = _dflash_waiter_enter()
                     resumed = get_mlx_executor().submit(
                         *_job_args, waiter_token, result
                     )
@@ -2346,6 +2348,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     )
                     return
                 latest["future"] = resumed
+                latest["token"] = waiter_token
                 resumed.add_done_callback(_on_executor_done)
 
         try:
@@ -2408,9 +2411,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 if finished:
                     break
         finally:
-            # Idempotent: releases the waiter hold if this request was
-            # cancelled before the executor ever picked it up.
-            waiter_token.leave()
+            # Idempotent. Parks re-acquire a fresh hold: a cancel landing
+            # while the job sits requeued must release THAT token (the
+            # original was already released when the job first started),
+            # or a phantom waiter skews fairness until the queued job
+            # eventually runs.
+            latest.get("token", waiter_token).leave()
             # End the admin activity before the drain await below: a second
             # cancellation delivered during that await would skip anything
             # placed after it and leak a phantom active count.

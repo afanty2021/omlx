@@ -2554,6 +2554,7 @@ async def test_park_resubmit_keeps_parked_job_visible_as_waiter(
         "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
     )
 
+    assert _dflash_waiter_count() == 0  # process-global: decouple from test order
     counts_at_submit = []
     fake_waiter = _dflash_waiter_enter()
 
@@ -2715,3 +2716,187 @@ async def test_shutdown_persists_snapshot_on_generation_thread(
     assert engine._target_model is None
     if method != "stop":
         fallback.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_park_rotation_between_two_jobs(monkeypatch, caplog, streaming):
+    """End-to-end incident shape (2026-10-09 14:09): job A parks for job B;
+    B, once running, must see the requeued A as a waiter and yield back.
+
+    Without the resubmit re-acquire, B releases its own token at start,
+    observes waiter_count()==0 and runs to completion -- exactly one park
+    line in the whole run. With rotation restored, both jobs park.
+    """
+    import logging
+    import time
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import DFlashEngine, _dflash_waiter_count
+
+    assert _dflash_waiter_count() == 0  # process-global: decouple from test order
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    # Bound the rotation ping-pong so both jobs finish promptly.
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_MAX_YIELD_WINDOW_S", 1.0)
+    caplog.set_level(logging.DEBUG, logger="omlx.engine.dflash")
+
+    def make_engine(slow):
+        engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+        engine._executor_tokenizer = engine._tokenizer_obj
+        summary = SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=1,
+            generated_token_ids=(42, 42, 42),
+            generation_tokens=3,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+
+        def events(**kwargs):
+            for _ in range(6):
+                if slow:
+                    time.sleep(0.05)
+                yield TokenEvent(42, 1, 1.0, 1)
+            yield summary
+
+        engine._stream_dflash_events = lambda **kwargs: (events(), None, set())
+        return engine
+
+    engine_a = make_engine(slow=True)
+    engine_b = make_engine(slow=True)
+
+    async def run(engine):
+        if streaming:
+            outputs = [o async for o in engine.stream_generate([1])]
+            assert outputs[-1].finish_reason == "stop"
+        else:
+            output = await engine.generate([1])
+            assert output.finish_reason == "stop"
+
+    async with asyncio.timeout(30):
+        task_a = asyncio.create_task(run(engine_a))
+        await asyncio.sleep(0.05)  # let A start and sit between slow events
+        task_b = asyncio.create_task(run(engine_b))
+        await asyncio.gather(task_a, task_b)
+
+    park_lines = [
+        r for r in caplog.records if "parked for executor fairness" in r.message
+    ]
+    assert len(park_lines) >= 2, f"no rotation: {len(park_lines)} park line(s)"
+    assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cancel_while_parked_and_requeued_releases_fresh_token(
+    monkeypatch, caplog, streaming
+):
+    """A cancel landing while a parked job sits requeued must release the
+    token acquired at resubmit (not the long-released original), else a
+    phantom waiter blocks the executor's fairness view until the queued
+    job eventually runs. Exercises clean cancellation, drain and no
+    waiter leak through that window (both transports).
+    """
+    import logging
+    import threading
+    import time
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import DFlashEngine, _dflash_waiter_count
+
+    assert _dflash_waiter_count() == 0  # process-global: decouple from test order
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    caplog.set_level(logging.INFO, logger="omlx.engine.dflash")
+
+    gate_b = threading.Event()
+
+    def make_engine(events_factory):
+        engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+        engine._executor_tokenizer = engine._tokenizer_obj
+        engine._stream_dflash_events = lambda **kwargs: (events_factory(), None, set())
+        return engine
+
+    def summary():
+        return SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=1,
+            generated_token_ids=(42, 42, 42),
+            generation_tokens=3,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+
+    def events_a(**kwargs):
+        # Throttled so A cannot finish before B registers its waiter:
+        # the parked state must be reachable deterministically.
+        for _ in range(6):
+            time.sleep(0.05)
+            yield TokenEvent(42, 1, 1.0, 1)
+        yield summary()
+
+    def events_b(**kwargs):
+        # First event: the park check is skipped, so B processes it and
+        # then blocks inside next() on the gate -- B deterministically
+        # holds the executor while parked A sits requeued.
+        yield TokenEvent(42, 1, 1.0, 1)
+        assert gate_b.wait(timeout=10)
+        for _ in range(3):
+            yield TokenEvent(42, 1, 1.0, 1)
+        yield summary()
+
+    engine_a = make_engine(events_a)
+    engine_b = make_engine(events_b)
+
+    async def wait_until(predicate, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    async def run(engine):
+        if streaming:
+            outputs = [o async for o in engine.stream_generate([1])]
+            return outputs[-1]
+        return await engine.generate([1])
+
+    task_a = asyncio.create_task(run(engine_a))
+    # A started once its submit-time token is released (count back to 0).
+    assert await wait_until(lambda: _dflash_waiter_count() == 0)
+    task_b = asyncio.create_task(run(engine_b))
+    # A parks for B (park line logged), B starts and releases its own
+    # token: count==1 is exactly A's resubmit-time token.
+    assert await wait_until(
+        lambda: _dflash_waiter_count() == 1
+        and any("parked for executor fairness" in r.message for r in caplog.records)
+    )
+
+    task_a.cancel()
+    # NOTE: the fresh-token release itself (streaming latest["token"]
+    # tracking) is deliberately NOT asserted for immediacy here: any
+    # waiter state that would keep the phantom observable also forces the
+    # park protocol to rotate it away within one park interval
+    # (self-healing, bounded by the chunk length in production), so
+    # end-to-end timing cannot deterministically separate fixed from
+    # self-healed. The load-bearing invariant -- the requeued job stays
+    # visible as a waiter -- is pinned by
+    # test_park_resubmit_keeps_parked_job_visible_as_waiter.
+    gate_b.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+    assert _dflash_waiter_count() == 0
+
+    result = await task_b
+    assert result.finish_reason == "stop"
+    assert _dflash_waiter_count() == 0
