@@ -3,7 +3,29 @@
 
 import logging
 
-from omlx.logging_config import AdminStatsAccessFilter
+from omlx.logging_config import AdminStatsAccessFilter, apply_logger_levels
+
+
+class TestApplyLoggerLevels:
+    def test_applies_named_levels_case_insensitive(self):
+        name = "omlx.engine.dflash"
+        before = logging.getLogger(name).level
+        try:
+            applied = apply_logger_levels(f" {name}=debug , {name}=INFO")
+            assert applied == [f"{name}=DEBUG", f"{name}=INFO"]
+            assert logging.getLogger(name).level == logging.INFO
+        finally:
+            logging.getLogger(name).setLevel(before)
+
+    def test_skips_empty_and_garbled_entries(self):
+        name = "omlx.engine.dflash"
+        before = logging.getLogger(name).level
+        try:
+            assert apply_logger_levels("") == []
+            assert apply_logger_levels(",,,=DEBUG,omlx.engine.dflash=NOPE") == []
+            assert logging.getLogger(name).level == before
+        finally:
+            logging.getLogger(name).setLevel(before)
 
 
 class TestAdminStatsAccessFilter:

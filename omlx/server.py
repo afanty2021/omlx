@@ -206,11 +206,16 @@ from .exceptions import (
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
+from .logging_config import apply_logger_levels
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
+# Ops knob for per-logger levels without code changes, e.g. on the launchd
+# agent: OMLX_LOGGER_LEVELS="omlx.engine.dflash=DEBUG" (dflash parks>=2 log
+# at DEBUG — needed to diagnose executor-fairness parking in production).
+apply_logger_levels(os.environ.get("OMLX_LOGGER_LEVELS", ""))
 logger = logging.getLogger(__name__)
 
 

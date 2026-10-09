@@ -183,6 +183,28 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_data)
 
 
+def apply_logger_levels(spec: str) -> list[str]:
+    """Apply per-logger levels from a comma list "name=LEVEL[,...]".
+
+    Empty/garbled entries are skipped so an ops typo in the env var can never
+    break startup. Returns the applied "name=LEVEL" descriptors for logging.
+    """
+    applied: list[str] = []
+    for raw in spec.split(","):
+        entry = raw.strip()
+        if not entry or "=" not in entry:
+            continue
+        name, _, level = entry.partition("=")
+        name = name.strip()
+        level_name = level.strip().upper()
+        levelno = logging.getLevelName(level_name)
+        if not name or not isinstance(levelno, int):
+            continue
+        logging.getLogger(name).setLevel(levelno)
+        applied.append(f"{name}={level_name}")
+    return applied
+
+
 def get_logger(
     name: str,
     request_id: Optional[str] = None,
