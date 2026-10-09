@@ -288,6 +288,10 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash_prefill_step_size: Cold-prefill chunk size in tokens (None = dflash default
+            2048). Smaller chunks surface engine events more often during long prefills,
+            letting executor-fairness parking admit queued short requests sooner (halved
+            worst-case wait) at a small per-chunk overhead cost.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -445,6 +449,7 @@ class ModelSettings:
     dflash_draft_sink_size: Optional[int] = 0
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_prefill_step_size: Optional[int] = None  # None = dflash runtime default (2048)
 
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;

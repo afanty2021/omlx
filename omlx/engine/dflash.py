@@ -552,6 +552,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else None
         )
+        # Cold-prefill chunk size. None keeps the dflash runtime default (2048);
+        # smaller chunks surface engine events more often during long prefills so
+        # executor-fairness parking admits queued short requests sooner.
+        self._prefill_step_size = (
+            getattr(model_settings, "dflash_prefill_step_size", None)
+            if model_settings
+            else None
+        )
         # Extra stop tokens from the target's generation_config.json; unioned
         # with the tokenizer's EOS set when the runtime stop list is built.
         self._generation_config_eos: set[int] = set()
@@ -749,6 +757,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
+            prefill_step_size=self._prefill_step_size,
         )
         return build_runtime_context(cfg)
 
@@ -1051,6 +1060,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         window_used = getattr(runtime_cfg, "draft_window_size", "?")
         sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
         verify_used = getattr(runtime_cfg, "verify_mode", "?")
+        prefill_used = getattr(runtime_cfg, "prefill_step_size", "?")
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
@@ -1058,7 +1068,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             f"fallback={self._fallback_engine_type}, "
             f"l1_cache={self._in_memory_cache_enabled}, "
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
-            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
+            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}, "
+            f"prefill_step={prefill_used}"
         )
 
     def _record_prefill_guard_active_memory(self) -> None:

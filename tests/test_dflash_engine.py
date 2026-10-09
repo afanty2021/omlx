@@ -31,6 +31,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
         assert settings.dflash_draft_window_size is None
+        assert settings.dflash_prefill_step_size is None
         assert settings.dflash_draft_sink_size == 0
         assert settings.dflash_block_size is None
         assert settings.dflash_verify_mode is None
@@ -104,6 +105,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
         assert settings.dflash_draft_window_size is None
+        assert settings.dflash_prefill_step_size is None
         assert settings.dflash_draft_sink_size == 0
 
     def test_from_dict_ignores_removed_speculative_tokens(self):
@@ -124,12 +126,14 @@ class TestDFlashModelSettings:
             "dflash_draft_sink_size": 32,
             "dflash_block_size": 5,
             "dflash_verify_mode": "adaptive",
+            "dflash_prefill_step_size": 1024,
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_draft_window_size == 2048
         assert settings.dflash_draft_sink_size == 32
         assert settings.dflash_block_size == 5
         assert settings.dflash_verify_mode == "adaptive"
+        assert settings.dflash_prefill_step_size == 1024
 
     def test_roundtrip_serialization(self):
         original = ModelSettings(
@@ -143,6 +147,7 @@ class TestDFlashModelSettings:
             dflash_in_memory_cache=False,
             dflash_ssd_cache=False,
             dflash_ssd_cache_max_bytes=30 * 1024**3,
+            dflash_prefill_step_size=1024,
         )
         d = original.to_dict()
         restored = ModelSettings.from_dict(d)
@@ -169,6 +174,7 @@ class TestDFlashModelSettings:
         assert (
             restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
         )
+        assert restored.dflash_prefill_step_size == original.dflash_prefill_step_size
 
 
 class TestDFlashEngineInit:
@@ -512,7 +518,9 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
-            model_settings=ModelSettings(dflash_verify_mode="off"),
+            model_settings=ModelSettings(
+                dflash_verify_mode="off", dflash_prefill_step_size=1024
+            ),
         )
 
         await engine.start()
@@ -527,6 +535,8 @@ class TestDFlashEngineInit:
             assert captured["bound_target_ops"] is engine._target_ops
             assert engine._draft_window_size == 2048
             assert engine._runtime_context.runtime.draft_window_size == 2048
+            assert engine._prefill_step_size == 1024
+            assert engine._runtime_context.runtime.prefill_step_size == 1024
         finally:
             await engine.stop()
 

@@ -387,6 +387,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_sink_size: int | None = None
     dflash_block_size: int | None = None
     dflash_verify_mode: str | None = None
+    dflash_prefill_step_size: int | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -923,6 +924,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_sink_size",
         "dflash_block_size",
         "dflash_verify_mode",
+        "dflash_prefill_step_size",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
     )
@@ -1034,6 +1036,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_sink_size = None
     settings.dflash_block_size = None
     settings.dflash_verify_mode = None
+    settings.dflash_prefill_step_size = None
     settings.mtp_enabled = False
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
@@ -3201,6 +3204,12 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    if "dflash_prefill_step_size" in sent:
+        # 0 / negative / None → dflash runtime default (2048).
+        value = request.dflash_prefill_step_size
+        current_settings.dflash_prefill_step_size = (
+            int(value) if value is not None and value > 0 else None
+        )
     draft_model = current_settings.dflash_draft_model
     if (
         ("dflash_enabled" in sent or "dflash_draft_model" in sent)
