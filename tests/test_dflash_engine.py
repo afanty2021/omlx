@@ -2345,6 +2345,151 @@ async def test_finish_reason_at_max_tokens(monkeypatch, streaming, generated, ex
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_park_preserves_in_flight_event(monkeypatch, caplog, streaming):
+    """A park must not drop the event already pulled from the iterator.
+
+    Regression: the park check fires after ``for event in event_iter`` has
+    pulled an event, so parking without stashing it dropped output tokens
+    (or the whole summary) once per park.
+    """
+    import logging
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import (
+        DFlashEngine,
+        _dflash_waiter_count,
+        _dflash_waiter_enter,
+    )
+
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    caplog.set_level(logging.INFO, logger="omlx.engine.dflash")
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+
+    summary = SummaryEvent(
+        elapsed_us=1000,
+        prompt_token_count=1,
+        generated_token_ids=(42, 42, 42),
+        generation_tokens=3,
+        accepted_from_draft=0,
+        acceptance_ratio=0.0,
+        cycles_completed=1,
+        phase_timings_us={},
+    )
+
+    def events(**kwargs):
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield summary
+
+    engine._stream_dflash_events = lambda **kwargs: (events(), None, set())
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+
+    # An extra waiter keeps waiter_count >= 1 for the whole request, so with
+    # a zero park interval the job parks between every pair of events.
+    fake_waiter = _dflash_waiter_enter()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+            async with asyncio.timeout(5):
+                if streaming:
+                    outputs = [o async for o in engine.stream_generate([1])]
+                    assert "".join(o.new_text for o in outputs) == "hellohellohello"
+                    assert outputs[-1].completion_tokens == 3
+                    assert outputs[-1].finish_reason == "stop"
+                else:
+                    output = await engine.generate([1])
+                    assert output.text == "hello"
+                    assert output.tokens == [42, 42, 42]
+                    assert output.completion_tokens == 3
+                    assert output.finish_reason == "stop"
+    finally:
+        fake_waiter.leave()
+    assert "DFlash parked" in caplog.text
+    assert not engine._active_stop_events
+    assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_park_resubmit_failure_unblocks_consumer(monkeypatch, caplog, streaming):
+    """Executor shutdown between parks must not hang or leak either path.
+
+    Regression (streaming): the resubmit inside the executor done-callback
+    raised with nobody catching it, leaving the parked state lost, the
+    consumer blocked on queue.get() forever, and the stop-event
+    registration leaked.
+
+    Regression (non-streaming): the resume loop registered stop_event before
+    resubmitting with no guard; a refused submit left the registration
+    forever (old future's callback already fired, new one never attached),
+    permanently blocking idle-unload/eviction.
+    """
+    import logging
+
+    from dflash_mlx.engine.events import TokenEvent
+
+    from omlx.engine.dflash import (
+        DFlashEngine,
+        _dflash_waiter_count,
+        _dflash_waiter_enter,
+    )
+
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    caplog.set_level(logging.INFO, logger="omlx.engine.dflash")
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+
+    def events(**kwargs):
+        yield TokenEvent(42, 1, 1.0, 1)
+
+    engine._stream_dflash_events = lambda **kwargs: (events(), None, set())
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+
+    class _ShutdownAfterFirstSubmit:
+        def __init__(self):
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._calls = 0
+
+        def submit(self, *args, **kwargs):
+            self._calls += 1
+            if self._calls > 1:
+                raise RuntimeError("executor is shutting down")
+            return self._executor.submit(*args, **kwargs)
+
+    fake_executor = _ShutdownAfterFirstSubmit()
+    monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: fake_executor)
+    fake_waiter = _dflash_waiter_enter()
+    try:
+        async with asyncio.timeout(5):
+            if streaming:
+                outputs = [o async for o in engine.stream_generate([1])]
+                assert [o.finish_reason for o in outputs] == ["error"]
+            else:
+                with pytest.raises(RuntimeError):
+                    await engine.generate([1])
+    finally:
+        fake_waiter.leave()
+        fake_executor._executor.submit(lambda: None).result()
+        fake_executor._executor.shutdown()
+    assert "DFlash parked" in caplog.text
+    assert not engine._active_stop_events
+    assert not engine.has_active_requests()
+    assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["stop", "_evict_dflash_and_start_fallback"])
 async def test_shutdown_persists_snapshot_on_generation_thread(
     monkeypatch, tmp_path, method

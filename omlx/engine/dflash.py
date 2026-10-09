@@ -13,6 +13,7 @@ delegating long-context requests to omlx's BatchedEngine/VLMBatchedEngine
 import asyncio
 import copy
 import gc
+import itertools
 import json
 import logging
 import math
@@ -268,6 +269,70 @@ def check_draft_target_precision_pairing(
         "This may reduce acceptance and make speculative decoding slower. "
         "Use a target/draft pair recommended by the checkpoint's model card."
     )
+
+
+_DFLASH_PARK_INTERVAL_S = 2.0
+_DFLASH_MAX_PARKS = 512
+_dflash_waiter_lock = threading.Lock()
+_dflash_waiter_count_v = 0
+
+
+class _DFlashWaiterToken:
+    """One queued dflash request's hold on the global waiter count.
+
+    leave() is idempotent: the executor job releases the hold when it starts
+    running, and the submitter's finally releases it if the request was
+    cancelled before the executor ever picked it up (queued futures can be
+    cancelled, so the job-side release alone would leak a permanent phantom
+    waiter and park every later generation forever).
+    """
+
+    __slots__ = ("_released",)
+
+    def __init__(self) -> None:
+        self._released = False
+
+    def leave(self) -> None:
+        global _dflash_waiter_count_v
+        with _dflash_waiter_lock:
+            if self._released:
+                return
+            self._released = True
+            _dflash_waiter_count_v = max(0, _dflash_waiter_count_v - 1)
+
+
+def _dflash_waiter_enter() -> _DFlashWaiterToken:
+    global _dflash_waiter_count_v
+    with _dflash_waiter_lock:
+        _dflash_waiter_count_v += 1
+    return _DFlashWaiterToken()
+
+
+def _dflash_waiter_count() -> int:
+    with _dflash_waiter_lock:
+        return _dflash_waiter_count_v
+
+
+def _dflash_park_due(state: dict) -> bool:
+    """Fair time-slice check for the single MLX executor thread.
+
+    DFlash runs each generation as one job on a max_workers=1 executor, so a
+    long fresh prefill (minutes at 25k+ tokens) starves every queued request
+    -- auto-mode permission classifiers time out behind it. When another
+    request is waiting, the running job parks (returns) between engine
+    events, the FIFO queue rotates, the waiter runs, and this job is
+    resubmitted at the tail. Same thread, no preemption, no new streams.
+    """
+    if _dflash_waiter_count() <= 0:
+        return False
+    now = time.monotonic()
+    if now - state["last_park"] < _DFLASH_PARK_INTERVAL_S:
+        return False
+    if state["parks"] >= _DFLASH_MAX_PARKS:
+        return False
+    state["last_park"] = now
+    state["parks"] += 1
+    return True
 
 
 def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
@@ -1567,55 +1632,104 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
-    ) -> None:
+        waiter_token: "_DFlashWaiterToken | None" = None,
+        state: "dict | None" = None,
+    ) -> "dict | None":
         """Run dflash generation with streaming on MLX executor thread.
 
         ``stop_event`` is set by the async consumer when it stops reading
         (client disconnect / abort). Polling it between events lets the loop
         return promptly so the single MLX executor thread is freed for the
         next request.
+
+        Executor fairness: when another request is waiting, this job parks
+        between engine events and returns its state dict for resubmission at
+        the FIFO tail, so a multi-minute fresh prefill cannot starve queued
+        requests. Completion returns ``None``; a park returns ``state``.
         """
         from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
-        event_iter = None
-        cache_manager = None
+        if state is None:
+            if waiter_token is not None:
+                waiter_token.leave()
+            state = {"last_park": time.monotonic(), "parks": 0}
+        parked = False
+        event_iter = state.get("event_iter")
+        pending_event = state.pop("pending_event", None)
+        prefix_flow = state.get("prefix_flow")
+        stop_ids = state.get("stop_ids")
+        parser_session = state.get("parser_session")
+        detokenizer = state.get("detokenizer")
+        cache_manager = state.get("cache_manager")
         try:
-            self._record_prefill_guard_active_memory()
-            if seed is not None:
-                # Best-effort per-request reproducibility, matching the
-                # batched engine's mx.random.seed handling.
-                mx.random.seed(int(seed))
-            event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
-                prompt_tokens=prompt_tokens,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                repetition_context_size=repetition_context_size,
-            )
-            cache_manager = self._begin_runtime_cache_request()
-            self._record_prefill_guard_active_memory()
-
-            # Protocol-specific parser (gemma4 channel markers → <think> tags,
-            # harmony channels → <think>/visible split). When active it owns
-            # detokenization too, so the standard streaming detokenizer is
-            # only created when no parser is available.
-            parser_session = self._create_output_parser_session(tools)
-            detokenizer = None
-            if parser_session is None:
-                detokenizer = create_streaming_detokenizer(
-                    self._executor_tokenizer,
-                    model_path=self._model_name,
+            if event_iter is None:
+                self._record_prefill_guard_active_memory()
+                if seed is not None:
+                    # Best-effort per-request reproducibility, matching the
+                    # batched engine's mx.random.seed handling.
+                    mx.random.seed(int(seed))
+                event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
+                    prompt_tokens=prompt_tokens,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    repetition_context_size=repetition_context_size,
                 )
-                if detokenizer is not None:
-                    detokenizer.reset()
+                cache_manager = self._begin_runtime_cache_request()
+                self._record_prefill_guard_active_memory()
 
-            for event in event_iter:
+                # Protocol-specific parser (gemma4 channel markers -> <think> tags,
+                # harmony channels -> <think>/visible split). When active it owns
+                # detokenization too, so the standard streaming detokenizer is
+                # only created when no parser is available.
+                parser_session = self._create_output_parser_session(tools)
+                detokenizer = None
+                if parser_session is None:
+                    detokenizer = create_streaming_detokenizer(
+                        self._executor_tokenizer,
+                        model_path=self._model_name,
+                    )
+                    if detokenizer is not None:
+                        detokenizer.reset()
+                state.update(
+                    event_iter=event_iter,
+                    prefix_flow=prefix_flow,
+                    stop_ids=stop_ids,
+                    parser_session=parser_session,
+                    detokenizer=detokenizer,
+                    cache_manager=cache_manager,
+                )
+
+            # An event pulled from the iterator right before a park must
+            # survive the round-trip: replay it before anything new so parks
+            # never drop output tokens or the summary. The replayed event
+            # skips the park check so every resumed run makes forward
+            # progress instead of re-parking the same event forever.
+            first_event = pending_event is not None
+            events = (
+                itertools.chain((pending_event,), event_iter)
+                if first_event
+                else event_iter
+            )
+            for event in events:
                 if stop_event.is_set():
                     logger.info("DFlash generation abort requested")
                     break
+                if first_event:
+                    first_event = False
+                elif _dflash_park_due(state):
+                    parked = True
+                    state["pending_event"] = event
+                    (logger.info if state["parks"] == 1 else logger.debug)(
+                        "DFlash parked for executor fairness "
+                        "(parks=%d, waiters=%d)",
+                        state["parks"],
+                        _dflash_waiter_count(),
+                    )
+                    return state
 
                 if isinstance(event, TokenEvent):
                     token_id = int(event.token_id)
@@ -1631,7 +1745,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else:
                         text = self._executor_tokenizer.decode([token_id])
                     # Parser sessions can emit empty stream_text on protocol
-                    # marker tokens — skip the chunk so clients don't see a
+                    # marker tokens -- skip the chunk so clients don't see a
                     # flood of empty deltas.
                     if not text:
                         continue
@@ -1693,7 +1807,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     )
 
                 # Cycle, memory, prefill, and snapshot events are consumed by the
-                # runtime cache manager and metrics layers — omlx does not surface
+                # runtime cache manager and metrics layers -- omlx does not surface
                 # them so all other event types are intentionally ignored.
 
         except Exception as e:
@@ -1702,23 +1816,23 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 queue.put(("", [], True, {"error": str(e)})), loop
             )
         finally:
-            # Closing the dflash generator throws GeneratorExit on its next
-            # yield, releasing kernel state and any draft cache it holds.
-            self._record_prefill_guard_active_memory()
-            if event_iter is not None:
-                close = getattr(event_iter, "close", None)
-                if close is not None:
-                    try:
-                        close()
-                    except Exception as exc:
-                        logger.debug(f"event_iter.close() raised: {exc}")
-            self._end_runtime_cache_request(cache_manager)
-            # Always send a sentinel so the async consumer doesn't deadlock
-            # when an abort happened before the dflash summary was emitted.
-            asyncio.run_coroutine_threadsafe(
-                queue.put(("", [], True, {"aborted": stop_event.is_set()})),
-                loop,
-            )
+            if not parked:
+                # Closing the dflash generator throws GeneratorExit on its next
+                # yield, releasing kernel state and any draft cache it holds.
+                self._record_prefill_guard_active_memory()
+                if event_iter is not None:
+                    close = getattr(event_iter, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception as exc:
+                            logger.debug(f"event_iter.close() raised: {exc}")
+                self._end_runtime_cache_request(cache_manager)
+                # Always send a sentinel so the async consumer doesn't deadlock
+                # when an abort happened before the dflash summary was emitted.
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("", [], True, {"aborted": stop_event.is_set()})), loop
+                )
 
     def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
         """Return prompt IDs without re-tokenizing an already-tokenized prompt."""
@@ -1803,42 +1917,90 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Models card reads this activity instead of a scheduler snapshot.
         activity_id = self._begin_activity("generate", detail="generating")
 
-        def _run():
+        def _run(state: dict | None = None):
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
-            event_iter = None
-            cache_manager = None
+            if state is None:
+                waiter_token.leave()
+                state = {"last_park": time.monotonic(), "parks": 0}
+            parked = False
+            event_iter = state.get("event_iter")
+            pending_event = state.pop("pending_event", None)
+            prefix_flow = state.get("prefix_flow")
+            stop_ids = state.get("stop_ids")
+            cache_manager = state.get("cache_manager")
+            tokens = state.get("tokens")
+            parsed_visible_parts = state.get("parsed_visible_parts")
+            summary = state.get("summary")
+            first_token_at = state.get("first_token_at")
             # Per-request parser session (gemma4 channel markers, harmony
             # channels). Lives only inside the executor thread so the parser
             # state cannot leak across requests.
-            parser_session = self._create_output_parser_session(tools)
+            parser_session = state.get("parser_session")
+            parser_final = None
             try:
-                self._record_prefill_guard_active_memory()
-                if seed is not None:
-                    # Best-effort per-request reproducibility, matching the
-                    # batched engine's mx.random.seed handling.
-                    mx.random.seed(int(seed))
-                event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
-                    prompt_tokens=prompt_tokens,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    min_p=min_p,
-                    repetition_penalty=repetition_penalty,
-                    repetition_context_size=int(repetition_context_size),
+                if event_iter is None:
+                    self._record_prefill_guard_active_memory()
+                    if seed is not None:
+                        # Best-effort per-request reproducibility, matching the
+                        # batched engine's mx.random.seed handling.
+                        mx.random.seed(int(seed))
+                    event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
+                        prompt_tokens=prompt_tokens,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        repetition_penalty=repetition_penalty,
+                        repetition_context_size=int(repetition_context_size),
+                    )
+                    cache_manager = self._begin_runtime_cache_request()
+                    self._record_prefill_guard_active_memory()
+                    tokens = []
+                    parsed_visible_parts = []
+                    summary = None
+                    first_token_at = None
+                    parser_session = self._create_output_parser_session(tools)
+                    state.update(
+                        event_iter=event_iter,
+                        prefix_flow=prefix_flow,
+                        stop_ids=stop_ids,
+                        cache_manager=cache_manager,
+                        tokens=tokens,
+                        parsed_visible_parts=parsed_visible_parts,
+                        summary=summary,
+                        first_token_at=first_token_at,
+                        parser_session=parser_session,
+                    )
+                # Replay the event stashed at the last park before anything
+                # new so parks never drop output tokens or the summary; the
+                # replayed event skips the park check for forward progress.
+                first_event = pending_event is not None
+                events = (
+                    itertools.chain((pending_event,), event_iter)
+                    if first_event
+                    else event_iter
                 )
-                cache_manager = self._begin_runtime_cache_request()
-                self._record_prefill_guard_active_memory()
-                tokens: list[int] = []
-                parsed_visible_parts: list[str] = []
-                summary: SummaryEvent | None = None
-                first_token_at: float | None = None
-                parser_final = None
-                for event in event_iter:
+                for event in events:
                     if stop_event.is_set():
                         logger.info("DFlash generation abort requested")
                         break
+                    if first_event:
+                        first_event = False
+                    elif _dflash_park_due(state):
+                        parked = True
+                        # Rebound locals must survive the park round-trip.
+                        state["summary"] = summary
+                        state["first_token_at"] = first_token_at
+                        state["pending_event"] = event
+                        (logger.info if state["parks"] == 1 else logger.debug)(
+                            "DFlash parked for executor fairness "
+                            "(parks=%d, waiters=%d)",
+                            state["parks"],
+                            _dflash_waiter_count(),
+                        )
+                        return ("__DFLASH_PARKED__", state)
                     if isinstance(event, TokenEvent):
                         if first_token_at is None:
                             first_token_at = time.perf_counter()
@@ -1869,38 +2031,64 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     self._summary_finish_reason(summary, stop_ids, max_tokens),
                 )
             finally:
-                self._record_prefill_guard_active_memory()
-                if event_iter is not None:
-                    close = getattr(event_iter, "close", None)
-                    if close is not None:
-                        try:
-                            close()
-                        except Exception as exc:
-                            logger.debug(f"event_iter.close() raised: {exc}")
-                self._end_runtime_cache_request(cache_manager)
+                if not parked:
+                    self._record_prefill_guard_active_memory()
+                    if event_iter is not None:
+                        close = getattr(event_iter, "close", None)
+                        if close is not None:
+                            try:
+                                close()
+                            except Exception as exc:
+                                logger.debug(f"event_iter.close() raised: {exc}")
+                    self._end_runtime_cache_request(cache_manager)
 
         self._register_stop_event(stop_event)
+        waiter_token = _dflash_waiter_enter()
         try:
             future = get_mlx_executor().submit(_run)
         except Exception:
+            waiter_token.leave()
             self._unregister_stop_event(stop_event)
             self._end_activity(activity_id)
             raise
         # Use the executor future: asyncio cancellation can precede worker exit.
         future.add_done_callback(lambda _: self._unregister_stop_event(stop_event))
-        future = asyncio.wrap_future(future)
         try:
             try:
-                (
-                    summary,
-                    generated,
-                    parser_session,
-                    parser_final,
-                    parsed_visible_parts,
-                    prefix_flow,
-                    first_token_at,
-                    summary_finish,
-                ) = await asyncio.shield(asyncio.wrap_future(future))
+                while True:
+                    result = await asyncio.shield(asyncio.wrap_future(future))
+                    if (
+                        isinstance(result, tuple)
+                        and len(result) == 2
+                        and result[0] == "__DFLASH_PARKED__"
+                    ):
+                        # Parked for executor fairness: requeue behind the
+                        # waiter(s) this job yielded to, then await again.
+                        self._register_stop_event(stop_event)
+                        try:
+                            future = get_mlx_executor().submit(_run, result[1])
+                        except Exception:
+                            # Executor shutdown between parks: the done
+                            # callback that would unregister never attaches,
+                            # so release here or the leaked registration
+                            # blocks idle-unload/eviction forever.
+                            self._unregister_stop_event(stop_event)
+                            raise
+                        future.add_done_callback(
+                            lambda _: self._unregister_stop_event(stop_event)
+                        )
+                        continue
+                    (
+                        summary,
+                        generated,
+                        parser_session,
+                        parser_final,
+                        parsed_visible_parts,
+                        prefix_flow,
+                        first_token_at,
+                        summary_finish,
+                    ) = result
+                    break
             except asyncio.CancelledError:
                 stop_event.set()
                 logger.info("DFlash generate cancelled, waiting for executor to drain")
@@ -1917,6 +2105,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     pass
                 raise
         finally:
+            waiter_token.leave()
             self._end_activity(activity_id)
 
         if stop_event.is_set():
@@ -2063,29 +2252,63 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Models card reads this activity instead of a scheduler snapshot.
         activity_id = self._begin_activity("generate", detail="generating")
         self._register_stop_event(stop_event)
+        waiter_token = _dflash_waiter_enter()
+        _job_args = (
+            self._run_generate_streaming,
+            prompt_tokens,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            int(repetition_context_size),
+            seed,
+            tools,
+            queue,
+            loop,
+            stop_event,
+        )
+        latest = {"future": None}
+
+        def _on_executor_done(fut) -> None:
+            self._unregister_stop_event(stop_event)
+            try:
+                result = fut.result()
+            except BaseException:
+                return  # failures already reached the consumer via the queue
+            if isinstance(result, dict):
+                # Parked for executor fairness: requeue at the FIFO tail so
+                # the waiter(s) this job yielded to run first. Callback
+                # chaining keeps this flat across arbitrarily many parks.
+                try:
+                    self._register_stop_event(stop_event)
+                    resumed = get_mlx_executor().submit(
+                        *_job_args, waiter_token, result
+                    )
+                except Exception as e:
+                    # A parked job emits no sentinel of its own, so when the
+                    # executor refuses the resubmit (e.g. shutdown between
+                    # parks) unblock the consumer here or it waits on
+                    # queue.get() forever.
+                    self._unregister_stop_event(stop_event)
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(("", [], True, {"error": str(e)})), loop
+                    )
+                    return
+                latest["future"] = resumed
+                resumed.add_done_callback(_on_executor_done)
+
         try:
-            future = get_mlx_executor().submit(
-                self._run_generate_streaming,
-                prompt_tokens,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                min_p,
-                repetition_penalty,
-                int(repetition_context_size),
-                seed,
-                tools,
-                queue,
-                loop,
-                stop_event,
-            )
+            future = get_mlx_executor().submit(*_job_args, waiter_token, None)
         except Exception:
+            waiter_token.leave()
             self._unregister_stop_event(stop_event)
             self._end_activity(activity_id)
             raise
+        latest["future"] = future
         # Use the executor future: asyncio cancellation can precede worker exit.
-        future.add_done_callback(lambda _: self._unregister_stop_event(stop_event))
+        future.add_done_callback(_on_executor_done)
         future = asyncio.wrap_future(future)
 
         total_text = ""
@@ -2136,6 +2359,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 if finished:
                     break
         finally:
+            # Idempotent: releases the waiter hold if this request was
+            # cancelled before the executor ever picked it up.
+            waiter_token.leave()
             # End the admin activity before the drain await below: a second
             # cancellation delivered during that await would skip anything
             # placed after it and leak a phantom active count.
@@ -2147,9 +2373,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if not finished_normally:
                 stop_event.set()
                 logger.info("DFlash stream cancelled, waiting for executor to drain")
+            # Benign race: latest["future"] may briefly be the just-completed
+            # pre-park future if the done-callback is mid-resubmit; the
+            # resumed job then sees stop_event set at its first replayed
+            # event and returns well inside the drain timeout.
             try:
                 await asyncio.wait_for(
-                    asyncio.wrap_future(future), timeout=_EXECUTOR_DRAIN_TIMEOUT
+                    asyncio.wrap_future(latest["future"]),
+                    timeout=_EXECUTOR_DRAIN_TIMEOUT,
                 )
             except TimeoutError:
                 logger.warning(
