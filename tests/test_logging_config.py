@@ -27,6 +27,58 @@ class TestApplyLoggerLevels:
         finally:
             logging.getLogger(name).setLevel(before)
 
+    def test_debug_raise_lowers_restrictive_root_handlers(self):
+        """A per-logger DEBUG raise must reach server.log: its file handler
+        carries the server log level, so without lowering it the records
+        would flow to stderr/launchd logs only and vanish from the file
+        ops greps (e.g. only the 1st dflash park at INFO, parking looks
+        broken)."""
+        root = logging.getLogger()
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        root.addHandler(handler)
+        logger = logging.getLogger("omlx.logging.test.dflash")
+        logger.setLevel(logging.INFO)
+        try:
+            apply_logger_levels("omlx.logging.test.dflash=DEBUG")
+            assert handler.level == logging.DEBUG
+        finally:
+            root.removeHandler(handler)
+            logger.setLevel(logging.NOTSET)
+
+    def test_raise_never_lifts_nor_touches_permissive_handlers(self):
+        """Only a more-verbose raise lowers handlers, and only downward: a
+        quieter raise (WARNING on an INFO logger) must not make sinks
+        noisier, and a DEBUG raise must not add filtering to NOTSET
+        (pass-all) handlers."""
+        root = logging.getLogger()
+        info_handler = logging.StreamHandler()
+        info_handler.setLevel(logging.INFO)
+        notset_handler = logging.StreamHandler()
+        notset_handler.setLevel(logging.NOTSET)
+        error_handler = logging.StreamHandler()
+        error_handler.setLevel(logging.ERROR)
+        root.addHandler(info_handler)
+        root.addHandler(notset_handler)
+        root.addHandler(error_handler)
+        quieter = logging.getLogger("omlx.logging.test.quieter")
+        quieter.setLevel(logging.INFO)
+        verbose = logging.getLogger("omlx.logging.test.verbose")
+        verbose.setLevel(logging.INFO)
+        try:
+            apply_logger_levels("omlx.logging.test.quieter=WARNING")
+            assert info_handler.level == logging.INFO
+            assert error_handler.level == logging.ERROR
+            apply_logger_levels("omlx.logging.test.verbose=DEBUG")
+            assert notset_handler.level == logging.NOTSET
+            assert error_handler.level == logging.DEBUG
+        finally:
+            root.removeHandler(info_handler)
+            root.removeHandler(notset_handler)
+            root.removeHandler(error_handler)
+            quieter.setLevel(logging.NOTSET)
+            verbose.setLevel(logging.NOTSET)
+
 
 class TestAdminStatsAccessFilter:
     """Tests for the admin polling access log filter."""

@@ -200,7 +200,21 @@ def apply_logger_levels(spec: str) -> list[str]:
         levelno = logging.getLevelName(level_name)
         if not name or not isinstance(levelno, int):
             continue
-        logging.getLogger(name).setLevel(levelno)
+        logger = logging.getLogger(name)
+        before = logger.getEffectiveLevel()
+        logger.setLevel(levelno)
+        # Only when the knob makes the logger MORE verbose: those records
+        # must reach the configured sinks, and server.log's file handler
+        # carries the server log level — without this, a DEBUG raise would
+        # flow to stderr/launchd logs but vanish from the file ops greps
+        # (e.g. only the 1st dflash park at INFO, parking looks broken).
+        # Lower any root handler still filtering above the new level; never
+        # raise one, leave NOTSET handlers alone (they pass everything), and
+        # touch nothing on a quieter raise (that must not make sinks noisier).
+        if before > levelno:
+            for handler in logging.getLogger().handlers:
+                if handler.level > levelno:
+                    handler.setLevel(levelno)
         applied.append(f"{name}={level_name}")
     return applied
 
