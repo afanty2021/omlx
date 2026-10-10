@@ -3095,3 +3095,161 @@ async def test_cancel_dropping_parked_sentinel_still_cleans_up(
         fake_waiter.leave()
         racing.shutdown()
     assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    ["drain-timeout", "second-cancel", "queued-resubmit"],
+)
+async def test_drain_cannot_cancel_queued_cleanup_run(
+    monkeypatch, caplog, scenario
+):
+    """The post-cancel drain must not cancel a state-carrying run still
+    queued on the busy executor (regression: the drain's wait_for, on
+    timeout or on a second cancel, cancels its asyncio wrapper;
+    wrap_future's chaining then cancels the underlying concurrent future —
+    a queued work item dies before starting, its finally never runs, and
+    the same L2 end_request leak the cancel-race fix closed comes straight
+    back).
+
+    Three shapes, one gate: the single-worker executor is held by a gated
+    blocker. drain-timeout: the sentinel is dropped by the cancel race,
+    the handler's cleanup resubmit queues, and the 0.2s drain times out.
+    second-cancel: same, but a second task cancel lands 50ms into the
+    (real-timeout) drain. queued-resubmit: the sentinel is delivered
+    normally, the park resubmit queues behind the blocker, and the single
+    cancel's drain times out — pre-existing shape, not just the cleanup
+    resubmit. In all three, releasing the gate lets the queued run
+    execute: end_request must fire exactly once.
+    """
+    import concurrent.futures
+    import logging
+    import threading
+    import time
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import (
+        DFlashEngine,
+        _dflash_waiter_count,
+        _dflash_waiter_enter,
+    )
+
+    assert _dflash_waiter_count() == 0
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    if scenario != "second-cancel":
+        monkeypatch.setattr("omlx.engine.dflash._EXECUTOR_DRAIN_TIMEOUT", 0.2)
+    caplog.set_level(logging.DEBUG, logger="omlx.engine.dflash")
+
+    class FakeCacheManager:
+        def __init__(self):
+            self.end_request_calls = 0
+
+        def begin_request(self):
+            pass
+
+        def end_request(self):
+            self.end_request_calls += 1
+
+    cache_manager = FakeCacheManager()
+
+    def summary():
+        return SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=1,
+            generated_token_ids=(42, 42),
+            generation_tokens=2,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+
+    def events():
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield summary()
+
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+    engine._begin_runtime_cache_request = lambda: cache_manager
+    engine._stream_dflash_events = lambda **kwargs: (events(), None, set())
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *a, **kw: None
+    )
+
+    gate = threading.Event()
+    inner = ThreadPoolExecutor(max_workers=1)
+    # Occupy the single worker: any state-carrying resubmit queues behind it.
+    inner.submit(lambda: gate.wait(20))
+
+    class RacingExecutor:
+        """First submit runs inline; in the race scenarios it also arms
+        cancel-before-delivery (see the sentinel-drop test). Later submits
+        queue on the gated executor."""
+
+        def __init__(self, loop, arm_cancel):
+            self._loop = loop
+            self._arm_cancel = arm_cancel
+            self.submit_count = 0
+
+        def submit(self, fn, *args, **kwargs):
+            self.submit_count += 1
+            if self.submit_count > 1:
+                return inner.submit(fn, *args, **kwargs)
+            fut = concurrent.futures.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as exc:
+                fut.set_exception(exc)
+            if self._arm_cancel:
+                task = asyncio.current_task(self._loop)
+                if task is not None:
+                    self._loop.call_soon(task.cancel)
+            return fut
+
+    racing = RacingExecutor(
+        asyncio.get_running_loop(), arm_cancel=scenario != "queued-resubmit"
+    )
+    fake_waiter = _dflash_waiter_enter()
+    task = None
+    try:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: racing)
+        task = asyncio.create_task(engine.generate([1]))
+        if scenario == "queued-resubmit":
+            # The sentinel was delivered normally; wait until the while
+            # loop's park resubmit is queued behind the gated blocker.
+            deadline = time.monotonic() + 5
+            while racing.submit_count < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert racing.submit_count >= 2, "park resubmit never queued"
+        elif scenario == "second-cancel":
+            asyncio.get_running_loop().call_later(0.05, task.cancel)
+        async with asyncio.timeout(10):
+            if scenario == "queued-resubmit":
+                task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        if scenario != "second-cancel":
+            assert "did not exit within" in caplog.text
+
+        # The state-carrying run is still queued behind the gate; let it run.
+        gate.set()
+        deadline = time.monotonic() + 2.0
+        while cache_manager.end_request_calls < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert cache_manager.end_request_calls == 1, (
+            "drain cancelled the queued state-carrying run: "
+            "end_request never ran"
+        )
+        assert not engine._active_stop_events
+    finally:
+        gate.set()
+        if task is not None and not task.done():
+            task.cancel()
+        fake_waiter.leave()
+        inner.shutdown(wait=True)
+    assert _dflash_waiter_count() == 0

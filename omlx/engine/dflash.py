@@ -2157,6 +2157,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         self._register_stop_event(stop_event)
         waiter_token = _dflash_waiter_enter()
+        # Whether the current `future` was submitted WITH parked state. Such
+        # a run owns event_iter + the runtime cache request until it executes
+        # (its finally is the only end_request), so the cancel-path drain
+        # must shield it from the wait_for cancellation cascade. A fresh
+        # first submit holds nothing until it starts, so cancelling it while
+        # queued stays clean — and keeps the stop-event registration (and
+        # idle-unload) from lingering behind a busy executor.
+        future_carries_state = False
         try:
             future = get_mlx_executor().submit(_run)
         except Exception:
@@ -2181,6 +2189,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         waiter_token = _dflash_waiter_enter()
                         try:
                             future = get_mlx_executor().submit(_run, result[1])
+                            future_carries_state = True
                         except Exception:
                             waiter_token.leave()
                             # Executor shutdown between parks: the done
@@ -2224,6 +2233,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     self._register_stop_event(stop_event)
                     try:
                         future = get_mlx_executor().submit(_run, parked_state)
+                        future_carries_state = True
                     except Exception:
                         # Executor refuses even the cleanup run (shutdown):
                         # inline the cleanup the run would have done.
@@ -2235,8 +2245,24 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         )
                 logger.info("DFlash generate cancelled, waiting for executor to drain")
                 try:
+                    # A state-carrying run must survive this drain: wait_for
+                    # cancels its wrapper on timeout or on a second cancel,
+                    # and wrap_future's chaining propagates that onto the
+                    # concurrent future — a run still QUEUED on the busy
+                    # single-worker executor (the job this one yielded to is
+                    # often a multi-minute prefill) would die before starting
+                    # and leak the same end_request this handler exists to
+                    # run. The shield keeps it alive; it executes whenever
+                    # the executor frees. Never abandon-inline on timeout
+                    # instead: the run may still execute later, which would
+                    # double end_request. Fresh (stateless) futures drain
+                    # unshielded so a queued-then-cancelled request still
+                    # unregisters promptly.
+                    drain_future = asyncio.wrap_future(future)
+                    if future_carries_state:
+                        drain_future = asyncio.shield(drain_future)
                     await asyncio.wait_for(
-                        asyncio.wrap_future(future), timeout=_EXECUTOR_DRAIN_TIMEOUT
+                        drain_future, timeout=_EXECUTOR_DRAIN_TIMEOUT
                     )
                 except TimeoutError:
                     logger.warning(
@@ -2411,7 +2437,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             loop,
             stop_event,
         )
-        latest = {"future": None}
+        latest = {"future": None, "carries_state": False}
 
         def _on_executor_done(fut) -> None:
             self._unregister_stop_event(stop_event)
@@ -2449,6 +2475,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         queue.put(("", [], True, {"error": str(e)})), loop
                     )
                     return
+                # Flag before the future ref: whenever the consumer's drain
+                # sees the new (state-carrying) future, the flag is already
+                # set, so the drain shields it from the cancellation cascade.
+                latest["carries_state"] = True
                 latest["future"] = resumed
                 latest["token"] = waiter_token
                 resumed.add_done_callback(_on_executor_done)
@@ -2535,8 +2565,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # resumed job then sees stop_event set at its first replayed
             # event and returns well inside the drain timeout.
             try:
+                # Same conditional shield as the non-streaming drain: a run
+                # submitted WITH parked state must not be cancelled out of
+                # the queue by this drain's wait_for cascade — its finally is
+                # the only thing that ends this request's cache hold. Fresh
+                # (stateless) futures drain unshielded so a queued-then-
+                # cancelled request unregisters promptly.
+                drain_future = asyncio.wrap_future(latest["future"])
+                if latest.get("carries_state"):
+                    drain_future = asyncio.shield(drain_future)
                 await asyncio.wait_for(
-                    asyncio.wrap_future(latest["future"]),
+                    drain_future,
                     timeout=_EXECUTOR_DRAIN_TIMEOUT,
                 )
             except TimeoutError:
