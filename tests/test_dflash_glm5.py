@@ -1003,6 +1003,44 @@ def test_glm_adapter_prefill_chunk_follows_scheduler_floor(monkeypatch):
     assert _adapter_prefill_chunk(glm, 2048) == 2048
 
 
+def test_prefill_guard_step_follows_engine_resolved_chunk(monkeypatch):
+    """The prefill guard charges the chunk the engine actually prefills at.
+
+    Regression: the guard was built from SchedulerConfig.prefill_step_size
+    (default 2048 — a different knob) while dflash chunks cold prefill at
+    the runtime's resolved prefill_step_size (dflash_prefill_step_size
+    setting, else the dflash default). At a 1024 setting the guard
+    over-rejected ~2x under memory pressure; above 2048 it under-protected
+    the OOM guard the engine relies on.
+    """
+    import types
+
+    import omlx.engine.dflash as dflash_engine
+    from omlx.engine.dflash import _prefill_guard_step
+
+    def ctx(step):
+        return types.SimpleNamespace(
+            runtime=types.SimpleNamespace(prefill_step_size=step)
+        )
+
+    # Runtime-chunked targets (adapter has no prefill_chunk_size): charge
+    # the resolved knob value as-is, whatever it is.
+    assert _prefill_guard_step(ctx(2048), types.SimpleNamespace()) == 2048
+    assert _prefill_guard_step(ctx(1024), types.SimpleNamespace()) == 1024
+    assert _prefill_guard_step(ctx(4096), types.SimpleNamespace()) == 4096
+
+    # Adapter-chunked targets: charge the floor-raised chunk the adapter
+    # actually runs, not the raw runtime value.
+    glm = types.SimpleNamespace(backend_name="glm5_next", prefill_chunk_size=0)
+    monkeypatch.setattr(dflash_engine, "_glm5_next_prefill_floor", lambda: 4096)
+    assert _prefill_guard_step(ctx(2048), glm) == 4096
+    assert _prefill_guard_step(ctx(8192), glm) == 8192
+
+    # Unreadable resolved chunk: 0 so the caller falls back to the
+    # scheduler-configured step.
+    assert _prefill_guard_step(ctx(None), types.SimpleNamespace()) == 0
+
+
 @pytest.mark.parametrize(
     "native,memory_gb,nax,nax_mla,expected",
     [

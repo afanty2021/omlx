@@ -396,6 +396,24 @@ def _parked_state_of(future) -> "dict | None":
     return result[1] if _is_parked_result(result) else None
 
 
+def _prefill_guard_step(runtime_context: Any, target_ops: Any) -> int:
+    """Chunk width the DFlash prefill guard must charge.
+
+    The same chunk the engine will actually prefill at: the dflash runtime's
+    resolved ``prefill_step_size`` (the ``dflash_prefill_step_size`` knob,
+    else the dflash default 2048), raised to the adapter floor when the
+    adapter owns chunking (glm5_next). ``SchedulerConfig.prefill_step_size``
+    is a different knob: charging it made the guard over-reject when the
+    dflash step is smaller (false 400s under memory pressure) and
+    under-protect the OOM guard when it is larger. Returns 0 when the
+    resolved chunk is unreadable.
+    """
+    step = int(getattr(runtime_context.runtime, "prefill_step_size", 0) or 0)
+    if hasattr(target_ops, "prefill_chunk_size"):
+        step = _adapter_prefill_chunk(target_ops, step)
+    return max(0, step)
+
+
 class _DFlashPrefillGuard:
     """Prefill-memory guard target for DFlash's primary (speculative) path,
     which bypasses the Scheduler entirely.
@@ -1089,9 +1107,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     max_kv_cache_memory=None, eviction_enabled=False
                 )
                 set_model_info_from_model(monitor, self._target_model)
-                step = (
-                    getattr(self._scheduler_config, "prefill_step_size", 2048) or 2048
-                )
+                # Charge the chunk width the engine actually prefills at
+                # (see _prefill_guard_step); SchedulerConfig.prefill_step_size
+                # is a different knob and diverges from the dflash setting.
+                step = _prefill_guard_step(runtime_context, self._target_ops)
+                if step <= 0:
+                    step = (
+                        getattr(self._scheduler_config, "prefill_step_size", 2048)
+                        or 2048
+                    )
                 self._prefill_guard = _DFlashPrefillGuard(monitor, step)
             except Exception as exc:
                 # Warn (not debug): a missing guard silently disables the
