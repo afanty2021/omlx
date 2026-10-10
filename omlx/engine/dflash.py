@@ -284,11 +284,16 @@ _dflash_waiter_count_v = 0
 class _DFlashWaiterToken:
     """One queued dflash request's hold on the global waiter count.
 
-    leave() is idempotent: the executor job releases the hold when it starts
-    running, and the submitter's finally releases it if the request was
-    cancelled before the executor ever picked it up (queued futures can be
-    cancelled, so the job-side release alone would leak a permanent phantom
-    waiter and park every later generation forever).
+    Authoritative lifecycle (the fairness invariant, consolidated): a token
+    is entered at the initial submit AND re-entered at every park resubmit --
+    a job requeued at the FIFO tail must stay visible as a waiter, or the
+    job it yielded to (often itself a multi-minute fresh prefill) sees
+    waiter_count()==0 and never yields back. The executor job releases the
+    hold when it (re)starts running; the submitter's finally releases it on
+    cancel/complete. leave() is idempotent so the job-side release and the
+    submitter-side release cannot double-decrement, and a cancel between
+    resubmit and restart (queued futures can be cancelled) cannot leak a
+    permanent phantom waiter that would park every later generation forever.
     """
 
     __slots__ = ("_released",)
@@ -364,6 +369,31 @@ def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
     if getattr(target_ops, "backend_name", "") == "glm5_next":
         step = max(step, _glm5_next_prefill_floor())
     return step
+
+
+def _is_parked_result(result: Any) -> bool:
+    """Whether an executor result is the non-streaming park sentinel."""
+    return (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and result[0] == "__DFLASH_PARKED__"
+    )
+
+
+def _parked_state_of(future) -> "dict | None":
+    """The parked state a completed executor future carries, if any.
+
+    asyncio drops an already-delivered future result when Task.cancel()
+    lands between the future resolving and the task resuming, so the
+    sentinel can be sitting in a future the awaiting task never saw.
+    """
+    if not future.done():
+        return None
+    try:
+        result = future.result()
+    except BaseException:
+        return None
+    return result[1] if _is_parked_result(result) else None
 
 
 class _DFlashPrefillGuard:
@@ -1135,6 +1165,28 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             end()
         except Exception as exc:
             logger.debug(f"dflash cache end_request failed: {exc}")
+
+    def _abandon_parked_state(self, state: dict) -> None:
+        """Inline the cleanup a parked run's finally would have run.
+
+        Only for paths where the resubmit that would own the parked state
+        cannot happen: the executor refuses it (shutdown between parks) or
+        a cancellation dropped the park sentinel before the awaiting task
+        saw it. Without this the runtime cache request is never ended, so
+        dflash-mlx's L2 _active_requests stays >0 and the write gate stays
+        closed (writer thread spinning) until engine unload. Order mirrors
+        the not-parked finally in _run/_run_generate_streaming.
+        """
+        self._record_prefill_guard_active_memory()
+        event_iter = state.get("event_iter")
+        if event_iter is not None:
+            close = getattr(event_iter, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as exc:
+                    logger.debug(f"event_iter.close() raised: {exc}")
+        self._end_runtime_cache_request(state.get("cache_manager"))
 
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
@@ -2094,11 +2146,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             try:
                 while True:
                     result = await asyncio.shield(asyncio.wrap_future(future))
-                    if (
-                        isinstance(result, tuple)
-                        and len(result) == 2
-                        and result[0] == "__DFLASH_PARKED__"
-                    ):
+                    if _is_parked_result(result):
                         # Parked for executor fairness: requeue behind the
                         # waiter(s) this job yielded to, then await again.
                         self._register_stop_event(stop_event)
@@ -2114,8 +2162,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                             # Executor shutdown between parks: the done
                             # callback that would unregister never attaches,
                             # so release here or the leaked registration
-                            # blocks idle-unload/eviction forever.
+                            # blocks idle-unload/eviction forever. The parked
+                            # state is equally unowned -- its cleanup cannot
+                            # run either, so abandon it inline.
                             self._unregister_stop_event(stop_event)
+                            self._abandon_parked_state(result[1])
                             raise
                         future.add_done_callback(
                             lambda _: self._unregister_stop_event(stop_event)
@@ -2134,6 +2185,30 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     break
             except asyncio.CancelledError:
                 stop_event.set()
+                # The cancel can beat this task's resumption after the
+                # executor future already resolved with a park sentinel --
+                # asyncio then drops the delivered result, and the sentinel's
+                # state (event_iter, cache_manager) is orphaned: nobody
+                # resubmits, so _run's not-parked finally never runs and the
+                # runtime cache request (L2 write gate) leaks until unload.
+                # Resubmit that state once; stop_event is already set, so the
+                # run exits at its first event-boundary check and the normal
+                # cleanup path executes. No waiter re-enter here -- the job
+                # is being abandoned, not requeued.
+                parked_state = _parked_state_of(future)
+                if parked_state is not None:
+                    self._register_stop_event(stop_event)
+                    try:
+                        future = get_mlx_executor().submit(_run, parked_state)
+                    except Exception:
+                        # Executor refuses even the cleanup run (shutdown):
+                        # inline the cleanup the run would have done.
+                        self._unregister_stop_event(stop_event)
+                        self._abandon_parked_state(parked_state)
+                    else:
+                        future.add_done_callback(
+                            lambda _: self._unregister_stop_event(stop_event)
+                        )
                 logger.info("DFlash generate cancelled, waiting for executor to drain")
                 try:
                     await asyncio.wait_for(
@@ -2341,8 +2416,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     # A parked job emits no sentinel of its own, so when the
                     # executor refuses the resubmit (e.g. shutdown between
                     # parks) unblock the consumer here or it waits on
-                    # queue.get() forever.
+                    # queue.get() forever. The parked state is unowned now --
+                    # its runtime cache request would leak with the consumer
+                    # gone, so abandon it inline before reporting.
                     self._unregister_stop_event(stop_event)
+                    self._abandon_parked_state(result)
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, {"error": str(e)})), loop
                     )

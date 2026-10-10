@@ -2941,3 +2941,157 @@ async def test_cancel_while_parked_and_requeued_releases_fresh_token(
                 with contextlib.suppress(BaseException):
                     await task
     assert _dflash_waiter_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cancel_dropping_parked_sentinel_still_cleans_up(
+    monkeypatch, caplog, streaming
+):
+    """A cancel that beats the task's resumption after the executor future
+    resolved with a park sentinel must not orphan the parked state.
+
+    Regression (non-streaming variant, red before the fix): asyncio drops an
+    already-delivered result when Task.cancel() lands between the future
+    resolving and the task resuming. The sentinel tuple -- the only holder of
+    event_iter and the runtime cache manager -- vanished, nobody resubmitted,
+    and _run's not-parked finally never ran: end_request() was never called,
+    so dflash-mlx's L2 _active_requests stayed >0 and the write gate stayed
+    closed (writer thread spinning) until engine unload. The streaming
+    transport is immune by construction -- its resubmit lives in the
+    executor-side done callback -- and this test pins that immunity too.
+
+    Deterministic recipe: the first submit runs _run inline on the loop
+    thread, returns an already-resolved sentinel future, and schedules
+    task.cancel() via loop.call_soon at submit time. The cancel callback is
+    queued before wrap_future's chain, so it always wins the delivery race
+    with zero timing dependence.
+    """
+    import concurrent.futures
+    import logging
+
+    from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+
+    from omlx.engine.dflash import (
+        DFlashEngine,
+        _dflash_waiter_count,
+        _dflash_waiter_enter,
+    )
+
+    assert _dflash_waiter_count() == 0
+    monkeypatch.setattr("omlx.engine.dflash._DFLASH_PARK_INTERVAL_S", 0)
+    caplog.set_level(logging.DEBUG, logger="omlx.engine.dflash")
+
+    class FakeCacheManager:
+        def __init__(self):
+            self.end_request_calls = 0
+
+        def begin_request(self):
+            pass
+
+        def end_request(self):
+            self.end_request_calls += 1
+
+    class TrackingIter:
+        """Event iterator that records close(), mirroring a dflash generator."""
+
+        def __init__(self, events):
+            self._events = events
+            self.closed = False
+
+        def __iter__(self):
+            return self._events
+
+        def close(self):
+            self.closed = True
+            close = getattr(self._events, "close", None)
+            if close is not None:
+                close()
+
+    cache_manager = FakeCacheManager()
+
+    def summary():
+        return SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=1,
+            generated_token_ids=(42, 42),
+            generation_tokens=2,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+
+    def events():
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield TokenEvent(42, 1, 1.0, 1)
+        yield summary()
+
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+    engine._begin_runtime_cache_request = lambda: cache_manager
+    engine._stream_dflash_events = lambda **kwargs: (
+        TrackingIter(events()),
+        None,
+        set(),
+    )
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *a, **kw: None
+    )
+
+    class RacingExecutor:
+        """First submit: run inline, arm cancel-before-delivery; then pass
+        through to a real executor so the cleanup resubmit takes the
+        production path (queued worker thread, drain await)."""
+
+        def __init__(self, loop):
+            self._loop = loop
+            self._inner = ThreadPoolExecutor(max_workers=1)
+            self._armed = False
+
+        def submit(self, fn, *args, **kwargs):
+            if self._armed:
+                return self._inner.submit(fn, *args, **kwargs)
+            self._armed = True
+            fut = concurrent.futures.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as exc:
+                fut.set_exception(exc)
+            task = asyncio.current_task(self._loop)
+            if task is not None:
+                self._loop.call_soon(task.cancel)
+            return fut
+
+        def shutdown(self):
+            self._inner.shutdown(wait=True)
+
+    racing = RacingExecutor(asyncio.get_running_loop())
+    fake_waiter = _dflash_waiter_enter()
+    try:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: racing)
+
+        async def consume():
+            if streaming:
+                outputs = [o async for o in engine.stream_generate([1])]
+                return outputs[-1]
+            return await engine.generate([1])
+
+        task = asyncio.create_task(consume())
+        async with asyncio.timeout(10):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert "DFlash parked" in caplog.text
+        # The sentinel was delivered-then-dropped (cancel won the race);
+        # the parked state must still have been cleaned up exactly once.
+        assert cache_manager.end_request_calls == 1, (
+            "parked state orphaned by the cancel race: end_request never ran"
+        )
+        assert not engine._active_stop_events
+    finally:
+        fake_waiter.leave()
+        racing.shutdown()
+    assert _dflash_waiter_count() == 0
