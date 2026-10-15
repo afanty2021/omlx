@@ -75,7 +75,6 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_window_size",
     "dflash_block_size",
     "dflash_verify_mode",
-    "dflash_prefill_step_size",
     "mtp_enabled",
     "mtp_adaptive_max_depth",
     "mtp_fixed_depth",
