@@ -203,6 +203,57 @@ class TestGenerateModelCard:
             "embedding table, or"
         ) in card
 
+    def test_v41_fp8_engram_tables_keep_source_storage(self, tmp_path):
+        engram = "language_model.layers.1.engram.embed"
+        rows, width = 32, 256
+        tensors = {
+            f"{engram}.weight": ("F8_E4M3", [rows, width], rows * width),
+            f"{engram}.scales": ("F8_E8M0", [rows, width // 32], rows * width // 32),
+            "language_model.norm.weight": ("BF16", [width], 2 * width),
+        }
+        header, offset = {}, 0
+        for key, (dtype, shape, size) in tensors.items():
+            header[key] = {
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + size],
+            }
+            offset += size
+        encoded = json.dumps(header).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        (tmp_path / "model.safetensors").write_bytes(
+            struct.pack("<Q", len(encoded)) + encoded + bytes(offset)
+        )
+        config = {
+            "model_type": "deepseek_v41",
+            "omlx_deepseek_v41": {
+                "quantized_modules": {},
+                "engram_tables": {
+                    engram: {
+                        "weight_key": f"{engram}.weight",
+                        "scale_key": f"{engram}.scales",
+                        "group_size": 32,
+                        "mode": "mxfp8",
+                    }
+                },
+            },
+        }
+
+        card = _generate_model_card(
+            "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp", tmp_path, config
+        )
+
+        lines = card.splitlines()
+        assert lines[lines.index("# DeepSeek-V4.1-Flash-oQ4e-ngram-mtp") + 2] == (
+            "N-gram (Engram) tables are kept at the original FP8 precision."
+        )
+        rows_by_label = {line.split(" | ")[0]: line for line in lines}
+        # One E4M3 byte per weight plus one E8M0 byte per 32 weights.
+        assert rows_by_label["| Engram MXFP8, group 32"] == (
+            "| Engram MXFP8, group 32 | 0.000B | 96.970% | 0.000 GiB | 8.25 |"
+        )
+        assert "excluding the Engram tables" in card
+
 
 # =============================================================================
 # UploadTask Tests

@@ -648,6 +648,20 @@ class TestResolveOutputName:
             == "Qwen3.5-122B-A10B-oQ4e"
         )
 
+    def test_ngram_suffix_precedes_mtp_and_is_stripped(self):
+        name = resolve_output_name(
+            "DeepSeek-V4.1-Flash-1017",
+            4,
+            enhanced=True,
+            preserve_mtp=True,
+            preserve_ngram_table=True,
+        )
+        assert name == "DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp"
+        assert (
+            resolve_output_name(name, 2, enhanced=True, preserve_mtp=True)
+            == "DeepSeek-V4.1-Flash-1017-oQ2e-mtp"
+        )
+
     def test_all_levels(self):
         for level in OQ_LEVELS:
             result = resolve_output_name("Model-7B", level)

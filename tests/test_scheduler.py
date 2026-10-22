@@ -860,7 +860,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
 
     def test_add_request_hot_cache_only_ignores_pressure_bypass(
@@ -898,7 +899,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
         scheduler._current_usage_bytes.assert_not_called()
 
@@ -1635,6 +1637,36 @@ class TestSchedulerAbortRequest:
         scheduler._ensure_batch_generator = MagicMock()
         scheduled, _ = scheduler._schedule_waiting()
         assert scheduled == [request]
+
+    def test_specprefill_deferred_while_plain_request_decoding(
+        self, mock_model, mock_tokenizer
+    ):
+        """The model-wide offset RoPE must not reach live decode rows."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        plain = Request(
+            request_id="plain",
+            prompt="Hi",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running["plain"] = plain
+        scheduler.requests["plain"] = plain
+
+        spec = Request(
+            request_id="sp",
+            prompt="Long prompt",
+            sampling_params=SamplingParams(),
+        )
+        spec.specprefill_indices = [0, 1, 2]
+        scheduler.requests["sp"] = spec
+        scheduler.waiting.append(spec)
+
+        scheduled, _ = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert list(scheduler.waiting) == [spec]
 
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting a non-existent request is silently ignored."""
@@ -4393,7 +4425,7 @@ class TestSchedulerArraysCacheBlockAlignment:
     """ArraysCache boundaries must match the effective prefill chunk."""
 
     @pytest.mark.parametrize("nested", [False, True])
-    def test_deepseek_v41_subclass_uses_2048_boundaries(
+    def test_deepseek_v41_subclass_uses_8192_boundaries(
         self, mock_tokenizer, tmp_path, nested
     ):
         model = self._hybrid_model(model_type="deepseek_v41")
@@ -4413,9 +4445,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         )
         try:
             assert scheduler._model_has_arrays_cache()
-            assert scheduler._qwen35_prefill_floor == 0
-            assert scheduler.config.paged_cache_block_size == 2048
-            assert scheduler._prefill_step_size_for_progress(0, 9216) == 2048
+            assert scheduler._qwen35_prefill_floor == 8192
+            assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._prefill_step_size_for_progress(0, 9216) == 8192
         finally:
             scheduler.shutdown()
 

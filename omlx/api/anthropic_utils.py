@@ -711,6 +711,19 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
     return ""
 
 
+_AUTO_MODE_CLASSIFIER_MARKER = (
+    "you are a security monitor for autonomous ai coding agents"
+)
+
+
+def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
+    """Match Claude Code's auto-mode safety classifier request."""
+    if request.stream or request.tools or not request.system:
+        return False
+    system_text = _extract_system_text(request.system).lower()
+    return _AUTO_MODE_CLASSIFIER_MARKER in system_text
+
+
 def _normalize_in_messages_system(
     request: MessagesRequest,
     *,

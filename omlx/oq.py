@@ -1519,13 +1519,15 @@ def resolve_output_name(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     enhanced: bool = False,
+    preserve_ngram_table: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
     Appends `-fp16` suffix when dtype is float16. bfloat16 is the default and
     produces no dtype suffix (backwards compatible). When preserve_mtp is True,
     appends `-mtp` so the resulting name reflects that mtp.* tensors and
-    config fields were preserved through quantization.
+    config fields were preserved through quantization. `-ngram` marks N-gram
+    lookup tables kept at source precision.
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
@@ -1533,9 +1535,11 @@ def resolve_output_name(
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
+        "DeepSeek-V4.1-Flash" + 4 + enhanced + preserve_ngram_table
+            + preserve_mtp -> "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1548,6 +1552,8 @@ def resolve_output_name(
     suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
     if dtype == "float16":
         suffix += "-fp16"
+    if preserve_ngram_table:
+        suffix += "-ngram"
     if preserve_mtp:
         suffix += "-mtp"
     return f"{base}{suffix}"
@@ -3510,6 +3516,7 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    preserve_ngram_table: bool = False,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3521,6 +3528,8 @@ def estimate_bpw_and_size(
         preserve_mtp: When True, mtp.* tensors are kept (counted toward
             output size) instead of being skipped. Mirrors the matching
             argument in ``quantize_oq_streaming``.
+        preserve_ngram_table: Price DeepSeek V4.1 Engram tables at their
+            source bytes, as ``quantize_oq_streaming`` stores them.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
 
@@ -3560,7 +3569,7 @@ def estimate_bpw_and_size(
             config,
             mapping,
             preserve_mtp=preserve_mtp,
-            engram_bits=_offload_table_bits(oq_level),
+            engram_bits=None if preserve_ngram_table else _offload_table_bits(oq_level),
         )
         remaining = budget["remaining_weights"]
         # Allocations below oQ4 are not known until calibration. Quote their
@@ -6446,7 +6455,9 @@ def quantize_oq_streaming(
             table can then be quantized separately (its measured
             sensitivity is far below the core's), and a passthrough leaves
             no per-layer quantization entry so loaders treat the shards as
-            plain weights. No effect on other model types.
+            plain weights. DeepSeek V4.1 keeps its Engram tables in the
+            official FP8 storage instead of 4-bit affine. No effect on other
+            model types.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -6515,6 +6526,7 @@ def quantize_oq_streaming(
             text_only=text_only,
             dtype=dtype,
             progress_callback=progress_callback,
+            preserve_ngram_table=preserve_ngram_table,
         )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES

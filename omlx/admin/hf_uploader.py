@@ -134,6 +134,11 @@ def _quantization_specs(config: dict) -> tuple[dict, dict]:
     return default, {k: v for k, v in quant.items() if isinstance(v, dict)}
 
 
+def _word_bits(weight: dict) -> int:
+    """MLX packs quantized weights into uint32; V4.1 FP8 tables keep raw bytes."""
+    return 32 if weight["dtype"] == "U32" else 8
+
+
 def _storage_format(
     spec: dict, weight: dict, scales: dict, has_biases: bool
 ) -> tuple[str, int]:
@@ -141,9 +146,9 @@ def _storage_format(
     mode = spec.get("mode") or ("affine" if has_biases else None)
     group = spec.get("group_size") or _MX_GROUP_SIZES.get(mode or "")
     group = group or (64 if has_biases else 32)
-    # Each uint32 word packs 32 / bits weights, and each scale covers a group.
+    # Each word packs word_bits / bits weights, and each scale covers a group.
     bits = spec.get("bits") or round(
-        weight["shape"][-1] * 32 / (scales["shape"][-1] * group)
+        weight["shape"][-1] * _word_bits(weight) / (scales["shape"][-1] * group)
     )
     mode = mode or f"mxfp{bits}"
     if mode == "affine":
@@ -197,10 +202,12 @@ def _storage_summary(model_path: Path, config: dict) -> tuple[dict, dict]:
             label, bits = _storage_format(
                 {**default, **modules.get(module, {})}, info, scales, biases is not None
             )
-            weights = math.prod(info["shape"]) * 32 // bits
+            weights = math.prod(info["shape"]) * _word_bits(info) // bits
             stored = info["bytes"] + scales["bytes"] + (biases or {}).get("bytes", 0)
             if component in _LOOKUP_TABLES:
-                label = f"{component.split()[0]} {label[0].lower()}{label[1:]}"
+                if not label[1].isupper():
+                    label = label[0].lower() + label[1:]
+                label = f"{component.split()[0]} {label}"
         else:
             weights = math.prod(info["shape"])
             stored = info["bytes"]
@@ -235,6 +242,11 @@ def _generate_model_card(
     if redownload_notice:
         today = date.today().isoformat()
         lines += [_REDOWNLOAD_NOTICE.format(date=today, version=__version__), ""]
+    engram = list(
+        ((config.get("omlx_deepseek_v41") or {}).get("engram_tables") or {}).values()
+    )
+    if engram and all(table.get("mode") == "mxfp8" for table in engram):
+        lines += ["N-gram (Engram) tables are kept at the original FP8 precision.", ""]
     lines += [
         "This model was quantized using [oQ](https://github.com/jundot/omlx) "
         f"(oMLX v{__version__}) mixed-precision quantization.",

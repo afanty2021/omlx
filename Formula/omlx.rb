@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.1rc1.tar.gz"
-  sha256 "dc55b7a83054bf0cfc4e635ae1906414c7d1eeb10fec25248abe9000da3c263a"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.2.tar.gz"
+  sha256 "9883becd3d1b42f1e55028a6cb792b9d607a12ef2fa947518c87ee3caef121d6"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -86,13 +86,24 @@ class Omlx < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
-      # `metal` ships with Xcode, not the Command Line Tools.
-      unless quiet_system("/usr/bin/xcrun", "-f", "metal")
+      # Execute the compiler rather than looking for it. `xcrun -f metal` only
+      # asks whether a file named `metal` is on the search path, and since Xcode
+      # 26 that file is a shim that forwards to the separately downloaded Metal
+      # toolchain. The shim is present whether or not the toolchain behind it is
+      # usable, so the lookup succeeds and the build then fails much later with
+      # an opaque CMake error in the metallib targets. Running the compiler is
+      # the only check that agrees with whether the build will work.
+      unless quiet_system("/usr/bin/xcrun", "metal", "--version")
         odie <<~EOS
-          --with-custom-kernel requires the Metal compiler, but `xcrun -f metal` found none.
+          --with-custom-kernel requires the Metal compiler, but `xcrun metal --version` failed.
           It ships with full Xcode, and on current Xcode versions is a separate component:
 
             xcodebuild -downloadComponent MetalToolchain
+
+          If the component is already installed, a stale xcrun lookup cache causes this
+          same failure and is worth clearing first, because it costs nothing:
+
+            rm -f "${TMPDIR:-/tmp}/xcrun_db"
 
           Otherwise install omlx without the custom kernels: brew install omlx
         EOS

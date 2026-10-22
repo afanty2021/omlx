@@ -1052,7 +1052,10 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         return cache_obj.merge([cache_obj])
     if (
         _TQ_SINGLETON_CACHE_TYPE is not None
-        and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+        and (
+            type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+            or type(cache_obj).__name__ in ("Affine4KVCache", "Affine8KVCache")
+        )
     ):
         return cache_obj.merge([cache_obj])
     # Model-owned conversion preserves extra state when a singleton joins a batch.
@@ -1308,6 +1311,10 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         # Both QSA handlers support block slicing, so their growing KV and
@@ -1322,6 +1329,10 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
     {
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
     }
 )
 
@@ -2189,6 +2200,7 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
+        self._turboquant_kv_scheme = "turboquant"
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
@@ -2861,31 +2873,18 @@ class Scheduler:
                 store_tail_terminal = getattr(
                     intermediate_snapshots, "tail_terminal_token_count", None
                 ) == len(token_sequence_to_store)
-                if hot_cache_write_back:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                        _store_tail_terminal=store_tail_terminal,
-                    )
-                else:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                        hot_cache_write_back=False,
-                        _store_tail_terminal=store_tail_terminal,
-                    )
+                block_table = self.block_aware_cache.store_cache(
+                    request_id,
+                    token_sequence_to_store,
+                    cache_to_store,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=intermediate_snapshots,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                    hot_cache_write_back=hot_cache_write_back,
+                    _store_tail_terminal=store_tail_terminal,
+                )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -3205,6 +3204,10 @@ class Scheduler:
                     return 0
             if model_type.startswith("glm5_next"):
                 return _glm5_next_prefill_floor()
+            if model_type == "deepseek_v41":
+                # Top-6-of-384 routing leaves ~32 rows per expert at 2048 tokens;
+                # 8192 fills the gather_qmm tiles better.
+                return 8192
             if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
@@ -3613,7 +3616,12 @@ class Scheduler:
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
         # for the new BatchGenerator API (each stop token is a sequence).
-        stop_tokens_set = self._get_stop_tokens()
+        # ignore_eos (forced-length bench): drop the model's own stop set;
+        # request-level stop_token_ids still apply.
+        stop_tokens_set = (
+            set() if getattr(sampling_params, "ignore_eos", False)
+            else self._get_stop_tokens()
+        )
         if sampling_params.stop_token_ids:
             stop_tokens_set.update(sampling_params.stop_token_ids)
         stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
@@ -3836,7 +3844,11 @@ class Scheduler:
 
         if self._model_uses_mla():
             return False
-        if self._model_uses_attention_sinks():
+        if (
+            getattr(self, "_turboquant_kv_scheme", "turboquant")
+            not in ("affine4", "affine8")
+            and self._model_uses_attention_sinks()
+        ):
             return False
 
         def _ok(c: Any) -> bool:
@@ -3853,6 +3865,10 @@ class Scheduler:
                 "BufferedRotatingKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
+                "Affine4KVCache",
+                "BatchAffine4KVCache",
+                "Affine8KVCache",
+                "BatchAffine8KVCache",
             ):
                 return True
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
@@ -3893,7 +3909,11 @@ class Scheduler:
         last KVCache layer if turboquant_skip_last is set.
         """
         from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        cache_class = quantized_cache_class(scheme)
 
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
@@ -3907,13 +3927,13 @@ class Scheduler:
             if isinstance(cache_obj, (KVCache, _vlm_cache.KVCache)):
                 if i == last_kv_idx:
                     continue
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                prompt_cache[i] = cache_class(bits=bits)
                 converted += 1
             elif isinstance(cache_obj, (CacheList, _vlm_cache.CacheList)):
                 new_caches = []
                 for c in cache_obj.caches:
                     if isinstance(c, (KVCache, _vlm_cache.KVCache)):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        new_caches.append(cache_class(bits=bits))
                         converted += 1
                     else:
                         new_caches.append(c)
@@ -3921,21 +3941,23 @@ class Scheduler:
         if converted > 0:
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
-                f"TurboQuant: {converted}/{len(prompt_cache)} "
+                f"{scheme}: {converted}/{len(prompt_cache)} "
                 f"cache layers set to {bits}-bit{skip_msg}"
             )
 
     def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
+        """Convert native full-attention caches to the selected packed format.
 
-        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
-        cache): the completed full-precision KV is quantized once, so prefill
-        hidden states stay exact and quantization error only enters at
-        decode-time reads. This is the key difference from #717/#771, which
-        quantized on the fly during prefill and corrupted hidden states.
+        TurboQuant converts after cold prefill to preserve its hidden states.
+        Affine formats also convert at prefill entry so subsequent updates
+        retain compressed history throughout the request.
         """
         from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        cache_class = quantized_cache_class(scheme)
 
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
@@ -3956,13 +3978,13 @@ class Scheduler:
                     continue
                 if i == last_kv_idx:
                     continue
-                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
+                prompt_cache[i] = cache_class.from_cache(cache_obj, bits=bits)
                 converted += 1
             elif isinstance(cache_obj, (CacheList, _vlm_cache.CacheList)):
                 new_caches = []
                 for c in cache_obj.caches:
                     if isinstance(c, (KVCache, _vlm_cache.KVCache)):
-                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
+                        new_caches.append(cache_class.from_cache(c, bits=bits))
                         converted += 1
                     else:
                         new_caches.append(c)
@@ -3970,7 +3992,7 @@ class Scheduler:
         if converted > 0:
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
-                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
+                f"{scheme}: converted {converted}/{len(prompt_cache)} "
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
@@ -4110,6 +4132,17 @@ class Scheduler:
             return True
         return qwen4_text_mrope_broadcast(position_ids, query_tokens) is True
 
+    def _prepare_affine_prefill_cache(self, prompt_cache: list[Any]) -> None:
+        """Keep full-attention history packed throughout affine prefill."""
+        if (
+            getattr(self, "_turboquant_kv_bits", None) is not None
+            and getattr(self, "_turboquant_kv_scheme", "turboquant")
+            in ("affine4", "affine8")
+            and self._turboquant_eligible(prompt_cache)
+        ):
+            with mx.stream(self._stream):
+                self._apply_turboquant_kv_convert(prompt_cache)
+
     @staticmethod
     def _qwen4_actual_gathered_pricing(
         cache: list[Any], predicted: bool
@@ -4202,12 +4235,13 @@ class Scheduler:
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. A restored TurboQuant prefix runs a
-        # long suffix over a dense copy. Rotating/sliding-window layers remain
-        # native pass-through caches; only full-attention KVCache layers are
-        # converted.
+        # long suffix over a dense copy. Affine formats pack each layer's new
+        # KV during prefill. Rotating/sliding-window layers remain native
+        # pass-through caches; only full-attention KVCache layers are converted.
         Scheduler._dequantize_restored_turboquant_prefix(
             self, prompt_cache, n_tokens - 1, request.request_id
         )
+        Scheduler._prepare_affine_prefill_cache(self, prompt_cache)
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -6463,6 +6497,7 @@ class Scheduler:
         Scheduler._dequantize_restored_turboquant_prefix(
             self, prompt_cache, len(tokens) - 1, request.request_id
         )
+        Scheduler._prepare_affine_prefill_cache(self, prompt_cache)
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
@@ -6473,7 +6508,7 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         if (
             boundary_enabled
             and hasattr(request, "cached_tokens")
@@ -6837,8 +6872,8 @@ class Scheduler:
         chunk_kwargs = {}
         if self._supports_skip_lm_head():
             chunk_kwargs["skip_lm_head"] = True
-        # Prompt position of the chunk: without boundary snapshots base_size
-        # stays 0 even when a prefix is cached.
+        # Prompt position of the chunk. Only boundary prefill corrects
+        # base_size to cached_tokens.
         chunk_start = state.tokens_processed + (
             state.base_size
             if state.boundary_enabled
@@ -7510,7 +7545,10 @@ class Scheduler:
         machine that tells BatchGenerator when to stop generating for
         this request.
         """
-        stop_tokens_set = self._get_stop_tokens()
+        stop_tokens_set = (
+            set() if getattr(request.sampling_params, "ignore_eos", False)
+            else self._get_stop_tokens()
+        )
         if request.sampling_params.stop_token_ids:
             stop_tokens_set.update(request.sampling_params.stop_token_ids)
 
@@ -10463,15 +10501,10 @@ class Scheduler:
                 original_tokens = block_table.num_tokens
                 reconstruct_started = time.perf_counter()
                 with self._phase_timer("prefix_cache_reconstruct"):
-                    if bypass_hot_cache:
-                        reconstructed = self.block_aware_cache.reconstruct_cache(
-                            block_table,
-                            promote_to_hot_cache=False,
-                        )
-                    else:
-                        reconstructed = self.block_aware_cache.reconstruct_cache(
-                            block_table
-                        )
+                    reconstructed = self.block_aware_cache.reconstruct_cache(
+                        block_table,
+                        promote_to_hot_cache=not bypass_hot_cache,
+                    )
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
                     reconstructed = None
@@ -11027,7 +11060,10 @@ class Scheduler:
 
         # Combine base stop tokens (EOS, Harmony, generation_config) with
         # request-specific stop_token_ids — same shape as _build_state_machine.
-        eos_ids: set[int] = self._get_stop_tokens()
+        eos_ids: set[int] = (
+            set() if getattr(request.sampling_params, "ignore_eos", False)
+            else self._get_stop_tokens()
+        )
         if request.sampling_params.stop_token_ids:
             eos_ids.update(request.sampling_params.stop_token_ids)
 
@@ -11289,6 +11325,7 @@ class Scheduler:
             extract_cache_states=self._extract_cache_states,
             sync_and_clear_cache=lambda: Scheduler._clear_cache(self),
             log=logger,
+            use_hot_cache=not self._bypass_hot_cache_under_pressure(),
         )
 
     def _cleanup_specprefill(self, request_id: str) -> None:
@@ -12763,8 +12800,10 @@ class Scheduler:
             elif batch_specprefill_status != request_is_specprefill:
                 self.waiting.appendleft(request)
                 break
-            if request_is_specprefill and len(scheduled) > 0:
-                # SpecPrefill request must be alone
+            if request_is_specprefill and (
+                len(scheduled) > 0 or self.running or self.prefilling
+            ):
+                # The offset RoPE would also shift running and prefilling rows.
                 self.waiting.appendleft(request)
                 break
 
@@ -13001,6 +13040,7 @@ class Scheduler:
                         promote_static_prefix_to_hot_cache=(
                             not self._bypass_hot_cache_under_pressure()
                         ),
+                        prepare_prompt_cache=self._prepare_affine_prefill_cache,
                     )
 
                     # An exact static-prefix restore can supersede a shorter
@@ -14685,8 +14725,8 @@ class Scheduler:
 
     def _requeue_prefill_retry(self, request: "Request") -> None:
         """Reset a torn-down prefill request and requeue it at the front."""
-        # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
+        # Drops only the SpecPrefill id. A request with an installed RoPE patch
+        # skips external/chunked prefill, so it never reaches this reset.
         if self._specprefill_active_request_id == request.request_id:
             self._specprefill_active_request_id = None
 
@@ -15813,6 +15853,7 @@ class Scheduler:
                 except Exception:
                     pass
 
+            affine_prefill = False
             if (
                 self._turboquant_kv_bits is not None
                 and isinstance(head_dim, int)
@@ -15828,7 +15869,16 @@ class Scheduler:
                     )
                 )
             ):
-                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+                affine_prefill = scheme in ("affine4", "affine8")
+                tq_dtype_size = (
+                    (
+                        ((head_dim * int(self._turboquant_kv_bits) + 31) // 32 * 4 + 4)
+                        / head_dim
+                    )
+                    if affine_prefill
+                    else float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                )
                 if (
                     self._turboquant_skip_last
                     and not isinstance(actual_kv_cache_layers, bool)
@@ -15888,11 +15938,15 @@ class Scheduler:
                     dtype_size=dtype_size,
                     # TurboQuant converts the prompt's KV only after prefill,
                     # so prefill holds full-width KV and then both copies.
+                    # Affine caches stay packed throughout prefill.
                     prefill_dtype_size=(
-                        base_dtype_size + dtype_size
+                        dtype_size
+                        if affine_prefill
+                        else base_dtype_size + dtype_size
                         if dtype_size != base_dtype_size
                         else None
                     ),
+                    affine_prefill=affine_prefill,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
                     # SDPA scores are materialized at the compute/activation
@@ -15901,8 +15955,8 @@ class Scheduler:
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
                     prefill_memory_profile=prefill_memory_profile,
-                    # ANE prefill holds fixed-shape I/O surfaces the first
-                    # long prompt dirties on top of KV+SDPA (issue #2841).
+                    # ANE program weights are wired during prefill on top
+                    # of KV+SDPA (issue #2841).
                     ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
                         self.model
                     ),
@@ -16017,9 +16071,14 @@ class Scheduler:
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        packed_type = {
+            "affine4": "Affine4KVCache",
+            "affine8": "Affine8KVCache",
+        }.get(scheme, "TurboQuantKVCache")
         for idx in kv_indices:
             if idx != last_kv_idx and idx < len(layer_cache_types):
-                layer_cache_types[idx] = "TurboQuantKVCache"
+                layer_cache_types[idx] = packed_type
 
         # The depth is keyed off the same eligibility gate the request path
         # uses, not the rewritten names: models whose convertible caches sit
