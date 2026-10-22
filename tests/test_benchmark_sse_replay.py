@@ -355,7 +355,9 @@ def bench_client(monkeypatch):
     from omlx.admin import routes as admin_routes
 
     _benchmark_runs.clear()
-    admin_routes._get_engine_pool = lambda: _FakePool()
+    # monkeypatch restores the getter at teardown; a bare assignment leaks
+    # into later test files (list_hf_models reads it since #4679).
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: _FakePool())
 
     async def _fake_require_admin():
         return True
