@@ -3699,12 +3699,8 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                         referenced_drafts.add(ref)
 
         excluded_model_ids: set[str] = set()
-        # Add all available models
         for m in status["models"]:
             model_id = m["id"]
-            model_type = m.get("model_type", "llm")
-
-            # Get display name (alias if set)
             display_id = model_id
             ms = None
             if settings_manager:
@@ -3731,23 +3727,10 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                 continue
             if ms is not None and ms.is_favorite:
                 favorite_ids.add(display_id)
-
-            # Get max tokens for capabilities
-            max_tok = get_max_context_window(model_id)
-
-            # Determine capabilities based on model type
-            is_vlm = model_type == "vlm"
             models.append(
                 ModelInfo(
                     id=display_id,
                     owned_by="omlx",
-                    capabilities={
-                        "type": "text" if not is_vlm else "vision",
-                        "streaming": True,
-                        "vision": is_vlm,
-                        "function_calling": True,
-                        "max_tokens": max_tok,
-                    },
                     max_model_len=get_max_context_window(model_id),
                 )
             )
