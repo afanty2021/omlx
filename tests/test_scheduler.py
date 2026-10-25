@@ -34,6 +34,7 @@ import omlx.scheduler as scheduler_module
 from omlx.adapter import output_parser as output_parser_module
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.cache.stats import PrefixCacheStats
+from omlx.exceptions import InvalidRequestError
 from omlx.models.vlm import VLMModelAdapter
 from omlx.patches.deepseek_v41 import output_parser as dsv41_output_parser
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
@@ -498,6 +499,21 @@ class TestSchedulerAddRequest:
 
         with pytest.raises(ValueError, match="already exists"):
             scheduler.add_request(request)
+
+    def test_add_request_rejects_empty_prompt(self, mock_model, mock_tokenizer):
+        """An empty prompt is refused at admission, not by insert() in step()."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="empty",
+            prompt=[],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+        with pytest.raises(InvalidRequestError, match="at least one token"):
+            scheduler.add_request(request)
+
+        assert "empty" not in scheduler.requests
+        assert not scheduler.waiting
 
     def test_add_multiple_requests(self, mock_model, mock_tokenizer):
         """Test adding multiple requests."""
@@ -5472,6 +5488,29 @@ class TestSpecPrefillCaches:
             scheduler.set_specprefill_draft_model(object())
 
             assert not hasattr(scheduler, "_specprefill_static_prefix_kv_cache")
+        finally:
+            scheduler.shutdown()
+
+    def test_draft_settings_are_scoring_defaults(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        try:
+            scheduler.set_specprefill_draft_model(
+                object(), keep_pct=0.4, threshold=100352
+            )
+            request = Request(
+                request_id="sp-defaults",
+                prompt=[1, 2, 3],
+                sampling_params=SamplingParams(max_tokens=8),
+            )
+            request.prompt_token_ids = [1, 2, 3]
+            request._specprefill_enabled = True
+            with patch(
+                "omlx.specprefill.policy.plan_specprefill_scoring", return_value=None
+            ) as plan:
+                scheduler._try_specprefill_scoring(request)
+
+            assert plan.call_args.kwargs["default_threshold"] == 100352
+            assert plan.call_args.kwargs["default_keep_pct"] == 0.4
         finally:
             scheduler.shutdown()
 

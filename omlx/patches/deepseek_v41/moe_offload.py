@@ -37,7 +37,8 @@ from .storage import SAFETENSORS_NUMPY_DTYPES, decode_array
 _PROJECTIONS = ("w1", "w3", "w2")
 _FLOAT_BYTES = {"BF16": 2, "F16": 2, "F32": 4}
 # Host bytes one residency update may hold in flight before the serial slot
-# writes drain them (about 32 oQ3e experts).
+# writes drain them (about 32 oQ3e experts). A prefill read-ahead holds up to
+# the same amount through a chunk's eval.
 INFLIGHT_BYTES = 512 * 1024 * 1024
 # Expert reads get their own pool: the Engram page pool runs long sequential
 # page touches that would otherwise queue ahead of a layer's misses.
@@ -346,8 +347,8 @@ class ExpertOffloadPlan:
         """Release the shard descriptors.
 
         Reads in flight must have drained: the engine closes a model after its
-        executor is idle, and ``ensure_ids`` waits for every read it started
-        before it returns or raises.
+        executor is idle, and ``ensure_ids`` and ``_sorted`` wait for every
+        read they started before they return or raise.
         """
         with self._lock:
             self._closed = True
@@ -364,6 +365,9 @@ class _ExpertSlots:
         self.free = list(range(plan.capacity))
         self.hits = self.misses = 0
         self.fetched_bytes = 0
+        # Experts whose reads a prefill started early: expert -> the same
+        # ``(proj, slabs, futures)`` shape ``ensure_ids`` builds.
+        self._ahead = {}
         for proj in _PROJECTIONS:
             sample = plan.fetch(prefix, proj, 0)
             values = {
@@ -381,6 +385,49 @@ class _ExpertSlots:
     def ensure(self, indices):
         slots = self.ensure_ids(indices.reshape(-1).tolist())
         return mx.array(slots, dtype=mx.int32).reshape(indices.shape)
+
+    def read_ahead(self, ids):
+        """Start the reads a later ``ensure_ids`` would otherwise wait for.
+
+        The SSD idles while the GPU evaluates the chunk that just ran, so the
+        next chunk's reads are issued before that eval. Only reads move: an
+        expert read ahead still counts as a miss when the chunk that needs it
+        runs, its install is the same slot write, and its bytes land in the
+        same ``fetched_bytes`` ledger. The window is the same ``INFLIGHT_BYTES``
+        bound ``ensure_ids`` enforces, and carried entries count against it
+        when that call consumes them. Those bytes stay alive through the eval.
+
+        Entries no later call consumes are dropped by ``release_read_ahead``,
+        which a prefill's ``finally`` always runs.
+        """
+        window = max(1, INFLIGHT_BYTES // max(1, self.plan.expert_bytes))
+        room = window - len(self._ahead)
+        started = 0
+        for expert in dict.fromkeys(ids):
+            if started >= room:
+                break
+            if expert in self.slot_of or expert in self._ahead:
+                continue
+            projections = []
+            for proj in _PROJECTIONS:
+                slabs = self.plan.slabs(self.prefix, proj, expert)
+                futures = [
+                    _EXPERT_IO_POOL.submit(self.plan.read, slab) for slab in slabs
+                ]
+                projections.append((proj, slabs, futures))
+            self._ahead[expert] = projections
+            started += 1
+        return started
+
+    def release_read_ahead(self):
+        """Drop every read-ahead entry a chunk did not consume."""
+        ahead, self._ahead = self._ahead, {}
+        for projections in ahead.values():
+            for _, _, futures in projections:
+                for future in futures:
+                    if not future.cancel():
+                        future.exception()
+        return len(ahead)
 
     def ensure_ids(self, ids):
         """Make every expert in ``ids`` resident; return their slots in order.
@@ -413,6 +460,12 @@ class _ExpertSlots:
             while submitted < min(limit, len(misses)):
                 expert = misses[submitted]
                 submitted += 1
+                carried = self._ahead.pop(expert, None)
+                if carried is not None:
+                    # Reads a prefill started early: already on the reader
+                    # pool, and counted against this call's window below.
+                    pending[expert] = carried
+                    continue
                 pending[expert] = []
                 for proj in _PROJECTIONS:
                     slabs = self.plan.slabs(self.prefix, proj, expert)
@@ -503,16 +556,34 @@ class OffloadedExpert(nn.Module):
                 sorted_indices=False,
                 input_quantized=input_quantized,
             )
-            mx.eval(out)
+            # No wait here: the next ``ensure`` syncs on its routing ids, and the
+            # GPU runs this chunk while the rest of the layer is built.
+            mx.async_eval(out)
             outputs.append(out)
         return outputs
+
+    @staticmethod
+    def _chunk_end(ids, start, capacity):
+        """End index of the chunk starting at ``start``.
+
+        A chunk holds every route of up to ``capacity`` distinct experts.
+        """
+        end, distinct = start, 0
+        while end < len(ids) and distinct < capacity:
+            run = end + 1
+            while run < len(ids) and ids[run] == ids[end]:
+                run += 1
+            end, distinct = run, distinct + 1
+        return end
 
     def _sorted(self, x, indices, weights, input_quantized):
         """Routes sorted by expert: chunk on expert boundaries.
 
         A chunk holds every route of up to ``capacity`` distinct experts, so a
         prefill reads each expert once per layer and runs one kernel per
-        chunk instead of one per ``capacity`` routes.
+        chunk instead of one per ``capacity`` routes. The next chunk's reads
+        are issued before this chunk's eval, so the drive works through the
+        GPU wait instead of queueing behind it.
         """
         ids = indices.reshape(-1).tolist()
         rows = x.reshape(-1, 1, x.shape[-1])
@@ -520,26 +591,28 @@ class OffloadedExpert(nn.Module):
         capacity = self.slots.plan.capacity
         outputs = []
         start = 0
-        while start < len(ids):
-            end, distinct = start, 0
-            while end < len(ids) and distinct < capacity:
-                run = end + 1
-                while run < len(ids) and ids[run] == ids[end]:
-                    run += 1
-                end, distinct = run, distinct + 1
-            slots = mx.array(self.slots.ensure_ids(ids[start:end]), dtype=mx.int32)
-            order = mx.argsort(slots)
-            inverse = mx.argsort(order)
-            out = self.slots.expert(
-                rows[start:end][order],
-                slots[order],
-                None if scores is None else scores[start:end][order],
-                sorted_indices=True,
-                input_quantized=input_quantized,
-            )[inverse]
-            mx.eval(out)
-            outputs.append(out)
-            start = end
+        try:
+            while start < len(ids):
+                end = self._chunk_end(ids, start, capacity)
+                slots = mx.array(self.slots.ensure_ids(ids[start:end]), dtype=mx.int32)
+                order = mx.argsort(slots)
+                inverse = mx.argsort(order)
+                out = self.slots.expert(
+                    rows[start:end][order],
+                    slots[order],
+                    None if scores is None else scores[start:end][order],
+                    sorted_indices=True,
+                    input_quantized=input_quantized,
+                )[inverse]
+                if end < len(ids):
+                    next_end = self._chunk_end(ids, end, capacity)
+                    self.slots.read_ahead(ids[end:next_end])
+                mx.eval(out)
+                outputs.append(out)
+                start = end
+        finally:
+            # A read-ahead the loop never consumed must not outlive the call.
+            self.slots.release_read_ahead()
         return outputs
 
 

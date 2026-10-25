@@ -807,7 +807,14 @@ class BatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"

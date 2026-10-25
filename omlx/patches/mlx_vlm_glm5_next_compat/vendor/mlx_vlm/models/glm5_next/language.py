@@ -58,6 +58,8 @@ from .sparse_mla_decode import (
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+# Smallest pool the native decode scan accepts (dsa_indexer.cpp).
+_NATIVE_DECODE_MIN_POOL = 1024
 
 
 # Causal row blocks of the dense-prefix attention (1 = one call).
@@ -486,6 +488,21 @@ class Glm5NextLinearAttention(nn.Module):
                 self._fs = mx.concatenate([m.scales for m in mods], axis=0)
                 self._fb = mx.concatenate([m.biases for m in mods], axis=0)
                 self._gs, self._bits = mods[0].group_size, mods[0].bits
+                # Keep the public projections for their own callers, but let
+                # them share the fused affine bank. Realize first: views of an
+                # unevaluated concat would keep the source arrays alive.
+                if getattr(mods[0], "mode", "affine") == "affine":
+                    mx.eval(self._fw, self._fs, self._fb)
+                    for field, bank in (
+                        ("weight", self._fw),
+                        ("scales", self._fs),
+                        ("biases", self._fb),
+                    ):
+                        for m, view in zip(mods, mx.split(bank, pts, axis=0)):
+                            # Concat can promote mixed metadata dtypes. An
+                            # unfused caller must keep its original dtype.
+                            if m[field].dtype == view.dtype:
+                                m[field] = view
             self._fused_ready = True
         if self._fq:
             out = fused_quantized_matmul(
@@ -877,9 +894,38 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.sparse_index import fast
 
+            qt = q.transpose(0, 2, 1, 3)
+            # On M3 and newer GPUs _fast_short_select serves one sequence's
+            # decode and verify rows (up to _DECODE_BLOCK) with scores that
+            # replay this padded tile bit for bit, so for those shapes the
+            # tile stays this general path's exact reference.
+            fused_reference = (
+                q.shape[0] == 1
+                and q.shape[1] <= _DECODE_BLOCK
+                and _decode_kernels.fused_decode_supported()
+            )
+            if (
+                q.shape[1] == 1
+                and not fused_reference
+                and pool_keys.shape[1] >= _NATIVE_DECODE_MIN_POOL
+                and fast.has_symbol("dsa_decode_scores")
+            ):
+                # Decode should not pay for a 64-row prefill tile.
+                # The kernel assumes a unit-stride last axis at eval; its
+                # graph-time check cannot detect lazy transposed views. This
+                # guard can also copy capacity-backed and batched pool slices.
+                keys = mx.contiguous(pool_keys)[:, None]
+                return fast.dsa_decode_scores(
+                    qt, keys, weights.reshape(weights.shape[0], self.n_heads)
+                )[:, 0]
+            if q.shape[0] > 1 and q.shape[1] < 32:
+                # Short batched chunks: the 64-row tile loses to the MLX
+                # matmul below roughly 32-48 rows on M3 Ultra. One sequence
+                # keeps the tile, whose fp32 head sum the bf16 chain does not
+                # match.
+                return None
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
-            qt = q.transpose(0, 2, 1, 3)
             keys = pool_keys[:, None]
             q_pad = (-qt.shape[2]) % _NATIVE_INDEXER_MATRIX_TILE_ROWS
             k_pad = (-keys.shape[2]) % _NATIVE_INDEXER_MATRIX_TILE_ROWS

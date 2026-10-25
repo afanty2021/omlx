@@ -31,7 +31,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.engine.base import BaseEngine
-from omlx.mcp.tools import merge_tools
+from omlx.mcp.tools import mcp_tools_to_openai, merge_tools
 from omlx.mcp.types import MCPTool
 
 
@@ -191,6 +191,10 @@ class FakeMCPManager:
 
     def get_merged_tools(self, user_tools=None):
         return merge_tools(self._mcp_tools, user_tools)
+
+    def get_all_tools_openai(self):
+        # /v1/messages merges MCP tools through this instead of get_merged_tools.
+        return mcp_tools_to_openai(self._mcp_tools)
 
 
 MCP_WEATHER_TOOL = MCPTool(
@@ -362,3 +366,75 @@ class TestToolChoiceNoneSuppressesTemplateExposure:
         assert tools is None, (
             f"MCP tools leaked to the template despite tool_choice='none': {tools!r}"
         )
+
+
+ANTHROPIC_STOCK_TOOL = {
+    "name": "get_stock_price",
+    "description": "Get the current stock price",
+    "input_schema": {
+        "type": "object",
+        "properties": {"ticker": {"type": "string"}},
+    },
+}
+
+
+class TestAnthropicToolChoiceNone:
+    """tool_choice {"type": "none"} hides client and MCP tools on /v1/messages."""
+
+    @pytest.fixture()
+    def template_calls(self, engine, monkeypatch):
+        calls = []
+        tokenizer = engine.tokenizer
+        render = tokenizer.apply_chat_template
+
+        def recording_render(messages, **kwargs):
+            calls.append(kwargs)
+            return render(messages, **kwargs)
+
+        monkeypatch.setattr(tokenizer, "apply_chat_template", recording_render)
+        return calls
+
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected"),
+        [
+            ({"type": "auto"}, {"get_stock_price", "weather__get_weather"}),
+            ({"type": "none"}, set()),
+        ],
+    )
+    def test_messages_tools_follow_tool_choice(
+        self, client_with_mcp, engine, tool_choice, expected
+    ):
+        resp = client_with_mcp.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": [ANTHROPIC_STOCK_TOOL],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert resp.status_code == 200
+        assert engine.recorded_chat_kwargs, "engine.chat was never called"
+        tools = engine.recorded_chat_kwargs[-1].get("tools") or []
+        assert {t["function"]["name"] for t in tools} == expected
+
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected"),
+        [({"type": "auto"}, True), ({"type": "none"}, False)],
+    )
+    def test_count_tokens_tools_follow_tool_choice(
+        self, client_with_mcp, template_calls, tool_choice, expected
+    ):
+        resp = client_with_mcp.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": [ANTHROPIC_STOCK_TOOL],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert resp.status_code == 200
+        assert template_calls, "chat template was never rendered"
+        assert ("tools" in template_calls[-1]) is expected

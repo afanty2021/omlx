@@ -30,6 +30,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import logging
 import threading
@@ -53,6 +54,7 @@ from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..patches.muse_spark import model as muse_spark_model
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -223,6 +225,10 @@ def _apply_minimax_m3_thinking_mode(
     if enable_thinking is True:
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
+        template_kwargs["thinking_mode"] = "disabled"
+    elif str(template_kwargs.get("reasoning_effort", "")).strip().lower() == "none":
+        # MiniMax renders the effort level verbatim; "none" also turns
+        # thinking off, as the reference server does.
         template_kwargs["thinking_mode"] = "disabled"
 
 
@@ -2233,6 +2239,13 @@ class VLMBatchedEngine(BaseEngine):
                             )
                         ),
                     )
+                if model_type == "muse_spark":
+                    return muse_spark_model.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -2940,7 +2953,14 @@ class VLMBatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
@@ -3473,9 +3493,48 @@ class VLMBatchedEngine(BaseEngine):
                         video_content.append({"type": "text", "text": item_text})
                 formatted_messages.append({"role": role, "content": video_content})
             else:
+                prompt: Any = content
+                parts: list[dict] = []
+                if isinstance(raw_content, list):
+                    parts = [
+                        (
+                            item
+                            if isinstance(item, dict)
+                            else {
+                                "type": getattr(item, "type", ""),
+                                "text": getattr(item, "text", ""),
+                            }
+                        )
+                        for item in raw_content
+                    ]
+                image_pos = [
+                    i for i, p in enumerate(parts) if p.get("type") in image_part_types
+                ][:msg_num_images]
+                # Text between images labels them, and flattening moves every
+                # image ahead of all text. Audio turns keep the flat layout
+                # because mlx-vlm keeps audio markers in the prefix.
+                if (
+                    msg_num_images > 1
+                    and msg_num_audios == 0
+                    and len(image_pos) == msg_num_images
+                    and extract_text_from_content(
+                        parts[image_pos[0] + 1 : image_pos[-1]]
+                    )
+                ):
+                    prompt = []
+                    for is_image, group in itertools.groupby(
+                        enumerate(parts),
+                        key=lambda ip: ip[1].get("type") in image_part_types,
+                    ):
+                        if is_image:
+                            prompt.extend(
+                                {"type": "image"} for i, _ in group if i in image_pos
+                            )
+                        elif text := extract_text_from_content([p for _, p in group]):
+                            prompt.append({"type": "text", "text": text})
                 formatted = get_message_json(
                     model_type,
-                    content,
+                    prompt,
                     role,
                     skip_image_token=role != "user" or msg_num_images == 0,
                     skip_audio_token=role != "user" or msg_num_audios == 0,
@@ -4142,6 +4201,12 @@ class VLMBatchedEngine(BaseEngine):
         num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
+        if model_type == "flint" and (num_images or num_audios or num_videos):
+            raise InvalidRequestError(
+                "Flint is a text-only model and does not support "
+                "image, audio, or video input.",
+                field="messages",
+            )
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -5283,11 +5348,11 @@ class VLMBatchedEngine(BaseEngine):
         _, text_messages, images, _, videos = self._extract_request_media(messages)
         if (
             images
-            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self.model_type in {"gemma4", "gemma4_unified", "muse_spark"}
             and self._vlm_model.config.vision_config is None
         ):
             raise InvalidRequestError(
-                "This text-only Gemma 4 model does not support image input.",
+                "This text-only model does not support image input.",
                 field="messages",
             )
         prompt = self._apply_chat_template(
