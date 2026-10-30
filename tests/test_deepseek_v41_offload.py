@@ -791,6 +791,91 @@ def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
         reader.close()
 
 
+def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
+    path = tmp_path / "mixed.safetensors"
+    row_bytes = 519
+    raw = np.random.default_rng(19).integers(0, 256, (4096, row_bytes), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    reader = storage.TensorFile(path)
+    original = storage.os.pread
+    calls = []
+
+    def counted(fd, count, offset):
+        calls.append((offset, offset + count))
+        return original(fd, count, offset)
+
+    try:
+        reader.read("w", np.arange(24))
+        # This row starts on the warm first page and ends on a new page.
+        crossing = (storage.PAGE_SIZE - reader._start) // row_bytes
+        offset = reader._start + crossing * row_bytes
+        assert offset < storage.PAGE_SIZE < offset + row_bytes
+        monkeypatch.setattr(storage.os, "pread", counted)
+        rows = np.tile([0, crossing, 2, 15], 5000).reshape(4, -1)
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        assert calls == [(offset, offset + row_bytes)]
+        # Narrow mixed reads, such as decode, still read every row.
+        calls.clear()
+        narrow = np.array([2, 3000, 15])
+        actual, _ = reader.read("w", narrow)
+        np.testing.assert_array_equal(actual, raw[narrow])
+        for row in narrow:
+            begin = reader._start + int(row) * row_bytes
+            assert any(
+                low <= begin and begin + row_bytes <= high for low, high in calls
+            )
+    finally:
+        reader.close()
+
+
+def test_evicted_warm_pages_keep_only_that_tensor_on_reads(tmp_path, monkeypatch):
+    path = tmp_path / "evicted.safetensors"
+    weights = np.arange(8192 * 64, dtype=np.uint8).reshape(8192, 64)
+    scales = np.arange(8192, dtype=np.float16).reshape(8192, 1)
+    raw_safetensors(path, {"w": (weights, "U8"), "s": (scales, "F16")})
+    reader = storage.TensorFile(path)
+    rows = np.tile([0, 255, 256, 4095], 4096)
+    address = np.frombuffer(reader._mapping, dtype=np.uint8, count=1).ctypes.data
+    first_scale_page = (reader._start + weights.nbytes) // storage.PAGE_SIZE
+    scale_page = address + first_scale_page * storage.PAGE_SIZE
+    original = storage.os.pread
+    calls = []
+    clock = [100.0]
+    weights_cached = [False]
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    def mincore(page, length, state):
+        state._obj.value = int(weights_cached[0] or page >= scale_page)
+        return 0
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    monkeypatch.setattr(storage, "_MINCORE", mincore)
+    monkeypatch.setattr(storage.time, "monotonic", lambda: clock[0])
+    try:
+        for key, raw in (("w", weights), ("s", scales)):
+            np.testing.assert_array_equal(reader.read(key, rows)[0], raw[rows])
+        calls.clear()
+        np.testing.assert_array_equal(reader.read("w", rows)[0], weights[rows])
+        assert calls
+        calls.clear()
+        np.testing.assert_array_equal(reader.read("s", rows)[0], scales[rows])
+        assert not calls
+        # The weight fallback holds without a new probe until it expires.
+        weights_cached[0] = True
+        reader.read("w", rows)
+        assert calls
+        calls.clear()
+        clock[0] += storage.ROW_READ_RETRY_SECONDS
+        np.testing.assert_array_equal(reader.read("w", rows)[0], weights[rows])
+        assert not calls
+    finally:
+        reader.close()
+
+
 def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
     reader, _ = page_table(tmp_path)
     original = storage.os.pread

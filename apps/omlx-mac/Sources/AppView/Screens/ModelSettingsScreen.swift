@@ -999,13 +999,17 @@ private struct BasicSection: View {
                     )
                 }
             }
-            if vm.showsEmbeddingContextWindow {
+            if vm.showsEmbeddingContextWindow || vm.showsRerankerContextWindow {
                 Row(label: String(localized: "settings.basic.context_window.label",
                                   defaultValue: "Context Window",
                                   comment: "Row label for the context window field"),
-                    sublabel: String(localized: "settings.basic.embedding_context_window.sub",
-                                     defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
-                                     comment: "Sublabel for the context window field of an embedding model")) {
+                    sublabel: vm.showsRerankerContextWindow
+                        ? String(localized: "settings.basic.reranker_context_window.sub",
+                                 defaultValue: "Used when a request does not set max_length. Jina rerankers read documents together up to this many tokens, other rerankers cut each query-document pair to this length.",
+                                 comment: "Sublabel for the context window field of a reranker model")
+                        : String(localized: "settings.basic.embedding_context_window.sub",
+                                 defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
+                                 comment: "Sublabel for the context window field of an embedding model")) {
                     TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
                 }
             }
@@ -1214,11 +1218,24 @@ private struct AdvancedPage: View {
                 sublabel: String(localized: "settings.advanced.trust_remote_code.sub",
                                  defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
                                  comment: "Sublabel describing the security implications of trust-remote-code"),
-                isLast: !showsLLMRows) {
+                isLast: !vm.isLLMLike) {
                 RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
                     Task { await vm.save(.trustRemoteCode, client: client) }
                 }))
                 .tint(theme.redDot)
+            }
+            if showsLLMRows && vm.model?.activationFp16Supported == true {
+                Row(label: String(localized: "settings.advanced.activation_fp16.label",
+                                  defaultValue: "Float16 Activations",
+                                  comment: "Row label for the load-time bfloat16 to float16 recast toggle"),
+                    sublabel: vm.activationFp16ConflictReason ?? String(localized: "settings.advanced.activation_fp16.sub",
+                                     defaultValue: "Converts the bfloat16 scales, norms and embeddings of this model to float16 at load. M1 and M2 GPUs emulate bfloat16, so prefill and decode run faster. Output can differ slightly from bfloat16.",
+                                     comment: "Sublabel for the load-time bfloat16 to float16 recast toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.activationFp16Enabled, save: {
+                        Task { await vm.save(.activationFp16, client: client) }
+                    }))
+                    .disabled(vm.activationFp16ConflictReason != nil && !vm.activationFp16Enabled)
+                }
             }
             if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
@@ -1235,6 +1252,33 @@ private struct AdvancedPage: View {
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
                 }
+            }
+            // The cap applies to every generating engine, diffusion included.
+            if vm.isLLMLike {
+                Row(label: String(localized: "settings.advanced.gpu_power_limit.label",
+                                  defaultValue: "GPU Power Limit",
+                                  comment: "Row label for the per-model GPU power limit"),
+                    sublabel: vm.gpuPowerLimitSupported
+                        ? String(localized: "settings.advanced.gpu_power_limit.sub",
+                                 defaultValue: "Caps GPU power for the whole Mac while this model generates, from 2 to 1000 W. It only helps below the usual draw. For example, an M5 Max uses about 25 W to generate an answer: 10 W saves about 40% energy per token and 5 W about half.",
+                                 comment: "Sublabel for the per-model GPU power limit")
+                        : GPUPowerGuide.unsupportedText,
+                    isLast: !showsLLMRows) {
+                    HStack(spacing: 8) {
+                        if vm.limitGpuPower {
+                            TextInput(text: vm.bindProfile($vm.gpuPowerLimitWatts),
+                                      placeholder: "2-1000", mono: true, isNumeric: true,
+                                      range: 2...1000, step: 1, suffix: "W",
+                                      width: .controlCompact)
+                        }
+                        GPUPowerGuideButton()
+                        // Unsupported GPUs can still turn an existing limit off.
+                        RowSwitch(isOn: vm.bindProfile($vm.limitGpuPower))
+                            .disabled(!vm.gpuPowerLimitSupported && !vm.limitGpuPower)
+                    }
+                }
+            }
+            if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
                                   defaultValue: "Limit Tool Result Tokens",
                                   comment: "Row label for the tool-result token limit field"),
@@ -2004,7 +2048,7 @@ private struct AccelerationSection: View {
                     sublabel: String(localized: "settings.acceleration.ced_prefill.sub",
                                      defaultValue: "Improves prefill speed by approximately 74–79% in tested configurations. Uses the model’s Causal Encoder–Decoder architecture to reduce decoder prefill computation.",
                                      comment: "Sublabel for the DeepSeek V4.1 CED prefill toggle"),
-                    isLast: !vm.isQwen4Exp && !vm.showsQwenOqA8) {
+                    isLast: !vm.isQwen4Exp && !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.deepseekV41CedPrefillEnabled, save: {
                         Task { await vm.save(.deepseekV41CedPrefill, client: client) }
                     }))
@@ -2017,25 +2061,25 @@ private struct AccelerationSection: View {
                     sublabel: String(localized: "settings.acceleration.qwen4_wide_decode.sub",
                                      defaultValue: "Speeds up decode on Qwen4 oQ2.5e, oQ2.7e, oQ6e, oQ8e and 8-bit community models (about 3-6% on an 8-bit model, up to 1.5 GiB more memory). No effect on oQ3e to oQ4e or fp16 builds, and little effect with Lightning MTP on.",
                                      comment: "Sublabel for the Qwen4 extended fused decode toggle"),
-                    isLast: !vm.showsQwenOqA8) {
+                    isLast: !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.qwen4GdnDecodeWideProj, save: {
                         Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
                     }))
                 }
             }
-            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
-            // Flash-Next has none, but still supports oQ A8.
-            if vm.showsQwenOqA8 {
+            // The A8 rows do not depend on an ANE backend: Qwen3.8 Flash-Next
+            // and DeepSeek V4.1 have none, but still support A8.
+            if vm.showsA8Prefill {
                 Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
-                                  defaultValue: "Qwen INT8 Activation Prefill",
+                                  defaultValue: "INT8 Activation Prefill",
                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
-                    sublabel: qwenOqA8Sublabel,
-                    isLast: !vm.qwen35OqA8Enabled) {
-                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
-                        .disabled(vm.qwen35OqA8ConflictReason != nil)
-                        .help(vm.qwen35OqA8ConflictReason ?? "")
+                    sublabel: a8PrefillSublabel,
+                    isLast: !vm.a8PrefillEnabled) {
+                    RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
+                        .disabled(vm.a8PrefillConflictReason != nil)
+                        .help(vm.a8PrefillConflictReason ?? "")
                 }
-                if vm.qwen35OqA8Enabled {
+                if vm.a8PrefillEnabled {
                     Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
                                       defaultValue: "Minimum Prompt Tokens",
                                       comment: "Row label for the oQ A8 minimum prompt length"),
@@ -2043,7 +2087,7 @@ private struct AccelerationSection: View {
                                          defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
                                          comment: "Sublabel explaining the oQ A8 minimum prompt length"),
                         isLast: true) {
-                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                        TextInput(text: vm.bindProfile($vm.a8PrefillMinTokens),
                                   placeholder: "128", mono: true,
                                   isNumeric: true, range: 1...262_144,
                                   step: 64, width: .controlCompact)
@@ -2054,13 +2098,13 @@ private struct AccelerationSection: View {
     }
 
     private var hasFamilyRows: Bool {
-        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsQwenOqA8
+        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsA8Prefill
     }
 
-    private var qwenOqA8Sublabel: String {
-        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+    private var a8PrefillSublabel: String {
+        if let reason = vm.a8PrefillConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 
@@ -2153,7 +2197,7 @@ private struct ExperimentalSection: View {
                 }
             }
             if vm.model?.anePrefillBackend != nil {
-                if vm.isQwenOqA8Model {
+                if vm.isA8PrefillModel {
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
@@ -2630,5 +2674,125 @@ enum SamplingValidator {
         }
         if let msg = check(v) { return .failure(.init(message: msg)) }
         return .success(v)
+    }
+}
+
+// MARK: - GPU power limit guide
+
+/// M5 Max measurements that show what a GPU power limit costs and saves.
+/// Shared by the model settings and Ask AI rows.
+struct GPUPowerGuide: View {
+    static var unsupportedText: String {
+        String(localized: "settings.gpu_power_guide.unsupported",
+               defaultValue: "This Mac's GPU does not support a power limit.",
+               comment: "Shown instead of the GPU power limit description when the GPU rejects a power cap")
+    }
+
+    /// Limit, answer speed, energy per token, prompt speed.
+    private static let rows: [(String, String, String, String)] = [
+        ("30-40 W", "0%", "0%", "-14 ~ -30%"),
+        ("20 W", "-3 ~ -4%", "-11 ~ -12%", "-38 ~ -44%"),
+        ("15 W", "-6 ~ -7%", "-25 ~ -29%", "-49 ~ -53%"),
+        ("10 W", "-14 ~ -18%", "-37 ~ -43%", "-59 ~ -64%"),
+        ("5 W", "-36 ~ -48%", "-49 ~ -52%", "-75 ~ -78%"),
+        ("2 W", "-67 ~ -78%", "-47 ~ -52%", "-90 ~ -91%"),
+    ]
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(String(localized: "settings.gpu_power_guide.title",
+                        defaultValue: "Measured on M5 Max (other chips differ)",
+                        comment: "Title of the GPU power limit guide popover"))
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                GridRow {
+                    Text(String(localized: "settings.gpu_power_guide.limit",
+                                defaultValue: "Limit",
+                                comment: "GPU power guide column: the power limit"))
+                    Text(String(localized: "settings.gpu_power_guide.answer",
+                                defaultValue: "Answer speed",
+                                comment: "GPU power guide column: change in token generation speed"))
+                    Text(String(localized: "settings.gpu_power_guide.energy",
+                                defaultValue: "Energy per token",
+                                comment: "GPU power guide column: change in energy used per generated token"))
+                    Text(String(localized: "settings.gpu_power_guide.prompt",
+                                defaultValue: "Prompt speed",
+                                comment: "GPU power guide column: change in prompt processing speed"))
+                }
+                .foregroundStyle(theme.textSecondary)
+                GridRow {
+                    Text(String(localized: "settings.gpu_power_guide.none",
+                                defaultValue: "No limit",
+                                comment: "GPU power guide row for running without a power limit"))
+                    Text(verbatim: "GPU 23-27 W")
+                    Text(verbatim: "-")
+                    Text(verbatim: "GPU 67-76 W")
+                }
+                ForEach(Self.rows, id: \.0) { row in
+                    GridRow {
+                        Text(verbatim: row.0)
+                        Text(verbatim: row.1)
+                        Text(verbatim: row.2)
+                        Text(verbatim: row.3)
+                    }
+                }
+            }
+            .font(.omlxText(DesignTokens.FontSize.subheadline).monospacedDigit())
+            Text(String(localized: "settings.gpu_power_guide.note",
+                        defaultValue: "30 W or more barely changes answer speed. Below 5 W, energy per token stops falling and answers only get slower. The minimum is 2 W. Other requests and apps also slow down while the limit is active. Benchmarks run without it.",
+                        comment: "Footnote of the GPU power limit guide popover"))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 400, alignment: .leading)
+    }
+}
+
+struct GPUPowerGuideButton: View {
+    @State private var isShown = false
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Button {
+            isShown.toggle()
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 12))
+                .foregroundStyle(theme.textSecondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(String(localized: "settings.gpu_power_guide.button",
+                     defaultValue: "How much does a limit save?",
+                     comment: "Tooltip on the info button that opens the GPU power limit guide"))
+        .popover(isPresented: $isShown, arrowEdge: .bottom) {
+            GPUPowerGuide()
+        }
+    }
+}
+
+/// Shown under a benchmark model picker: benchmarks never take a model's
+/// GPU power limit, so their numbers are full-power numbers.
+struct GPUPowerBenchNotice: View {
+    let model: ModelDTO?
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        if let watts = model?.settings?.gpuPowerLimitW, watts > 0 {
+            FreeRow {
+                Label(String(localized: "bench.gpu_power_limit_note",
+                             defaultValue: "This model's \(watts) W GPU power limit does not apply to benchmarks.",
+                             comment: "Note under a benchmark model picker when the model has a GPU power limit; placeholder is the watt value"),
+                      systemImage: "info.circle")
+                    .font(.omlxText(DesignTokens.FontSize.callout))
+                    .foregroundStyle(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }

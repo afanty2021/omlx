@@ -246,7 +246,12 @@ private struct RuntimeCacheSection: View {
             if let dir = cache?.ssdCacheDir, !dir.isEmpty {
                 Row(label: String(localized: "status.runtime_cache.location",
                                   defaultValue: "Location",
-                                  comment: "Row label for the SSD cache directory path")) {
+                                  comment: "Row label for the SSD cache directory path"),
+                    warning: cache?.ssdCacheUnavailable == true
+                        ? String(localized: "status.runtime_cache.location.unavailable",
+                                 defaultValue: "SSD cache is off because this directory was not available when the server started. Restart the server after reconnecting the drive.",
+                                 comment: "Warning under the SSD cache location when it was unavailable at server start")
+                        : nil) {
                     Text(dir)
                         .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
@@ -634,11 +639,24 @@ private struct UpdatesSection: View {
                 ))
             }
             Row(
+                label: String(localized: "status.updates.background_download",
+                              defaultValue: "Download Automatically",
+                              comment: "Row label for the toggle that downloads found updates in the background"),
+                sublabel: String(localized: "status.updates.background_download.sub",
+                                 defaultValue: "Download in the background, then ask before installing",
+                                 comment: "Sublabel for the background update download toggle")
+            ) {
+                RowSwitch(isOn: Binding(
+                    get: { updates.backgroundDownload },
+                    set: { updates.backgroundDownload = $0 }
+                ))
+            }
+            Row(
                 label: String(localized: "status.updates.auto_download",
                               defaultValue: "Notify About Updates",
                               comment: "Row label for the automatic update notification toggle"),
                 sublabel: String(localized: "status.updates.auto_download.sub",
-                                 defaultValue: "Show release notes before downloading in the background",
+                                 defaultValue: "Show the release notes when an update is found",
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
@@ -694,11 +712,17 @@ private struct UpdatesSection: View {
                 .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         case .available(let upd):
-            Text(String(localized: "status.updates.available_secondary",
-                        defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
-                        comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
-                .font(.omlxText(DesignTokens.FontSize.subheadline))
-                .foregroundStyle(theme.textSecondary)
+            if let error = updates.lastError {
+                Text(error)
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
+                    .foregroundStyle(theme.redDot)
+            } else {
+                Text(String(localized: "status.updates.available_secondary",
+                            defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
+                            comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline))
+                    .foregroundStyle(theme.textSecondary)
+            }
         case .downloading(let pct):
             Text(String(localized: "status.updates.downloading_secondary",
                         defaultValue: "Downloading · \(pct)%",

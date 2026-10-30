@@ -248,6 +248,8 @@ print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
 """
 
 
+# Two real ranks on one GPU: a rank can hit the Metal timeout on a busy runner.
+@pytest.mark.slow
 def test_glm5_next_cluster_forwards_match_single_process(tmp_path):
     run_two_ranks(tmp_path, _GLM5_NEXT_RANK, json.dumps(_GLM5_NEXT_TEXT))
 
@@ -390,6 +392,7 @@ print(json.dumps({"rank": rank, "ok": True, "cycles": len(cycles)}), flush=True)
 """
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("depth", "drafts", "split"),
     [

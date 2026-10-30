@@ -463,6 +463,80 @@ def _mma_mse_attention_kernel():
     )
 
 
+# Turboquant's decode pass 2 with attention sinks: a sink is one extra logit
+# per query head in the softmax denominator with no value row. Row r of the
+# partials belongs to query head (r / L) % H (rows are B x heads x L).
+_SINK_REDUCE_SOURCE = """
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = Dim / BD;
+    typedef float U;
+
+    thread U o[elem_per_thread] = {};
+    threadgroup U outputs[BN * BD];
+
+    auto head_idx = threadgroup_position_in_grid.x;
+    auto simd_gid = simdgroup_index_in_threadgroup;
+    auto simd_lid = thread_index_in_simdgroup;
+    const U sink = static_cast<U>(sinks[(int(head_idx) / L) % H]);
+
+    U max_score = -INFINITY;
+    U sum_exp_score = 0;
+    for (int b = simd_gid; b < Blocks; b += BN) {
+        U block_max = maxs[head_idx * Blocks + b];
+        U block_sum = sums[head_idx * Blocks + b];
+        U new_max = max(max_score, block_max);
+        U factor = fast::exp(max_score - new_max);
+        U block_factor = fast::exp(block_max - new_max);
+        sum_exp_score = sum_exp_score * factor + block_sum * block_factor;
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] = o[i] * factor +
+                partials[(head_idx * Blocks + b) * Dim +
+                         simd_lid * elem_per_thread + i] * block_factor;
+        }
+        max_score = new_max;
+    }
+
+    threadgroup U sg_maxs[BN];
+    threadgroup U sg_sums[BN];
+    if (simd_lid == 0) {
+        sg_maxs[simd_gid] = max_score;
+        sg_sums[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U sg_max = sg_maxs[simd_lid];
+    U new_max = max(simd_max(sg_max), sink);
+    U factor = fast::exp(sg_max - new_max);
+    U total_sum = simd_sum(sg_sums[simd_lid] * factor) + fast::exp(sink - new_max);
+    U my_factor = fast::exp(max_score - new_max);
+
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = total_sum > 0 ? o[i] / total_sum : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++)
+            out[head_idx * Dim + simd_gid * elem_per_thread + i] =
+                static_cast<U>(o[i]);
+    }
+"""
+
+
+@cache
+def _sink_reduce_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_tq_mse_sdpa_2pass2_sinks",
+        input_names=["partials", "sums", "maxs", "sinks"],
+        output_names=["out"],
+        source=_SINK_REDUCE_SOURCE,
+    )
+
+
 def _mma_blocks(total: int) -> int:
     # Half of turboquant's 2-pass decode split, measured best on M4 Max.
     if total <= 8192:
@@ -488,13 +562,17 @@ def _full_state(cache_state, state, total):
     return state
 
 
-def _mma_mse_attention(real_cache, queries, keys, values, scale, starts=None):
+def _mma_mse_attention(
+    real_cache, queries, keys, values, scale, starts=None, sinks=None
+):
     """Decode and causal verify attention over MSE states.
 
     ``starts`` holds each row's first key column for a left-padded batch
     whose rows end at the same column; without it only one sequence is
-    accepted. Returns None outside the kernel's envelope (other codecs,
-    bit widths that straddle packed words, odd head dims).
+    accepted. ``sinks`` (one logit per query head) join the softmax
+    denominator in the reduction pass. Returns None outside the kernel's
+    envelope (other codecs, bit widths that straddle packed words, odd head
+    dims).
     """
     from mlx_vlm import turboquant as _tq
 
@@ -580,14 +658,24 @@ def _mma_mse_attention(real_cache, queries, keys, values, scale, starts=None):
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    out = _tq._fused_mse_decode_2pass_2_kernel()(
-        inputs=[out_acc, out_sums, out_maxs],
-        template=[("Dim", D), ("Blocks", num_blocks)],
-        grid=(n_rows * 1024, 1, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(n_rows, D)],
-        output_dtypes=[mx.float32],
-    )[0]
+    if sinks is None:
+        out = _tq._fused_mse_decode_2pass_2_kernel()(
+            inputs=[out_acc, out_sums, out_maxs],
+            template=[("Dim", D), ("Blocks", num_blocks)],
+            grid=(n_rows * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(n_rows, D)],
+            output_dtypes=[mx.float32],
+        )[0]
+    else:
+        out = _sink_reduce_kernel()(
+            inputs=[out_acc, out_sums, out_maxs, sinks],
+            template=[("Dim", D), ("Blocks", num_blocks), ("L", L), ("H", n_q_heads)],
+            grid=(n_rows * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(n_rows, D)],
+            output_dtypes=[mx.float32],
+        )[0]
     output = value_codec._rotate_inverse(out.reshape(B, n_kv_heads, n_repeats, L, D))
     return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
@@ -914,9 +1002,16 @@ def apply_turboquant_attention_patch() -> bool:
                     sinks=sinks,
                 )
             if sinks is not None:
-                # TurboQuant's quantized kernels do not implement attention
-                # sinks. Preserve correctness by falling back to MLX's
-                # sink-aware SDPA over dequantized states.
+                # Only the MMA kernel's reduction implements attention sinks.
+                # Elsewhere preserve correctness by falling back to MLX's
+                # sink-aware SDPA over dequantized states (it re-reads the
+                # whole cache every step, so long decodes slow down).
+                if queries.shape[-2] == 1 and mask is None:
+                    result = _mma_mse_attention(
+                        real_cache, queries, keys, values, scale, sinks=sinks
+                    )
+                    if result is not None:
+                        return result
                 dequantized_keys, dequantized_values = real_cache.dequantize(
                     keys_state=keys,
                     values_state=values,

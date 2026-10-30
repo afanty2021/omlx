@@ -8,6 +8,7 @@ Note: Configuration validation tests are in test_config.py.
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -36,6 +37,32 @@ class TestCLIModule:
 
         # The module should have the main entry point
         assert callable(cli.main)
+
+    def test_package_import_relaxes_metal_preemption_timeout(self):
+        """Importing omlx sets the Metal driver flag and keeps an explicit value."""
+        code = (
+            "import os, omlx; print(os.environ.get('AGX_RELAX_CDM_CTXSTORE_TIMEOUT'))"
+        )
+        env = {
+            k: v for k, v in os.environ.items() if k != "AGX_RELAX_CDM_CTXSTORE_TIMEOUT"
+        }
+        default = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        explicit = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**env, "AGX_RELAX_CDM_CTXSTORE_TIMEOUT": "0"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        expected = "1" if sys.platform == "darwin" else "None"
+        assert default.stdout.strip() == expected
+        assert explicit.stdout.strip() == "0"
 
 
 class TestCLIHelp:
@@ -1140,6 +1167,7 @@ class TestServeCommandFunctions:
             enabled=False,
             ane_compile_cache=False,
             get_ssd_cache_dir=lambda base_path: tmp_path / "cache",
+            is_ssd_cache_dir_unavailable=lambda: False,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
             get_hot_cache_max_size_bytes=lambda: 0,
         )

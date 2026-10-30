@@ -139,6 +139,7 @@ class FakeStreamingCore:
             finished=False,
             finish_reason=None,
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
         )
 
@@ -190,6 +191,7 @@ class TestVLMStreamingCleanup:
                     finished=True,
                     finish_reason="length",
                     tool_calls=None,
+                    logprobs=None,
                     cached_tokens=0,
                     generated_at=10.0,
                     generated_until=12.0,
@@ -237,6 +239,7 @@ class TestVLMToolForwarding:
             finished=streaming,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -785,6 +788,18 @@ class TestInjectToolCalling:
         assert tokenizer.has_tool_calling is True
         assert tokenizer.tool_call_start == "<tool_call>"
 
+    def test_mimo_template_uses_qwen3_coder(self):
+        """MiMo writes <tool_call><function= with no newline (#4933)."""
+        engine = _make_engine()
+        tokenizer = MockVLMTokenizer(
+            chat_template="'<tool_call><function=' ~ tool_call.name ~ '>'",
+            vocab={"<tool_call>": 100, "</tool_call>": 101},
+        )
+
+        engine._inject_tool_calling(tokenizer)
+
+        assert tokenizer.tool_parser.__module__ == "mlx_vlm.tools.parsers.qwen3_coder"
+
     def test_skips_when_no_chat_template(self):
         """No chat template → no injection."""
         engine = _make_engine()
@@ -1145,6 +1160,27 @@ class TestApplyOcrPrompt:
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert text_parts[0]["text"] == "Text Recognition:"
+
+    @pytest.mark.parametrize(
+        "sparse, expected",
+        [
+            (None, "document parsing."),
+            ({"training_stage": "dash"}, "Multi page parsing."),
+        ],
+    )
+    def test_unlimited_ocr_default_prompt_by_version(self, sparse, expected):
+        """Unlimited-OCR-2 (DASH) uses its multi-page default prompt."""
+        engine = _make_loaded_engine(model_type="unlimited-ocr")
+        engine._vlm_model.config.text_config.sparse_attention_config = sparse
+
+        result = engine._apply_ocr_prompt(self._make_image_messages(""))
+
+        text_parts = [
+            p
+            for p in result[0]["content"]
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        assert text_parts[0]["text"] == expected
 
     def test_injects_default_prompt_when_whitespace_only(self):
         """OCR model + whitespace-only text + image → default OCR prompt injected."""
@@ -1536,6 +1572,33 @@ class TestPrepareVisionInputs:
         proc_call = engine._processor.apply_chat_template
         call_kwargs = proc_call.call_args[1]
         assert "tools" not in call_kwargs
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        "model_type, prompt_type", [("unlimited-ocr", str), ("qwen3_vl", list)]
+    )
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_unlimited_ocr_pages_share_one_prompt(
+        self, mock_vlm_act, mock_prepare, model_type, prompt_type
+    ):
+        """A prompt list makes the Unlimited-OCR processor keep only page one."""
+        engine = self._setup_engine_for_vision(model_type=model_type)
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        from PIL import Image
+
+        pages = [Image.new("RGB", (4, 4), c) for c in ("red", "green", "blue")]
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Multi page parsing."}], pages
+        )
+
+        call_kwargs = mock_prepare.call_args[1]
+        assert isinstance(call_kwargs["prompts"], prompt_type)
+        assert call_kwargs["images"] == pages
 
     def test_single_image_model_rejects_multi(self):
         """SINGLE_IMAGE_ONLY_MODELS raise ValueError for multiple images."""
@@ -3274,6 +3337,7 @@ class TestVLMEngineFrequencyPenalty:
             completion_tokens=2,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -3350,6 +3414,7 @@ class TestVLMEngineFrequencyPenalty:
                 finished=True,
                 finish_reason="stop",
                 tool_calls=None,
+                logprobs=None,
                 cached_tokens=0,
             )
 

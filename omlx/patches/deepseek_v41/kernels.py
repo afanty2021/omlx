@@ -12,6 +12,7 @@ from functools import cache
 
 import mlx.core as mx
 
+from ..glm_moe_dsa.indexer_nax import indexer_scores_nax, nax_indexer_available
 from .packed_attention import rounded_packed_attention
 
 _HEADER = r"""
@@ -408,6 +409,58 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
     )[0]
 
 
+# One thread per value: 64 FP4 code bytes, then 4 power-of-two scale bytes.
+_INDEX_UNPACK = r"""
+    const uint i = thread_position_in_grid.x;
+    if (i >= uint(rows[0]) * D) return;
+    const uint row = i / D, d = i % D;
+    const size_t base = size_t(row) * (D / 2 + D / 32);
+    const uchar code = (keys[base + d / 2] >> ((d % 2) * 4)) & 15;
+    out[i] = bfloat16_t(ldexp(v41_fp4(code), int(keys[base + D / 2 + d / 32]) - 127));
+"""
+
+# Shorter query blocks (decode, verify) stay on the native kernel.
+_NAX_INDEX_MIN_ROWS = 64
+
+
+@cache
+def _index_unpack_kernel():
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_unpack_index_keys",
+        input_names=["keys", "rows"],
+        output_names=["out"],
+        source=_INDEX_UNPACK,
+        header=_HEADER,
+    )
+
+
+def _nax_index_scores(q, keys, weights, start, ratio, key_start):
+    """Source-key scores on the tensor units, or None.
+
+    FP4 values with power-of-two scales are exact in bf16, so the head dot
+    products match the native kernel and only the FP32 head sum order differs.
+    """
+    rows, dim = keys.shape[1], q.shape[-1]
+    unpacked = _index_unpack_kernel()(
+        inputs=[keys, mx.array([rows], mx.int32)],
+        template=[("D", dim)],
+        grid=(rows * dim, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, dim)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    scores = indexer_scores_nax(
+        q[0],
+        unpacked,
+        weights[0].astype(mx.float32),
+        start - key_start * ratio,
+        rows,
+        ratio,
+        rounded=True,
+    )
+    return None if scores is None else scores[None]
+
+
 def packed_index_scores(
     q, keys, weights, start, ratio, candidates=None, *, key_start=0
 ):
@@ -428,6 +481,16 @@ def packed_index_scores(
         raise ValueError("Invalid packed index row width")
     if not width:
         return mx.zeros((1, length, 0), mx.float32)
+    if (
+        candidates is None
+        and dim == 128
+        and length >= _NAX_INDEX_MIN_ROWS
+        and q.dtype == mx.bfloat16
+        and nax_indexer_available()
+    ):
+        scores = _nax_index_scores(q, keys, weights, start, ratio, key_start)
+        if scores is not None:
+            return scores
     mma = dim <= 128 and heads >= 8
     head_split = mma and heads >= 32
     cols = 16 if head_split else 32
@@ -1024,11 +1087,13 @@ def index_select(scores, count, candidates=None):
     )[0]
 
 
-def _radix_index_topk(q, keys, weights, start, ratio, count):
+def _radix_index_topk(
+    q, keys, weights, start, ratio, count, block_count=0, block_size=0
+):
     """Score bounded query groups, then select with the radix kernel."""
     # At most 64 MiB of FP32 scores per group.
     group = min(1024, max(1, (64 << 20) // (4 * keys.shape[1])))
-    results, pending = [], None
+    results, block_results, pending = [], [], ()
     for begin in range(0, q.shape[1], group):
         end = min(begin + group, q.shape[1])
         scores = packed_index_scores(
@@ -1037,15 +1102,28 @@ def _radix_index_topk(q, keys, weights, start, ratio, count):
         ids = _radix_topk(scores, count)
         valid = mx.take_along_axis(scores, ids, -1) > -float("inf")
         ids = mx.sort(mx.where(valid, ids, -1), axis=-1)
+        if block_count:
+            values, blocks = _tile_topk(
+                scores,
+                block_count,
+                block_size=block_size,
+                force_latest=True,
+                start=start + begin,
+                ratio=ratio,
+            )
+            blocks = mx.sort(mx.where(values > -float("inf"), blocks, -1), axis=-1)
+        else:
+            blocks = mx.zeros((1, end - begin, 0), mx.int32)
         # Build the next group while this one runs; keep one group in flight.
-        if pending is not None:
-            mx.eval(pending)
-        mx.async_eval(ids)
-        pending = ids
+        if pending:
+            mx.eval(*pending)
+        pending = (ids, blocks)
+        mx.async_eval(*pending)
         results.append(ids)
-    if pending is not None:
-        mx.eval(pending)
-    return mx.concatenate(results, 1)
+        block_results.append(blocks)
+    if pending:
+        mx.eval(*pending)
+    return mx.concatenate(results, 1), mx.concatenate(block_results, 1)
 
 
 def packed_index_topk(
@@ -1090,12 +1168,20 @@ def packed_index_topk(
     width = keys.shape[1]
     count = min(count, width)
     visible = min(width, (start + q.shape[1]) // ratio)
-    if q.shape[1] > 8 and not block_count and visible >= max(_RADIX_MIN_KEYS, count):
-        ids = _radix_index_topk(q, keys[:, :visible], weights, start, ratio, count)
-        return ids, mx.zeros((1, q.shape[1], 0), mx.int32)
     if block_count:
         block_count = min(block_count, (width + block_size - 1) // block_size)
         chunk_size = max(block_size, chunk_size // block_size * block_size)
+    if (
+        q.shape[1] > 8
+        and count
+        and block_count <= 2048
+        and visible >= max(_RADIX_MIN_KEYS, count, block_count * block_size)
+    ):
+        # Candidate-source layers share the same bounded score scan. Only
+        # block maxima need tile sorting; sorting every source key is wasted.
+        return _radix_index_topk(
+            q, keys[:, :visible], weights, start, ratio, count, block_count, block_size
+        )
     results, block_results = [], []
     batch_chunks = 1 if q.shape[1] == 1 else 2
     pending = ()

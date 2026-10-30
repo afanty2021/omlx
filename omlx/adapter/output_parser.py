@@ -24,6 +24,7 @@ from ..utils.tokenizer import (
     create_streaming_detokenizer,
     is_gemma4_model,
     is_harmony_model,
+    is_mimo_tool_template,
 )
 from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
 
@@ -396,6 +397,18 @@ class BailingHybridOutputParserSession:
         )
 
 
+def correct_tool_parser_type(parser_type: str | None, template: Any) -> str | None:
+    """Return qwen3_coder for a template that MLX template matching misreads.
+
+    MiMo renders the qwen3_coder grammar with no newline after ``<tool_call>``
+    (#4933). MLX-LM and MLX-VLM match only the newline form, so they select
+    json_tools and every call fails the native parser.
+    """
+    if parser_type == "json_tools" and is_mimo_tool_template(template):
+        return "qwen3_coder"
+    return parser_type
+
+
 def repair_tool_parser(tokenizer: Any) -> str | None:
     """Replace a ``json_tools`` label that the chat template contradicts.
 
@@ -414,8 +427,11 @@ def repair_tool_parser(tokenizer: Any) -> str | None:
         return None
     # Resolve at call time because patches (hy_v3) rebind this function.
     # An empty vocab keeps the choice based on the template only.
-    inferred = tokenizer_utils._infer_tool_parser(
-        SimpleNamespace(chat_template=template, get_vocab=dict)
+    inferred = correct_tool_parser_type(
+        tokenizer_utils._infer_tool_parser(
+            SimpleNamespace(chat_template=template, get_vocab=dict)
+        ),
+        template,
     )
     if inferred in (None, "json_tools"):
         return None

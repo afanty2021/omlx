@@ -29,6 +29,7 @@ import regex
 from jsonschema import Draft202012Validator, SchemaError, ValidationError, validate
 from jsonschema.exceptions import UndefinedTypeCheck
 
+from ..utils.tokenizer import is_mimo_tool_template
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
 from .thinking import extract_thinking, leading_thinking_only
 
@@ -788,7 +789,9 @@ def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
         pos = value_end + len(_XML_PARAMETER_CLOSE)
 
 
-_ATTR_FUNCTION_OPEN_RE = re.compile(r'<function\s+name="([^"]+)"\s*>')
+_ATTR_FUNCTION_OPEN_RE = re.compile(r'<(function)\s+name="([^"]+)"\s*>')
+# MiMo-format templates also accept bare MiniMax-style <invoke> elements (#4933).
+_ATTR_ELEMENT_OPEN_RE = re.compile(r'<(function|invoke)\s+name="([^"]+)"\s*>')
 # Both <param> (MiniCPM5's chat template) and <parameter> spellings occur in
 # the wild; the backreference pairs open/close spellings so a literal
 # "</param>" cannot close a <parameter> element. The non-greedy CDATA
@@ -826,13 +829,17 @@ def _find_attr_function_span(
     """
     span_start = open_match.start()
     payload_start = open_match.end()
+    kind = open_match.group(1)
+    close = f"</{kind}>"
     cursor = payload_start
     n = len(text)
 
     while cursor < n:
         cdata_start = text.find("<![CDATA[", cursor)
-        close_tag = text.find("</function>", cursor)
-        next_open = _ATTR_FUNCTION_OPEN_RE.search(text, cursor)
+        close_tag = text.find(close, cursor)
+        next_open = _ATTR_ELEMENT_OPEN_RE.search(text, cursor)
+        while next_open is not None and next_open.group(1) != kind:
+            next_open = _ATTR_ELEMENT_OPEN_RE.search(text, next_open.end())
 
         if close_tag < 0:
             return None
@@ -856,7 +863,7 @@ def _find_attr_function_span(
             continue
 
         # close_tag is outside CDATA!
-        span_end = close_tag + len("</function>")
+        span_end = close_tag + len(close)
         payload = text[payload_start:close_tag]
         return span_start, span_end, payload
 
@@ -1026,7 +1033,7 @@ def _parse_xml_tool_calls(
         # truncate the element early.
         attr_open = _ATTR_FUNCTION_OPEN_RE.match(content)
         if attr_open:
-            func_name = attr_open.group(1)
+            func_name = attr_open.group(2)
             found = _find_attr_function_span(content, attr_open)
             if found is not None:
                 params_text = found[2]
@@ -1123,7 +1130,7 @@ def _parse_namespaced_tool_calls(
 
 
 def _parse_attribute_function_tool_calls(
-    text: str, tools: Optional[List] = None
+    text: str, tools: Optional[List] = None, *, bare_invoke: bool = False
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for bare attribute-style tool calls (#3429).
@@ -1131,7 +1138,9 @@ def _parse_attribute_function_tool_calls(
     MiniCPM5-family chat templates emit
     ``<function name="name"><param name="key">value</param></function>``
     with no wrapper marker at all, so none of the envelope-anchored parsers
-    ever see it.
+    ever see it. With ``bare_invoke`` (MiMo-format templates, #4933),
+    MiniMax-style ``<invoke name="name"><parameter name="key">`` elements
+    without the ``<minimax:tool_call>`` wrapper are parsed too.
 
     Without an envelope the only safe anchor is the request's own tool
     declarations: an element is parsed only when its name exactly matches a
@@ -1154,14 +1163,15 @@ def _parse_attribute_function_tool_calls(
     if not registered:
         return text, None
 
+    open_re = _ATTR_ELEMENT_OPEN_RE if bare_invoke else _ATTR_FUNCTION_OPEN_RE
     tool_calls = []
     spans: List[Tuple[int, int]] = []
     pos = 0
     while pos < len(text):
-        match = _ATTR_FUNCTION_OPEN_RE.search(text, pos)
+        match = open_re.search(text, pos)
         if not match:
             break
-        func_name = match.group(1)
+        func_name = match.group(2)
         if func_name not in registered:
             pos = match.end()
             continue
@@ -2089,19 +2099,21 @@ def _parse_tool_calls_impl(
             r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
         ).strip()
 
-    if tools and _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
+    bare_invoke = is_mimo_tool_template(getattr(tokenizer, "chat_template", None))
+    attr_open_re = _ATTR_ELEMENT_OPEN_RE if bare_invoke else _ATTR_FUNCTION_OPEN_RE
+    if tools and attr_open_re.search(cleaned_text):
         # Select outer envelopes before inspecting markers inside CDATA values.
         finder = ToolCallStreamFilter(tokenizer, tools=tools)
         pos, prose, attr_calls = 0, [], []
         while start := finder._find_start_envelope(cleaned_text, pos):
-            opening = _ATTR_FUNCTION_OPEN_RE.match(cleaned_text, start[0])
+            opening = attr_open_re.match(cleaned_text, start[0])
             if opening is None:
                 break
             span = _find_attr_function_span(cleaned_text, opening)
             if span is None:
                 break
             _, calls = _parse_attribute_function_tool_calls(
-                cleaned_text[span[0] : span[1]], tools
+                cleaned_text[span[0] : span[1]], tools, bare_invoke=bare_invoke
             )
             if not calls:
                 break
@@ -2277,10 +2289,13 @@ def _parse_tool_calls_impl(
         return _parse_namespaced_tool_calls(cleaned_text, ns, tools)
 
     # Fallback: bare attribute-style <function name="..."> elements with no
-    # wrapper marker (MiniCPM5 family, #3429). Anchored on declared tool
-    # names; see the parser's docstring.
-    if _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
-        attr_result = _parse_attribute_function_tool_calls(cleaned_text, tools)
+    # wrapper marker (MiniCPM5 family, #3429), plus <invoke name="..."> for
+    # MiMo-format templates (#4933). Anchored on declared tool names; see the
+    # parser's docstring.
+    if attr_open_re.search(cleaned_text):
+        attr_result = _parse_attribute_function_tool_calls(
+            cleaned_text, tools, bare_invoke=bare_invoke
+        )
         if attr_result[1] is not None:
             return attr_result
 
@@ -2555,6 +2570,19 @@ def extract_tool_calls_with_thinking(
                     tool_calls_from_thinking = False
             else:
                 valid_names = _extract_tool_names(tools)
+                dropped = [
+                    tc.function.name[:200]
+                    for tc in tool_calls
+                    if tc.function.name not in valid_names
+                ]
+                if dropped:
+                    # The reasoning filter already removed these envelopes.
+                    logger.warning(
+                        "Dropped %d tool call(s) from reasoning with undeclared "
+                        "names: %s",
+                        len(dropped),
+                        dropped[:8],
+                    )
                 tool_calls = [
                     tc for tc in tool_calls if tc.function.name in valid_names
                 ]
@@ -2675,6 +2703,9 @@ class ToolCallStreamFilter:
                 self._registered_tool_names = _extract_tool_names(tools)
         else:
             self._registered_tool_names = set()
+        self._bare_invoke = is_mimo_tool_template(
+            getattr(tokenizer, "chat_template", None)
+        )
         self._attr_func_in_cdata = False
         if marker:
             if marker_end:
@@ -3047,7 +3078,7 @@ class ToolCallStreamFilter:
             self._naked_scan_off = len(buffer) if end is None else end
             return -1 if end is None else end - len(_XML_FUNCTION_CLOSE)
 
-        if marker == "</function>":
+        if marker in ("</function>", "</invoke>"):
             return self._find_attr_function_suppression_end(buffer)
 
         # Feed the boundary scanner while the dialect is still undecided too:
@@ -3212,9 +3243,12 @@ class ToolCallStreamFilter:
         def compute_attr_func() -> Optional[Tuple[int, int, Optional[str]]]:
             if not self._registered_tool_names:
                 return None
-            for m in _ATTR_FUNCTION_OPEN_RE.finditer(text, start):
-                if m.group(1) in self._registered_tool_names:
-                    return (m.start(), len(m.group(0)), "</function>")
+            open_re = (
+                _ATTR_ELEMENT_OPEN_RE if self._bare_invoke else _ATTR_FUNCTION_OPEN_RE
+            )
+            for m in open_re.finditer(text, start):
+                if m.group(2) in self._registered_tool_names:
+                    return (m.start(), len(m.group(0)), f"</{m.group(1)}>")
             return None
 
         hit = lookup("attr_func", compute_attr_func)
@@ -3257,16 +3291,25 @@ class ToolCallStreamFilter:
         return "tool_call".startswith(suffix)
 
     def _could_be_partial_attr_function_open(self, candidate: str) -> bool:
-        """Return True if candidate could prefix a bare <function name="..."> tag for a declared tool."""
+        """Return True if candidate could prefix a bare open tag for a declared tool.
+
+        Covers ``<function name="...">``, plus ``<invoke name="...">`` for
+        MiMo-format templates.
+        """
         if not self._registered_tool_names:
             return False
         if not candidate.startswith("<") or ">" in candidate:
             return False
-        if "<function".startswith(candidate):
+        tag = (
+            "<invoke"
+            if self._bare_invoke and candidate.startswith("<i")
+            else "<function"
+        )
+        if tag.startswith(candidate):
             return True
-        if not candidate.startswith("<function"):
+        if not candidate.startswith(tag):
             return False
-        rest = candidate[len("<function") :]
+        rest = candidate[len(tag) :]
         if not rest:
             return True
         if not rest[0].isspace():
@@ -3582,7 +3625,7 @@ class ToolCallStreamFilter:
                 end_idx = self._find_suppression_end(self._buffer)
                 if end_idx < 0:
                     if (
-                        self._suppressing_until == "</function>"
+                        self._suppressing_until in ("</function>", "</invoke>")
                         or self._json_state == "attr_xml"
                     ):
                         if self._attr_func_in_cdata:

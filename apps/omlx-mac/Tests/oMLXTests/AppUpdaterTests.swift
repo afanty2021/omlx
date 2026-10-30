@@ -64,16 +64,6 @@ final class AppUpdaterTests: XCTestCase {
 
     // MARK: - Staged-app signature verification
 
-    private func makeUpdater() -> AppUpdater {
-        AppUpdater(
-            dmgURL: URL(fileURLWithPath: "/tmp/unused.dmg"),
-            version: "test",
-            onProgress: { _ in },
-            onError: { _ in },
-            onReady: {}
-        )
-    }
-
     /// Builds a minimal .app bundle (plist + tiny executable) at path.
     private func makeAppBundle(at appURL: URL) throws {
         let macOS = appURL.appendingPathComponent("Contents/MacOS", isDirectory: true)
@@ -124,7 +114,7 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(codesign(["-f", "-s", "-", appURL.path]), 0, "test setup: ad-hoc sign failed")
 
         XCTAssertThrowsError(
-            try makeUpdater().verifyAppSignature(at: appURL.path)
+            try AppUpdater.verifyAppSignature(at: appURL.path)
         ) { error in
             guard case AppUpdater.UpdateError.signatureInvalid = error else {
                 return XCTFail("expected signatureInvalid, got \(error)")
@@ -139,7 +129,7 @@ final class AppUpdaterTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: appURL) }
 
         XCTAssertThrowsError(
-            try makeUpdater().verifyAppSignature(at: appURL.path)
+            try AppUpdater.verifyAppSignature(at: appURL.path)
         ) { error in
             guard case AppUpdater.UpdateError.signatureInvalid = error else {
                 return XCTFail("expected signatureInvalid, got \(error)")

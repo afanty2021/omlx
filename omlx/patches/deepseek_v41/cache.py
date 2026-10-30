@@ -20,7 +20,9 @@ class DeepseekV41Cache(ArraysCache):
     ``state``) for code that reads a batch as arrays.
     """
 
-    # offset, window KV, compressed KV, index K, partial KV, partial gates, history
+    # offset, window KV, compressed KV, index K, partial KV, partial gates, history.
+    # After a CED chunk that skipped its decoder tail, the midpoint layer also holds
+    # the decoder replay input in slots 7-10 (see pending()).
     def __init__(self, compress_ratio=0):
         self._rows = None
         self._dense = None
@@ -43,13 +45,19 @@ class DeepseekV41Cache(ArraysCache):
 
     def __setitem__(self, idx, value):
         if self._rows is not None:
+            if any(row.has_pending() for row in self._rows) and len(self._rows) > 1:
+                # The dense layout has no per-row replay slots.
+                raise ValueError("A pending V4.1 decoder replay cannot be batched")
             dense = self.cache
             self._rows = None
             self._dense = dense
         self._dense[idx] = value
 
     def _materialize(self):
-        """Padded dense arrays of a row-backed batch (same layout extend() builds)."""
+        """Padded dense arrays of a row-backed batch (same layout extend() builds).
+        A single row keeps its replay slots."""
+        if len(self._rows) == 1:
+            return list(self._rows[0].cache)
         states = []
         for slot in range(7):
             values = [row.cache[slot] for row in self._rows]
@@ -123,6 +131,23 @@ class DeepseekV41Cache(ArraysCache):
         obj.meta_state = meta_state
         return obj
 
+    def has_pending(self):
+        if self._rows is not None:
+            return any(row.has_pending() for row in self._rows)
+        return self._dense is not None and len(self._dense) > 7
+
+    def pending(self):
+        """The decoder replay input: midpoint output hidden, pre weights, top-k
+        ids and candidate blocks of the last window, or None."""
+        if not self.has_pending():
+            return None
+        if self._rows is not None and len(self._rows) > 1:
+            raise ValueError("A batch holds its decoder replay inputs per row")
+        return tuple(self.cache[7:])
+
+    def set_pending(self, values):
+        self.cache = list(self.cache[:7]) + ([] if values is None else list(values))
+
     @property
     def offset(self):
         return self.cache[0] if self.cache[0] is not None else 0
@@ -138,17 +163,20 @@ class DeepseekV41Cache(ArraysCache):
 
     @property
     def meta_state(self):
-        return (
-            ("deepseek_v41", "2")
-            if self.compress_ratio is None
-            else ("deepseek_v41", "3", str(self.compress_ratio))
-        )
+        if self.compress_ratio is None:
+            return ("deepseek_v41", "2")
+        # Version 4 marks the replay slots, which older readers must reject.
+        version = "4" if len(self.cache) > 7 else "3"
+        return ("deepseek_v41", version, str(self.compress_ratio))
 
     @meta_state.setter
     def meta_state(self, value):
         if tuple(value) == ("deepseek_v41", "2"):
             self.compress_ratio = None
-        elif len(value) == 3 and tuple(value[:2]) == ("deepseek_v41", "3"):
+        elif len(value) == 3 and tuple(value[:2]) in (
+            ("deepseek_v41", "3"),
+            ("deepseek_v41", "4"),
+        ):
             self.compress_ratio = int(value[2])
             if self.compress_ratio < 0:
                 raise ValueError("Invalid DeepSeek V4.1 compression ratio")
@@ -273,6 +301,6 @@ class DeepseekV41CacheHandler(ArraysCacheHandler):
 
     def reconstruct_cache(self, state, meta_state=None, token_count=0):
         states = state.get("states", [])
-        if len(states) != 7:
+        if len(states) not in (7, 11):
             raise ValueError("V4.1 delta requires its complete block chain")
         return DeepseekV41Cache.from_state(states, meta_state)

@@ -1660,6 +1660,40 @@ def test_recovery_candidate_payload_versus_quoted_marker(markers, text, is_paylo
     assert f.take_recovery_candidate()
 
 
+def test_recovery_candidate_unclosed_envelope_3153_is_payload():
+    """Issue #3153 sample is a truncated call payload, not quoted-marker prose.
+
+    Option 1 recovery is not attempted here: the sample has no closing tags
+    and uses bare query= rather than <parameter=query>.
+    """
+    sample = (
+        "I have comprehensive material. Let me do one final targeted check...\n"
+        "\n"
+        "<tool_call>\n"
+        "<function=websearch>\n"
+        'query="Flowable Work platform-api analytics process-instance query '
+        'endpoint frequency duration chart data REST" numResults=5'
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "websearch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+    visible = f.feed(sample) + f.finish()
+
+    assert "<tool_call>" not in visible
+    assert f.recovery_candidate_is_payload() is True
+    assert f.take_recovery_candidate().startswith("<tool_call>")
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())
@@ -2633,6 +2667,25 @@ class TestThinkingFallbackGuardRegression:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].function.name == "write_file"
         assert result.tool_calls_from_thinking is True
+
+    def test_undeclared_thinking_call_drop_is_logged(self, caplog):
+        """The reasoning filter removes the envelope, so the drop must be
+        visible in the log (#4933)."""
+        thinking = (
+            "Let me read the log. "
+            '<tool_call>{"name": "Read", "arguments": {"path": "/tmp/a.log"}}'
+            "</tool_call>"
+        )
+        tools = [{"type": "function", "function": {"name": "read"}}]
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = extract_tool_calls_with_thinking(
+                thinking, "", tokenizer=_make_tokenizer(), tools=tools
+            )
+
+        assert result.tool_calls is None
+        assert result.cleaned_thinking == "Let me read the log."
+        assert "undeclared names: ['Read']" in caplog.text
 
     def test_empty_tools_list_drops_thinking_calls_no_regular(self):
         """tools=[] means 'no tools allowed' — drop thinking-embedded calls
@@ -5326,10 +5379,19 @@ class TestAttributeStyleFunctionDialect:
         '<function name="read"><param name="path">/workspace/TASK.md</param>'
         "</function>"
     )
+    # MiMo writes compact qwen3_coder calls and sometimes MiniMax-style
+    # <invoke> elements without their <minimax:tool_call> wrapper (#4933).
+    MIMO_TEMPLATE = "{{- '<tool_call><function=' ~ tool_call.name ~ '>' -}}"
+    BARE_INVOKE = (
+        '<invoke name="read">\n<parameter name="path">/workspace/TASK.md'
+        "</parameter>\n</invoke>"
+    )
 
-    def _tokenizer(self):
+    def _tokenizer(self, chat_template=None):
         tok = MagicMock(spec=[])
         tok.has_tool_calling = False
+        if chat_template is not None:
+            tok.chat_template = chat_template
         return tok
 
     def test_bare_element_parses_with_declared_tool(self):
@@ -5352,6 +5414,31 @@ class TestAttributeStyleFunctionDialect:
         assert "function" not in cleaned
         assert "I'll read the file." in cleaned
         assert "Standing by." in cleaned
+
+    def test_bare_invoke_parses_for_mimo_template(self):
+        text = f"I'll read the file. {self.BARE_INVOKE} Standing by."
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(self.MIMO_TEMPLATE), [self.READ_TOOL]
+        )
+        assert [c.function.name for c in calls] == ["read"]
+        assert json.loads(calls[0].function.arguments) == {"path": "/workspace/TASK.md"}
+        assert "invoke" not in cleaned
+        assert "I'll read the file." in cleaned
+        assert "Standing by." in cleaned
+
+    @pytest.mark.parametrize(
+        "chat_template, name",
+        [(None, "read"), (MIMO_TEMPLATE, "evil")],
+        ids=["other-template", "undeclared-name"],
+    )
+    def test_bare_invoke_left_as_text(self, chat_template, name):
+        text = f'<invoke name="{name}"><parameter name="path">/x</parameter></invoke>'
+        tok = self._tokenizer(chat_template)
+        cleaned, calls = parse_tool_calls(text, tok, [self.READ_TOOL])
+        assert calls is None
+        assert cleaned == text
+        f = ToolCallStreamFilter(tok, tools=[self.READ_TOOL])
+        assert f.feed(text) + f.finish() == text
 
     def test_parameter_spelling_variant(self):
         text = (
@@ -5437,6 +5524,21 @@ class TestAttributeStyleFunctionDialect:
             'ion name="read"><param name="pa',
             'th">/x</param></funct',
             "ion>",
+            " Done.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Sure.  Done."
+
+    def test_stream_filter_suppresses_bare_invoke_across_chunks(self):
+        f = ToolCallStreamFilter(
+            self._tokenizer(self.MIMO_TEMPLATE), tools=[self.READ_TOOL]
+        )
+        chunks = [
+            "Sure. ",
+            "<inv",
+            'oke name="re',
+            'ad">\n<parameter name="path">/x</parameter>\n</inv',
+            "oke>",
             " Done.",
         ]
         out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()

@@ -164,7 +164,10 @@ private struct ExternalEnginesSection: View {
                               comment: "Row label for the Splash SSD cache size"),
                 sublabel: String(localized: "integrations.splash.ssd_cache.sub",
                                  defaultValue: "Splash's prefix cache in the oMLX SSD cache folder. Empty uses the oMLX SSD cache size; 0 turns it off.",
-                                 comment: "Sublabel for the Splash SSD cache size")) {
+                                 comment: "Sublabel for the Splash SSD cache size"),
+                warning: String(localized: "integrations.splash.ssd_cache.warning",
+                                defaultValue: "Applies to each Splash model, and a model's cache stays after it unloads, so the total can grow to this size times the number of Splash models you use. Set a size when you use more than one.",
+                                comment: "Warning under the Splash SSD cache size about its per-model limit")) {
                 TextInput(text: $vm.splashSsdCacheGb,
                           placeholder: String(localized: "integrations.splash.auto",
                                               defaultValue: "Auto",

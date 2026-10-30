@@ -697,6 +697,38 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     )
 
 
+def test_qwen4_decode_rows_never_read_back_rank_three_positions(monkeypatch):
+    """A one-row step never takes gathered prefill, so the host comparison of
+    its rank-three positions (a GPU sync per step) is never made."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    cache = _crossover_cache(config, attention)
+    checked = []
+
+    def broadcast_check(position_ids, length):
+        checked.append(length)
+        return True
+
+    monkeypatch.setattr(language, "_broadcast_text_mrope_position_ids", broadcast_check)
+    row = mx.random.normal((1, 1, config.hidden_size))
+    row_planes = mx.full((3, 1, 1), cache.offset, dtype=mx.int32)
+    assert not attention._gathered_text_prefill_eligible(
+        row, "causal", cache, row_planes, None, False
+    )
+    assert checked == []
+
+    wide = mx.random.normal((1, 16, config.hidden_size))
+    wide_planes = mx.broadcast_to(
+        (cache.offset + mx.arange(16, dtype=mx.int32))[None, None], (3, 1, 16)
+    )
+    assert attention._gathered_text_prefill_eligible(
+        wide, "causal", cache, wide_planes, None, False
+    )
+    assert checked == [16]
+
+
 def test_qwen4_trim_keeps_pooled_index_prefix_exact():
     """trim() clamps the pooled frontier instead of re-pooling every block."""
     config = _tiny_text_config()
@@ -898,8 +930,11 @@ def _require_selection(result):
 @pytest.mark.parametrize(
     "key_len",
     [
-        2052,  # 513 blocks: one above the budget
+        2052,  # 513 blocks: one above the budget, 1 per thread
         2055,  # three-token tail
+        4096,  # 1024 blocks: largest bank held 1 per thread
+        4100,  # 1025 blocks: 2 per thread
+        8197,  # 2049 blocks, one-token tail: 4 per thread
         24003,  # 24K decode
         32768,  # 8192 blocks: largest bank held 8 per thread
         32773,  # 8193 blocks, one-token tail: 16 per thread
@@ -970,7 +1005,7 @@ def test_pipeline_limit_keeps_the_kernel_for_smaller_banks(monkeypatch):
     actual, scores = select(2055)
     assert actual is not None
     assert mx.array_equal(actual, _official_mask(scores, 2055)).item()
-    assert launches == [16, 8]
+    assert launches == [16, 1]
 
 
 def test_block_scores_round_like_maximum_sum_divide():
@@ -1168,7 +1203,7 @@ def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
     return tokens
 
 
-@pytest.mark.parametrize("key_len", [2052, 32770, 65539])
+@pytest.mark.parametrize("key_len", [2052, 4100, 8197, 32770, 65539])
 @pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "specials"])
 def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     blocks = key_len // RATIO

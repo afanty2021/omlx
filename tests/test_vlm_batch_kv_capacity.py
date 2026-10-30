@@ -14,6 +14,7 @@ from omlx.cache.type_handlers import KVCacheHandler
 from omlx.patches.mlx_vlm_qwen4_exp_compat import (
     apply_mlx_vlm_qwen4_exp_compat_patch,
 )
+from omlx.patches.vlm_batch_kv_capacity import _refill_order
 
 apply_mlx_vlm_qwen4_exp_compat_patch()
 
@@ -62,6 +63,8 @@ def equal(a, b):
     assert a._idx == b._idx
     if a.keys is None:
         return
+    # A refill keeps spare rows only while live rows fill over half the bank.
+    assert b._keys.shape[0] < 2 * b.keys.shape[0]
     assert b._logical_width() == a.keys.shape[2]
     assert mx.array_equal(a.keys, b.keys[..., : b._logical_width(), :]).item()
     assert mx.array_equal(a.values, b.values[..., : b._logical_width(), :]).item()
@@ -96,7 +99,16 @@ def test_cache_and_attention_match_stock_through_lifecycle(seed, backend):
     equal(a, b)
     for step in range(40):
         operation = rng.choice(
-            ["append", "merge", "trim", "rollback", "filter", "extend", "restore"]
+            [
+                "append",
+                "merge",
+                "trim",
+                "rollback",
+                "filter",
+                "finish",
+                "extend",
+                "restore",
+            ]
         )
         if operation in ("append", "rollback"):
             n = rng.randint(1, 17)
@@ -118,6 +130,12 @@ def test_cache_and_attention_match_stock_through_lifecycle(seed, backend):
             )
         elif operation == "filter":
             kept = rng.sample(range(a.keys.shape[0]), rng.randint(1, a.keys.shape[0]))
+            a.filter(kept)
+            b.filter(kept)
+        elif operation == "finish":
+            # The row order GenerationBatch.filter passes after rows finish.
+            rows = a.keys.shape[0]
+            kept = _refill_order(sorted(rng.sample(range(rows), rng.randint(1, rows))))
             a.filter(kept)
             b.filter(kept)
         elif operation == "extend" and a.keys.shape[0] < 6:
@@ -142,7 +160,7 @@ def test_merge_reserves_append_without_changing_logical_width(backend):
     c = make(patched, [8192, 8187])
     assert c._logical_width() == 8192
     capacity = c.keys.shape[2]
-    assert 8192 < capacity <= 8192 * 1.125 + 512
+    assert 8192 < capacity <= 8192 * 1.25 + 512
     for _ in range(16):
         x = mx.ones((2, 2, 5, 8), mx.bfloat16)
         c.update_and_fetch(x, x)
@@ -152,6 +170,127 @@ def test_merge_reserves_append_without_changing_logical_width(backend):
         assert row.keys.shape[2] > row.offset
     else:
         assert row.keys.shape[2] == row.offset
+
+
+def test_finished_row_is_refilled_without_copying_the_bank(backend):
+    stock, patched = backend
+    lengths = [4000, 3990, 3999, 3000, 3998, 3997, 3996, 3995]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((8, 2, 3, 8), mx.bfloat16)
+    kept = _refill_order([0, 1, 2, 4, 5, 6, 7])
+    for c in (a, b):
+        c.update_and_fetch(x, x)
+        c.filter(kept)
+        c.update_and_fetch(x[:7], x[:7])
+    # The bank keeps its eight rows; the freed slot holds the last row.
+    assert b._keys.shape[0] == 8 and b.keys.shape[0] == 7
+    equal(a, b)
+
+
+def test_setting_keys_alone_after_a_refill_keeps_rows_aligned(backend):
+    stock, patched = backend
+    a, b = make(stock, [40, 39, 38, 37]), make(patched, [40, 39, 38, 37])
+    x = mx.ones((3, 2, 2, 8), mx.bfloat16)
+    for c in (a, b):
+        c.filter(_refill_order([0, 1, 3]))
+        c.keys = mx.depends(c.keys, c.values)
+        c.update_and_fetch(x, x)
+    assert b.keys.shape[0] == b.values.shape[0] == 3
+    equal(a, b)
+
+
+def test_join_fills_a_freed_row_and_shifts_live_rows_in_place(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    # A row shorter than the batch, then one longer that moves the live rows right.
+    for joined in (120, 700):
+        for c in (a, b):
+            c.filter(_refill_order([0, 1, 2]))
+        bank = b._keys
+        a.extend(make(stock, [joined]))
+        b.extend(make(patched, [joined]))
+        assert b._keys is bank
+        equal(a, b)
+    assert b._idx == 700
+
+
+def test_finish_of_the_longest_row_drops_the_padding_in_place(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    for c in (a, b):
+        c.filter(_refill_order([1, 2, 3]))
+    # The spare row stays for the next join.
+    assert b._keys.shape[0] == 4 and b.keys.shape[0] == 3
+    equal(a, b)
+
+
+def test_ragged_rollback_keeps_the_spare_rows(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((3, 2, 9, 8), mx.bfloat16)
+    for c in (a, b):
+        c.filter(_refill_order([0, 1, 2]))
+        c.update_and_fetch(x, x)
+        c.prepare(right_padding=[0, 6, 3])
+        c.finalize()
+    assert b._keys.shape[0] == 4 and b.keys.shape[0] == 3
+    equal(a, b)
+
+
+def test_join_after_an_in_place_drop_leaves_no_stale_columns(backend):
+    stock, patched = backend
+    lengths = [3000, 2500, 2600, 2800]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((4, 2, 1, 8), mx.bfloat16)
+    for c, module in ((a, stock), (b, patched)):
+        c.filter(_refill_order([1, 2, 3]))
+        c.extend(make(module, [1000]))
+        # Growth inside the capacity turns spare columns into logical ones.
+        c.update_and_fetch(x, x)
+    equal(a, b)
+
+
+def test_finish_that_drops_most_of_the_width_releases_the_bank(backend):
+    stock, patched = backend
+    lengths = [8192, 500, 480, 490]
+    a, b = make(stock, lengths), make(patched, lengths)
+    for c in (a, b):
+        c.filter(_refill_order([1, 2, 3]))
+    assert b._keys.shape[0] == 3 and b._keys.shape[2] < 2048
+    equal(a, b)
+
+
+@pytest.mark.parametrize("hold_view", [False, True])
+@pytest.mark.parametrize("shift", [6, 20])
+def test_ragged_rollback_matches_stock_on_every_roll_path(backend, shift, hold_view):
+    """Native in place, native copy (a view holds the bank) and the gather fallback."""
+    stock, patched = backend
+    lengths = [300, 290, 299]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((3, 2, 24, 8), mx.bfloat16)
+    for c in (a, b):
+        c.update_and_fetch(x, x)
+    held = b._keys[:1] if hold_view else None
+    for c in (a, b):
+        c.prepare(right_padding=[0, shift, 3])
+        c.finalize()
+    equal(a, b)
+    del held
+
+
+def test_setting_the_bank_back_keeps_its_logical_width(backend):
+    stock, patched = backend
+    a, b = make(stock, [300, 290, 280]), make(patched, [300, 290, 280])
+    # DSA indexers and MTP heads write the bank back through mx.depends each step.
+    for _ in range(3):
+        for c, module in ((a, stock), (b, patched)):
+            c.keys = mx.depends(c.keys, c.values)
+            c.extend(make(module, [100]))
+            c.filter([0, 1, 2])
+        equal(a, b)
 
 
 def test_prefix_handler_restore_uses_capacity_managed_cache():

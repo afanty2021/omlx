@@ -52,6 +52,18 @@ def _write_qwen4_mtp_checkpoint(tmp_path, *, embedded_mtp: bool) -> None:
     )
 
 
+def _write_minimax_m3_checkpoint(tmp_path, *, dspark: bool) -> None:
+    config = {"model_type": "minimax_m3_vl", "text_config": {"num_hidden_layers": 60}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if dspark:
+        draft = tmp_path / "dspark"
+        draft.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"architectures": ["DSparkMiniMaxDraftModel"]})
+        )
+        (draft / "model-dspark-00001.safetensors").write_bytes(b"")
+
+
 async def _update_settings(
     pool: EnginePool,
     settings: ModelSettings,
@@ -274,6 +286,31 @@ def _idle_engine() -> MagicMock:
 
 
 @pytest.mark.asyncio
+async def test_gpu_power_limit_saves_without_reload():
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings()
+
+    def request(watts):
+        return admin_routes.ModelSettingsRequest(gpu_power_limit_w=watts)
+
+    result = await _update_settings(pool, settings, request(10))
+    assert settings.gpu_power_limit_w == 10
+    assert result["requires_reload"] is False
+    pool._unload_engine.assert_not_awaited()
+
+    await _update_settings(pool, settings, request(0))
+    assert settings.gpu_power_limit_w is None
+
+    # Profiles and templates go through the same request model.
+    with pytest.raises(pydantic.ValidationError):
+        request(1)
+    assert admin_routes._normalize_profile_settings({"gpu_power_limit_w": 0}) == {}
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
@@ -343,9 +380,9 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 @pytest.mark.parametrize(
     "initial, update",
     [
-        ({"qwen35_ane_prefill_enabled": True}, {"qwen35_oq_a8_enabled": True}),
-        ({"qwen35_oq_a8_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
-        ({}, {"qwen35_oq_a8_enabled": True, "qwen35_ane_prefill_enabled": True}),
+        ({"qwen35_ane_prefill_enabled": True}, {"a8_prefill_enabled": True}),
+        ({"a8_prefill_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
+        ({}, {"a8_prefill_enabled": True, "qwen35_ane_prefill_enabled": True}),
     ],
 )
 async def test_oq_a8_is_refused_while_ane_prefill_is_on(tmp_path, initial, update):
@@ -383,12 +420,12 @@ async def test_oq_a8_alone_is_persisted():
             pool,
             settings,
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=256
+                a8_prefill_enabled=True, a8_prefill_min_tokens=256
             ),
         )
 
-    assert settings.qwen35_oq_a8_enabled is True
-    assert settings.qwen35_oq_a8_min_tokens == 256
+    assert settings.a8_prefill_enabled is True
+    assert settings.a8_prefill_min_tokens == 256
 
 
 @pytest.mark.asyncio
@@ -403,12 +440,12 @@ async def test_oq_a8_is_accepted_for_qwen4_exp_and_keeps_min_tokens():
             pool,
             settings,
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=512
+                a8_prefill_enabled=True, a8_prefill_min_tokens=512
             ),
         )
 
-    assert settings.qwen35_oq_a8_enabled is True
-    assert settings.qwen35_oq_a8_min_tokens == 512
+    assert settings.a8_prefill_enabled is True
+    assert settings.a8_prefill_min_tokens == 512
 
 
 @pytest.mark.asyncio
@@ -426,12 +463,12 @@ async def test_oq_a8_is_refused_outside_validated_families(config_type):
             await _update_settings(
                 pool,
                 settings,
-                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+                admin_routes.ModelSettingsRequest(a8_prefill_enabled=True),
             )
 
     assert excinfo.value.status_code == 400
     assert "Flash-Next" in excinfo.value.detail
-    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.a8_prefill_enabled is False
 
 
 @pytest.mark.asyncio
@@ -453,7 +490,7 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         await admin_routes.update_model_settings(
             "ling",
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+                a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True
             ),
             is_admin=True,
         )
@@ -472,6 +509,8 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         ("Qwen4-Exp", True),
         ("qwen4", False),
         ("qwen4_exp_x", False),
+        ("deepseek_v41", True),
+        ("deepseek_v4", False),
         ("llama", False),
         (None, False),
     ],
@@ -487,7 +526,7 @@ def test_oq_a8_model_supported(config_type, expected):
 def test_model_options_report_oq_a8_support(config_type, kernels, expected):
     with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=kernels):
         options = admin_routes._model_options({"config_model_type": config_type}, None)
-    assert options["qwen35_oq_a8_supported"] is expected
+    assert options["a8_prefill_supported"] is expected
 
 
 @pytest.mark.asyncio
@@ -503,12 +542,12 @@ async def test_oq_a8_needs_native_int8_kernels():
             await _update_settings(
                 pool,
                 settings,
-                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+                admin_routes.ModelSettingsRequest(a8_prefill_enabled=True),
             )
 
     assert excinfo.value.status_code == 400
     assert "M5-series or newer" in excinfo.value.detail
-    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.a8_prefill_enabled is False
 
 
 @pytest.mark.asyncio
@@ -621,6 +660,43 @@ async def test_qwen4_mtp_setting_rejects_nextn_only_layout(tmp_path):
 
     assert exc_info.value.status_code == 400
     assert "native nextn layers are not supported" in exc_info.value.detail
+    assert settings.mtp_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_minimax_m3_mtp_setting_accepts_bundled_dspark(tmp_path):
+    _write_minimax_m3_checkpoint(tmp_path, dspark=True)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "minimax_m3_vl"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_enabled=True),
+    )
+
+    assert settings.mtp_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_minimax_m3_mtp_setting_rejects_missing_dspark(tmp_path):
+    _write_minimax_m3_checkpoint(tmp_path, dspark=False)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "minimax_m3_vl"
+    settings = ModelSettings()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(mtp_enabled=True),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "no bundled dspark/ draft" in exc_info.value.detail
     assert settings.mtp_enabled is False
 
 

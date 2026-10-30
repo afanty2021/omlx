@@ -12,7 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
-- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, Decision 3.0)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, d3, d1)
 """
 
 import contextlib
@@ -34,7 +34,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3"]
+DecisionKind = Literal["clef", "openjev", "d3", "d1"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -80,6 +80,7 @@ VLM_MODEL_TYPES = {
     "muse_glimmer",
     "muse_spark",
     "glm5_next",
+    "lfm3_audio",
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -88,6 +89,8 @@ VLM_MODEL_TYPES = {
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
     "flint",
+    # Same mlx-vlm text tower as LFM3-VL, LFM3-Audio and LFM3-Omni.
+    "lfm3",
     # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
     "deepseek_v41",
     "glm5_next",
@@ -312,8 +315,9 @@ UNSUPPORTED_ARCHITECTURES: set[str] = set()
 # Some base LLM model_types (qwen3, llama, …) collide with mlx-audio TTS
 # model directory names because mlx-audio extends these architectures for
 # audio.  We exclude them so a plain Qwen3 LLM is not misdetected as TTS.
+# mlx-audio maps "mimo" to its MiMo ASR model; MiMo-7B LLMs use that type too.
 
-_LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense"}
+_LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense", "mimo"}
 
 
 def _build_audio_detection_sets():
@@ -489,7 +493,8 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
     """Return the decision-model family of a checkpoint, or None.
 
     Clef is identified by its joint head files and Decision 3.0 by its
-    readout and decision config. OpenJev is a plain Qwen3.5 checkpoint, so it
+    readout and decision config. LiquidAI d1 declares ``D1Model`` on an
+    LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint, so it
     is identified by its helper directory or, for MLX conversions without the
     helper, by the directory name.
     """
@@ -507,7 +512,13 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
                 config = json.load(f)
         except (OSError, ValueError):
             return None
-    if config.get("model_type") != "qwen3_5":
+    model_type = config.get("model_type")
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or str((config.get("auto_map") or {}).get("AutoModel", "")).endswith("D1Model")
+    ):
+        return "d1"
+    if model_type != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
         model_path
@@ -822,11 +833,11 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config. gemma4_unified and
-    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
-    # vision_config presence in config.json.
+    # Text-only quants won't carry a vision sub-config. gemma4_unified,
+    # diffusion_gemma and lfm3_audio are exceptions: they are served by mlx-vlm
+    # regardless of vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+        if normalized_type in {"gemma4_unified", "diffusion_gemma", "lfm3_audio"}:
             logger.info(
                 f"{model_type} detected as VLM (mlx-vlm native model)"
             )

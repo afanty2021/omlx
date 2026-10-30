@@ -402,6 +402,11 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Runtime-only: the configured dir that GlobalSettings.ensure_directories()
+    # could not create, e.g. on a disconnected external drive.
+    unavailable_ssd_cache_dir: Path | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -451,6 +456,13 @@ class CacheSettings:
         if self.ssd_cache_dir:
             return Path(self.ssd_cache_dir).expanduser().resolve()
         return base_path / "cache"
+
+    def is_ssd_cache_dir_unavailable(self) -> bool:
+        """Return whether the configured SSD cache dir was unavailable at startup."""
+        return bool(self.ssd_cache_dir) and (
+            Path(self.ssd_cache_dir).expanduser().resolve()
+            == self.unavailable_ssd_cache_dir
+        )
 
     def get_ssd_cache_max_size_bytes(self, base_path: Path) -> int:
         """
@@ -1614,7 +1626,6 @@ class GlobalSettings:
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
-            self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]
 
@@ -1627,9 +1638,26 @@ class GlobalSettings:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
 
-        # Model directories - skip unavailable paths (e.g. disconnected external drive)
-        valid_dirs = []
-        for directory in self.model.get_model_dirs(self.base_path):
+        # SSD cache - turn the SSD cache off until restart when the configured
+        # dir is unavailable. Writing to another disk could fill it unnoticed.
+        cache_dir = self.cache.get_ssd_cache_dir(self.base_path)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            if cache_dir == self.base_path / "cache":
+                logger.error(f"Failed to create directory {cache_dir}: {e}")
+                raise
+            if self.cache.unavailable_ssd_cache_dir != cache_dir:
+                logger.warning(
+                    f"SSD cache directory unavailable, SSD cache is off until "
+                    f"restart: {cache_dir} ({e})"
+                )
+            self.cache.unavailable_ssd_cache_dir = cache_dir
+
+        # Keep unavailable model dirs (e.g. disconnected external drive) in the
+        # settings so discovery finds them again after reconnection.
+        model_dirs = self.model.get_model_dirs(self.base_path)
+        for directory in model_dirs:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
@@ -1643,12 +1671,9 @@ class GlobalSettings:
             access_error = model_directory_access_error(directory)
             if access_error is not None:
                 logger.warning(f"Model directory unavailable, skipping: {access_error}")
-                continue
 
-            valid_dirs.append(str(directory))
-
-        # Update model_dirs to only include valid paths
-        self.model.model_dirs = valid_dirs
+        # Store resolved paths so they match what the admin API reports.
+        self.model.model_dirs = [str(d) for d in model_dirs]
         self.model.model_dir = None
 
     def validate(self) -> list[str]:
@@ -1938,7 +1963,9 @@ class GlobalSettings:
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
         ssd_dir = (
-            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+            self.cache.get_ssd_cache_dir(self.base_path)
+            if self.cache.enabled and not self.cache.is_ssd_cache_dir_unavailable()
+            else None
         )
 
         return SchedulerConfig(

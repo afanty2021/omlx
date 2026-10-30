@@ -18,8 +18,13 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
+from mlx_embeddings.models.siglip import Model as Siglip
+from mlx_embeddings.models.siglip import ModelArgs as SiglipArgs
+from mlx_embeddings.models.siglip import TextConfig as SiglipTextConfig
+from mlx_embeddings.models.siglip import VisionConfig as SiglipVisionConfig
 from mlx_vlm.models.embedding_gemma2 import Model as EmbeddingGemma2
 from mlx_vlm.models.embedding_gemma2 import ModelConfig as EmbeddingGemma2Config
+from PIL import Image
 from safetensors.numpy import save_file
 
 from omlx.api.embedding_models import (
@@ -2544,3 +2549,109 @@ class TestMlxVlmEmbeddingGemma2:
 
         assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
 
+
+
+class TestSiglipEmbedding:
+    """SigLIP embeds text and images with separate towers."""
+
+    class MockTokenizer:
+        """Pads to max_length and records the call kwargs."""
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, texts, **kwargs):
+            self.calls.append(kwargs)
+            length = kwargs["max_length"]
+            encoded = [[3 + len(word) % 20 for word in t.split()] + [1] for t in texts]
+            input_ids = [ids + [0] * (length - len(ids)) for ids in encoded]
+            mask = [[1] * len(ids) + [0] * (length - len(ids)) for ids in encoded]
+            return {"input_ids": mx.array(input_ids), "attention_mask": mx.array(mask)}
+
+    class MockProcessor:
+        """Like SiglipProcessor, __call__ takes images first."""
+
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+        def __call__(self, images=None, text=None, **kwargs):
+            raise AssertionError("text reached the processor's images argument")
+
+        @staticmethod
+        def image_processor(images, return_tensors):
+            pixels = [np.asarray(img, dtype=np.float32) / 127.5 - 1 for img in images]
+            return {"pixel_values": np.stack(pixels).transpose(0, 3, 1, 2)}
+
+    @staticmethod
+    def _image(color):
+        return Image.new("RGB", (32, 32), color)
+
+    def _uri(self, color):
+        buffer = io.BytesIO()
+        self._image(color).save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def _load(self, tmp_path):
+        args = SiglipArgs(
+            text_config=SiglipTextConfig(
+                vocab_size=32,
+                max_position_embeddings=8,
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+            ),
+            vision_config=SiglipVisionConfig(
+                image_size=32,
+                patch_size=16,
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+            ),
+        )
+        siglip = Siglip(args)
+        mx.eval(siglip.parameters())
+        tokenizer = self.MockTokenizer()
+        model = MLXEmbeddingModel(str(tmp_path))
+        with patch(
+            "mlx_embeddings.load", return_value=(siglip, self.MockProcessor(tokenizer))
+        ):
+            model.load()
+        return model, siglip, tokenizer
+
+    def test_text_and_image_items_use_their_own_tower(self, tmp_path):
+        model, siglip, tokenizer = self._load(tmp_path)
+        texts = ["a red square", "a blue circle"]
+        items = [
+            {"text": texts[0]},
+            {"image": self._uri("red")},
+            {"text": texts[1]},
+            {"image": self._uri("blue")},
+        ]
+
+        output = model.embed(items)
+
+        assert [(c["padding"], c["max_length"]) for c in tokenizer.calls] == [
+            ("max_length", 8)
+        ]
+        tokens = tokenizer(texts, max_length=8)
+        text = siglip.get_text_features(input_ids=tokens["input_ids"])
+        pixels = self.MockProcessor.image_processor(
+            [self._image("red"), self._image("blue")], return_tensors="np"
+        )["pixel_values"]
+        image = siglip.get_image_features(pixel_values=mx.array(pixels))
+        text = np.array(text / mx.linalg.norm(text, axis=-1, keepdims=True))
+        image = np.array(image / mx.linalg.norm(image, axis=-1, keepdims=True))
+        np.testing.assert_allclose(
+            np.array(output.embeddings),
+            np.stack([text[0], image[0], text[1], image[1]]),
+            atol=1e-5,
+        )
+        assert output.total_tokens == int(tokens["attention_mask"].sum())
+
+    def test_text_and_image_in_one_item_is_rejected(self, tmp_path):
+        model, _, _ = self._load(tmp_path)
+
+        with pytest.raises(ValueError, match="separately"):
+            model.embed([{"text": "a red square", "image": self._uri("red")}])

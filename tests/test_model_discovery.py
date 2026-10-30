@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from omlx import gguf
 from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
@@ -639,6 +640,39 @@ class TestDetectModelType:
         assert detect_model_type(model_dir) == "decision"
         assert decision_kind(model_dir) == "d3"
 
+    def test_detect_d1_by_d1model_on_lfm3_config(self, tmp_path):
+        """LiquidAI d1 shares lfm3_vl / lfm3_omni configs with the LFM3 chat models."""
+        vision = {"hidden_size": 1024, "num_hidden_layers": 14}
+        chat = tmp_path / "LFM3-VL-2B"
+        d1_vl = tmp_path / "d1-2B"
+        d1_omni = tmp_path / "d1-Omni-2B"
+        configs = {
+            chat: {
+                "model_type": "lfm3_vl",
+                "architectures": ["Lfm3VlForConditionalGeneration"],
+                "vision_config": vision,
+            },
+            d1_vl: {
+                "model_type": "lfm3_vl",
+                "architectures": ["D1Model"],
+                "vision_config": vision,
+            },
+            d1_omni: {
+                "model_type": "lfm3_omni",
+                "auto_map": {"AutoModel": "modeling_d1_lfm3_omni.D1Model"},
+                "vision_config": vision,
+            },
+        }
+        for path, config in configs.items():
+            path.mkdir()
+            (path / "config.json").write_text(json.dumps(config))
+
+        assert detect_model_type(chat) == "vlm"
+        assert decision_kind(chat) is None
+        for path in (d1_vl, d1_omni):
+            assert detect_model_type(path) == "decision"
+            assert decision_kind(path) == "d1"
+
     def test_detect_openjev_by_helper_or_directory_name(self, tmp_path):
         config = {
             "model_type": "qwen3_5",
@@ -847,6 +881,25 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm3_text_model_as_vlm_native_text(self, tmp_path):
+        """LFM3 text checkpoints load through mlx-vlm; mlx-lm has no lfm3."""
+        config = {
+            "model_type": "lfm3",
+            "architectures": ["Lfm3ForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_lfm3_audio_as_vlm_not_audio_sts(self, tmp_path):
+        """LFM3-Audio has no vision config and is served by mlx-vlm, not mlx-audio STS."""
+        config = {
+            "model_type": "lfm3_audio",
+            "architectures": ["Lfm3AudioForConditionalGeneration"],
+            "audio_config": {"model_type": "lfm3_audio_encoder"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
         """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""
@@ -2483,6 +2536,59 @@ PROJECTOR_GGUF = {
 
 class TestGgufDiscovery:
 
+    def test_split_variant_with_separately_named_table(self, tmp_path, write_gguf):
+        repo = tmp_path / "models" / "Vardaan97" / "Flash-Next-Splash-GGUF"
+        prefix = "Qwen3.8-Flash-Next-UD-Q4_K_XL"
+        names = [f"{prefix}-{index:05d}-of-00005.gguf" for index in range(1, 5)]
+        names.append("Qwen3.8-Flash-Next-ple8-table-00005-of-00005.gguf")
+        for name in reversed(names):
+            write_gguf(repo / "Q4-PLE8" / name, {"general.architecture": "qwen4exp"})
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+
+        assert set(models) == {f"{prefix}-Q4-PLE8"}
+        model = models[f"{prefix}-Q4-PLE8"]
+        info = gguf.source_info(model.model_path)
+        assert info["source_parts"] == [f"Q4-PLE8/{name}" for name in names]
+        assert info["projectors"] == ["mmproj-BF16.gguf"]
+        for name in names:
+            assert (
+                Path(model.model_path) / "split" / name
+            ).resolve() == repo / "Q4-PLE8" / name
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            ["Flash-Next-body-00001-of-00002.gguf"],
+            [
+                "Flash-Next-body-00001-of-00002.gguf",
+                "Other-body-00001-of-00002.gguf",
+                "Flash-Next-ple8-table-00002-of-00002.gguf",
+            ],
+        ],
+        ids=["missing", "duplicate"],
+    )
+    def test_mixed_prefix_split_needs_one_complete_set(
+        self, tmp_path, write_gguf, names
+    ):
+        repo = tmp_path / "models" / "repo"
+        for name in names:
+            write_gguf(repo / "Q4-PLE8" / name, {"general.architecture": "qwen4exp"})
+        assert gguf.find_models(repo) == []
+        assert discover_models(tmp_path / "models", tmp_path / "gguf") == {}
+
+    def test_repository_name_ending_in_ple_is_not_a_variant(self, tmp_path, write_gguf):
+        repo = tmp_path / "models" / "owner" / "Qwen3.8-Flash-Next-PLE8"
+        for part in (1, 2):
+            write_gguf(repo / f"Flash-Next-Q4-{part:05d}-of-00002.gguf", QWEN_GGUF)
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        assert set(models) == {"Flash-Next-Q4"}
+        info = gguf.source_info(models["Flash-Next-Q4"].model_path)
+        assert info["directory"] == str(repo)
+        assert info["projectors"] == ["mmproj-BF16.gguf"]
+
     @pytest.mark.parametrize(
         "parts, complete",
         [
@@ -2495,8 +2601,6 @@ class TestGgufDiscovery:
     def test_split_variant_requires_every_part(
         self, tmp_path, write_gguf, parts, complete
     ):
-        from omlx import gguf
-
         repo = tmp_path / "models" / "ISTA-DASLab" / "Flash-Next-GGUF"
         for index, count in parts:
             part = write_gguf(

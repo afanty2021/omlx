@@ -2,8 +2,8 @@
 """Splash engine: serve a model through a Splash server process.
 
 Splash (https://github.com/incoai/splash) runs Qwen3.8-27B,
-Qwen3.6-35B-A3B and Qwen3.8-Flash-Next on its own Metal engine with DFlash2
-speculative decoding.
+Qwen3.6-35B-A3B, Qwen3.5-122B-A10B (Ornith-1.5-122B), Qwen3.8-Flash-Next and
+Flint on its own Metal engine with DFlash2 speculative decoding.
 It is a separate program, so this engine does not load weights in-process.
 ``start()`` stages the oMLX model folder as an entry of a private Hugging Face
 cache, launches ``splash serve --offline`` for it on a loopback port and
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import functools
 import hashlib
 import json
@@ -29,6 +30,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 import uuid
@@ -48,6 +50,69 @@ from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
+
+def scan_ssd_cache(
+    root: Path, *, clear: bool = False, exclude: Iterable[Path] = ()
+) -> tuple[int, int]:
+    """Count or remove Splash's cache data, keeping its lock files in place."""
+    excluded = {path.resolve() for path in exclude}
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return 0, 0
+    count = size = 0
+    try:
+        for folder, directories, _, directory_fd in os.fwalk(".", dir_fd=root_fd):
+            parts = Path(folder).parts
+            if not parts:
+                directories[:] = [
+                    name
+                    for name in directories
+                    if (root / name).resolve() not in excluded
+                ]
+                continue
+            if len(parts) == 1:
+                directories[:] = [
+                    name
+                    for name in directories
+                    if re.fullmatch(r"[0-9a-f]{1,64}", name)
+                ]
+                continue
+            directories.clear()
+            lock_fd = None
+            try:
+                if clear:
+                    lock_fd = os.open(
+                        "lock",
+                        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as exc:
+                        raise RuntimeError(
+                            "Splash SSD cache is in use by another process; stop it and retry"
+                        ) from exc
+                for name in ("kv.slots", "kv.records", "state.slots", "state.records"):
+                    try:
+                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        if clear:
+                            os.unlink(name, dir_fd=directory_fd)
+                        count += 1
+                        size += info.st_blocks * 512
+                    except FileNotFoundError:
+                        continue
+            finally:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+    finally:
+        os.close(root_fd)
+    return count, size
+
 
 # External engines a model can be served by, as model settings name them.
 EXTERNAL_ENGINES = {"splash": "Splash"}
@@ -79,6 +144,9 @@ THINKING_BUDGET_VERSION = (1, 3, 2)
 NVIDIA_QUANTIZATION_VERSION = (1, 3, 2)
 FLASH_NEXT_VERSION = (1, 4, 0)
 SPLIT_GGUF_VERSION = (1, 4, 0)
+# Splash 1.4.1 serves MoE GGUFs pruned to a multiple of 8 routed experts.
+PRUNED_EXPERTS_VERSION = (1, 4, 1)
+_PRUNED_EXPERTS_MULTIPLE = 8
 _MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
 _COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
 SPLASH_MAX_CONTEXT = 262144
@@ -130,7 +198,42 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
         "num_experts": 512,
         "num_experts_per_tok": 10,
     },
+    # Ornith-1.5-122B is a fine-tune of it.
+    "Qwen3.5-122B-A10B": {
+        "model_type": "qwen3_5_moe_text",
+        "max_position_embeddings": 262144,
+        "hidden_size": 3072,
+        "num_hidden_layers": 48,
+        "vocab_size": 248320,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+    },
+    "Flint": {
+        "model_type": "flint",
+        "max_position_embeddings": 262144,
+        "hidden_size": 2048,
+        "num_hidden_layers": 49,
+        "vocab_size": 150144,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "num_experts": 256,
+        "num_experts_per_tok": 6,
+    },
 }
+# The first Splash release that serves each family, where later than 1.3.0.
+_FAMILY_VERSIONS = {
+    "Qwen3.8-Flash-Next": FLASH_NEXT_VERSION,
+    "Qwen3.5-122B-A10B": (1, 4, 1),
+    "Flint": (1, 4, 1),
+}
+# Families Splash loads from GGUFs only, not from MLX checkpoints.
+_GGUF_ONLY_FAMILIES = frozenset({"Qwen3.8-Flash-Next", "Flint"})
+# Families without a vision tower; Splash serves their models text only.
+_TEXT_ONLY_FAMILIES = frozenset({"Flint"})
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 _SHARD_INDEX = "model.safetensors.index.json"
 # Splash serves vision only with one of these from the target repository.
@@ -142,6 +245,8 @@ SPLASH_DRAFT_REPOS = {
     "Qwen3.8-27B": "incoai/Qwen3.8-27B-DFlash2",
     "Qwen3.6-35B-A3B": "incoai/Qwen3.6-35B-A3B-DFlash2",
     "Qwen3.8-Flash-Next": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "Qwen3.5-122B-A10B": "incoai/Ornith-1.5-122B-DFlash2",
+    "Flint": "incoai/Flint-DFlash2",
 }
 
 # Splash quantizes the BF16 DFlash2 draft to 4 bits when it loads it.
@@ -323,20 +428,72 @@ def _read_config(model_path: Path) -> dict | None:
     return _read_json(model_path / "config.json")
 
 
-def splash_family(config: dict) -> str | None:
-    """The Splash family whose architecture ``config`` states, or None."""
+def _text_config(config: dict) -> dict | None:
+    """The text model's configuration: ``text_config``, or the top level of a
+    flat Flint config.json."""
     text = config.get("text_config")
-    if not isinstance(text, dict):
+    if isinstance(text, dict):
+        return text
+    if config.get("model_type") == SPLASH_FAMILIES["Flint"]["model_type"]:
+        return config
+    return None
+
+
+def splash_family(config: dict) -> str | None:
+    """The Splash family whose architecture ``config`` states, or None.
+
+    The routed expert count is not compared: a pruned GGUF keeps fewer
+    experts than its family (_experts_problem).
+    """
+    text = _text_config(config)
+    if text is None:
         return None
     for name, signature in SPLASH_FAMILIES.items():
-        if all(text.get(key) == value for key, value in signature.items()):
+        if all(
+            text.get(key) == value
+            for key, value in signature.items()
+            if key != "num_experts"
+        ):
             return name
     return None
 
 
 def splash_has_vision(config: dict) -> bool:
     """Whether the checkpoint carries a vision tower Splash can load."""
-    return isinstance(config.get("vision_config"), dict)
+    return isinstance(config.get("vision_config"), dict) and (
+        splash_family(config) not in _TEXT_ONLY_FAMILIES
+    )
+
+
+def _version_text(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _experts_problem(family: str, text: dict, gguf: bool, binary: SplashBinary) -> str:
+    """Why Splash cannot serve a model of ``family`` with its routed expert
+    count, or ""."""
+    full = SPLASH_FAMILIES[family].get("num_experts")
+    experts = text.get("num_experts")
+    if full is None or experts in (None, full):
+        return ""
+    if not gguf:
+        return f"Splash serves {family} MLX checkpoints with all {full} routed experts"
+    if (
+        not isinstance(experts, int)
+        or not 0 < experts < full
+        or experts % _PRUNED_EXPERTS_MULTIPLE
+    ):
+        return (
+            f"Splash serves {family} GGUFs with a multiple of "
+            f"{_PRUNED_EXPERTS_MULTIPLE} routed experts up to {full}, not {experts}"
+        )
+    if binary.version_tuple < PRUNED_EXPERTS_VERSION:
+        return (
+            f"GGUFs pruned to fewer routed experts need Splash "
+            f"{_version_text(PRUNED_EXPERTS_VERSION)} or later"
+        )
+    # Splash checks that its MoE kernels route this count when it loads.
+    return ""
 
 
 def _is_affine_4bit_group64(quant: dict) -> bool:
@@ -441,13 +598,18 @@ def _check_model(
         return "failed to read config.json"
     family = splash_family(config)
     if family is None:
-        return f"Splash serves {' and '.join(SPLASH_FAMILIES)} only"
+        *others, last = SPLASH_FAMILIES
+        return f"Splash serves {', '.join(others)} and {last} only"
+    text = _text_config(config) or {}
     source = _gguf_source(config)
-    if family == "Qwen3.8-Flash-Next":
-        if binary.version_tuple < FLASH_NEXT_VERSION:
-            return "Qwen3.8-Flash-Next needs Splash 1.4.0 or later"
-        if source is None:
-            return "Qwen3.8-Flash-Next needs a GGUF; Splash cannot load its MLX checkpoints"
+    minimum = _FAMILY_VERSIONS.get(family)
+    if minimum is not None and binary.version_tuple < minimum:
+        return f"{family} needs Splash {_version_text(minimum)} or later"
+    if family in _GGUF_ONLY_FAMILIES and source is None:
+        return f"{family} needs a GGUF; Splash cannot load its MLX checkpoints"
+    problem = _experts_problem(family, text, source is not None, binary)
+    if problem:
+        return problem
     if source is not None:
         # Splash checks a GGUF's tensor types itself when it loads the file.
         if (
@@ -462,7 +624,7 @@ def _check_model(
     missing = [name for name in _REQUIRED_MODEL_FILES if not (path / name).is_file()]
     if missing:
         return f"Splash needs {', '.join(missing)} in the model folder"
-    return binary, family, config["text_config"]
+    return binary, family, text
 
 
 def resolve_splash_target(
@@ -553,12 +715,15 @@ def _splash_projector_rank(name: str) -> int:
 def _weight_bytes(path: Path) -> int:
     """Bytes of the weights Splash loads: the safetensors, or for a GGUF its
     file and the projector Splash pairs it with."""
-    source = _gguf_source(_read_config(path) or {})
+    config = _read_config(path) or {}
+    source = _gguf_source(config)
     if source is None:
         nested = sum((path / name).stat().st_size for name in _nested_shards(path))
         return _safetensors_bytes(path) + nested
     projectors = sorted(source.get("projectors") or [], key=_splash_projector_rank)
-    names = [*(source.get("parts") or []), *projectors[:1]]
+    # A family without a vision tower never loads the projector.
+    loaded = projectors[:1] if splash_has_vision(config) else []
+    names = [*(source.get("parts") or []), *loaded]
     return sum((path / name).stat().st_size for name in names)
 
 
@@ -587,7 +752,7 @@ def splash_memory_estimate(
     is enough. Splash spends a larger budget on its prefix cache.
     """
     path = Path(model_path)
-    text = (_read_config(path) or {}).get("text_config") or {}
+    text = _text_config(_read_config(path) or {}) or {}
     context = min(max_context or SPLASH_MAX_CONTEXT, SPLASH_MAX_CONTEXT)
     kv = _kv_bytes_per_token(text, kv_format) * context
     draft = int(_safetensors_bytes(draft_path) * _DRAFT_LOAD_RATIO)
@@ -1086,6 +1251,10 @@ class SplashEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         return self._active > 0
+
+    @property
+    def ssd_cache_dir(self) -> Path | None:
+        return self._options.cache_dir if self._options.cache_disk_bytes > 0 else None
 
     @property
     def runtime_failed_reason(self) -> str | None:

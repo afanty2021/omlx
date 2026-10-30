@@ -281,6 +281,12 @@ def mock_engine_pool():
     return pool
 
 
+@pytest.fixture(autouse=True)
+def _empty_image_decode_cache():
+    # Leftover images from other tests add a usage read to each pressure tick.
+    images.clear_image_decode_cache()
+
+
 @pytest.fixture
 def enforcer(mock_engine_pool):
     """Create an enforcer with a fixed 10GB ceiling.
@@ -644,6 +650,37 @@ class TestCurrentUsageTelemetry:
             ),
         ):
             assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_picks_up_runtime_metal_cap_raise(self, mock_engine_pool):
+        """A raised iogpu.wired_limit_mb reaches the scheduler without a restart."""
+        enforcer = _make_enforcer(mock_engine_pool)
+        enforcer._prefill_memory_guard = True
+        enforcer._effective_metal_cap_bytes = 8 * 1024**3
+        # _make_enforcer pins the breakdown, so expose the cached cap through it.
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": 0,
+            "dynamic": 0,
+            "metal_cap": enforcer._get_effective_metal_cap_bytes(),
+            "hard_limit": 10 * 1024**3,
+        }
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+
+        with patch.object(
+            pme, "get_effective_metal_cap_bytes", return_value=12 * 1024**3
+        ):
+            await enforcer._check_and_enforce()
+        assert scheduler._memory_metal_cap_bytes == 12 * 1024**3
+
+        with patch.object(
+            pme, "get_effective_metal_cap_bytes", return_value=16 * 1024**3
+        ) as reader:
+            await enforcer._check_and_enforce()
+        reader.assert_not_called()
+        assert scheduler._memory_metal_cap_bytes == 12 * 1024**3
 
 
 class TestDisabledWhenCeilingZero:
@@ -3333,7 +3370,6 @@ class TestPressureReclaimGrace:
 async def test_image_cache_reclaimed_before_model_eviction(
     mock_engine_pool, initial_usage
 ):
-    images.clear_image_decode_cache()
     buffer = io.BytesIO()
     Image.new("RGB", (120, 120), "red").save(buffer, format="PNG")
     source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
@@ -3360,7 +3396,6 @@ async def test_image_cache_reclaimed_before_model_eviction(
 
 
 async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engine_pool):
-    images.clear_image_decode_cache()
     buffer = io.BytesIO()
     Image.new("RGB", (120, 120), "blue").save(buffer, format="PNG")
     source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()

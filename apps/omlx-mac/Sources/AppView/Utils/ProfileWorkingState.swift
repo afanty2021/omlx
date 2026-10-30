@@ -125,6 +125,7 @@ enum ProfileSettingsKey {
     static let thinkingBudgetTokens = "thinking_budget_tokens"
     static let reasoningParser = "reasoning_parser"
     static let maxToolResultTokens = "max_tool_result_tokens"
+    static let gpuPowerLimitW = "gpu_power_limit_w"
     static let forceSampling = "force_sampling"
     static let isPinned = "is_pinned"
     static let chatTemplateKwargs = "chat_template_kwargs"
@@ -138,8 +139,8 @@ enum ProfileSettingsKey {
         maxContextWindow, maxTokens, temperature, topP, topK, minP,
         repetitionPenalty, presencePenalty, enableThinking,
         thinkingBudgetEnabled, thinkingBudgetTokens, reasoningParser,
-        maxToolResultTokens, forceSampling, chatTemplateKwargs, forcedCtKwargs,
-        guidedGrammarEnabled, guidedGrammar,
+        maxToolResultTokens, gpuPowerLimitW, forceSampling, chatTemplateKwargs,
+        forcedCtKwargs, guidedGrammarEnabled, guidedGrammar,
     ]
 
     // Model-specific
@@ -149,8 +150,8 @@ enum ProfileSettingsKey {
     static let turboquantKvScheme = "turboquant_kv_scheme"
     static let turboquantKvBits = "turboquant_kv_bits"
     static let qwen35AnePrefillSharedFraction = "qwen35_ane_prefill_shared_fraction"
-    static let qwen35OqA8Enabled = "qwen35_oq_a8_enabled"
-    static let qwen35OqA8MinTokens = "qwen35_oq_a8_min_tokens"
+    static let a8PrefillEnabled = "a8_prefill_enabled"
+    static let a8PrefillMinTokens = "a8_prefill_min_tokens"
     static let moeExpertOffloadEnabled = "moe_expert_offload_enabled"
     static let moeExpertOffloadResidentFraction = "moe_expert_offload_resident_fraction"
     static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"

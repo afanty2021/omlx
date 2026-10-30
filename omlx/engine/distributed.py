@@ -288,6 +288,10 @@ class DistributedBatchedEngine(BatchedEngine):
         return self._vision_checkpoint
 
     @property
+    def supports_logprobs(self) -> bool:
+        return False
+
+    @property
     def runtime_failed_reason(self) -> str | None:
         """Terminal worker failure observed by the coordinator, if any."""
 

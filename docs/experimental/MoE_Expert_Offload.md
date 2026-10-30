@@ -34,6 +34,17 @@ with a resident-fraction field accepting 5% to 95%, including fractional percent
 
 Toggling triggers an engine reload (it is a load-time transform).
 
+In the web dashboard, **Fit to memory** under the field offers the largest whole percent that leaves about 4 GB for prompts. It uses the same size estimate as load admission. The target is the prompt admission line, (memory ceiling - hot cache) x memory-guard tier headroom, less the models already loaded and that 4 GB. Clicking it fills the field. When even 5% leaves less than 4 GB, a short notice replaces it. If a larger percent only fits because the load would move a Qwen4-Exp PLE or DeepSeek V4.1 Engram table to SSD, the hint keeps the table resident at a lower percent when one fits. `GET /admin/api/models/{model_id}/moe-offload-fit` returns the same value.
+
+Measured on an M3 Ultra with the ceiling held at 12 GiB (balanced tier), each model loaded at the suggested percent and sent one 16K-token prompt:
+
+| model | suggested | loaded | 16K-token prompt | peak |
+|---|---:|---:|---|---:|
+| gemma-4-26b-a4b-it-4bit | 33% | 8.3 GB | served | 11.4 GB |
+| Qwen3.6-35B-A3B-MLX-4bit | 28% | 7.7 GB | served | 10.0 GB |
+
+The prompt line here is 11.9 GB. Prompt memory depends on the model and the prompt length, so 4 GB is a starting point rather than a guarantee. Longer prompts or several concurrent requests need a lower percent.
+
 Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute. None of this changes what is computed.
 
 ## Performance

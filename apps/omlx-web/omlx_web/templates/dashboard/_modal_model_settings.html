@@ -375,6 +375,15 @@
                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                    class="{{ ms_field_short }}">
                         </label>
+                        <!-- Reranker context window -->
+                        <label class="{{ ms_row }}" x-show="selectedModel?.model_type === 'reranker'" x-cloak>
+                            <span class="min-w-0">
+                                <span class="block {{ ms_row_label }}">{{ t('modal.model_settings.max_context_window') }}</span>
+                                <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.reranker_context_window_hint') }}</span>
+                            </span>
+                            <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
+                                   class="{{ ms_field_short }}">
+                        </label>
                         <label class="{{ ms_row }}">
                             <span class="min-w-0">
                                 <span class="block {{ ms_row_label }}">{{ t('modal.model_settings.ttl_seconds') }}</span>
@@ -762,8 +771,8 @@
                             </div>
                         </div>
 
-                        <!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->
-                        <template x-if="showsQwenOqA8(selectedModel)">
+                        <!-- INT8-activation (A8) prefill kernels -->
+                        <template x-if="showsA8Prefill(selectedModel)">
                             <div class="px-4 py-3.5 space-y-4">
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -771,22 +780,22 @@
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_hint') }}</p>
                                     </div>
                                     <button type="button"
-                                            @click="modelSettings.qwen35_oq_a8_enabled = !modelSettings.qwen35_oq_a8_enabled"
-                                            :class="modelSettings.qwen35_oq_a8_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            @click="modelSettings.a8_prefill_enabled = !modelSettings.a8_prefill_enabled"
+                                            :class="modelSettings.a8_prefill_enabled ? 'bg-black' : 'bg-neutral-200'"
                                             role="switch"
-                                            :aria-checked="modelSettings.qwen35_oq_a8_enabled ? 'true' : 'false'"
+                                            :aria-checked="modelSettings.a8_prefill_enabled ? 'true' : 'false'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="modelSettings.qwen35_oq_a8_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                        <span :class="modelSettings.a8_prefill_enabled ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
 
-                                <div x-show="modelSettings.qwen35_oq_a8_enabled" x-transition class="space-y-4 pt-1">
+                                <div x-show="modelSettings.a8_prefill_enabled" x-transition class="space-y-4 pt-1">
                                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_oq_a8_min_tokens') }}</label>
                                             <input type="number"
-                                                   x-model.number="modelSettings.qwen35_oq_a8_min_tokens"
+                                                   x-model.number="modelSettings.a8_prefill_min_tokens"
                                                    min="1" step="1" required placeholder="128"
                                                    class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-black">
                                         </div>
@@ -842,8 +851,8 @@
                                     </div>
                                     <button type="button"
                                             @click="modelSettings.moe_expert_offload_enabled = !modelSettings.moe_expert_offload_enabled"
-                                            :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled"
-                                            :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
+                                            :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled || modelSettings.activation_fp16_enabled"
+                                            :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled || modelSettings.activation_fp16_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
                                             role="switch"
                                             :aria-checked="modelSettings.moe_expert_offload_enabled ? 'true' : 'false'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -866,6 +875,8 @@
                                         <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
                                     </div>
                                     <p x-show="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched" x-cloak class="mt-1.5 text-xs text-red-600">{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}</p>
+                                    <p x-effect="loadMoeOffloadFit()" x-show="moeOffloadFit?.status === 'fit'" x-cloak class="mt-1.5 text-xs text-neutral-500"><button type="button" class="underline hover:text-neutral-900" @click="applyMoeOffloadFit()" x-text="moeOffloadFitText()"></button></p>
+                                    <p x-show="moeOffloadFit?.status === 'no_fit'" x-cloak class="mt-1.5 text-xs text-neutral-500" x-text="moeOffloadFitText()"></p>
                                 </div>
                             </div>
                         </template>
@@ -1011,6 +1022,82 @@
                             <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
                                 <input type="number" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                            </div>
+                        </div>
+
+                        <!-- GPU Power Limit -->
+                        <div class="px-4 py-3.5 space-y-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.gpu_power_limit') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.gpu_power_limit_hint') }}</p>
+                                    <p x-show="!modelSettings.gpu_power_limit_supported" x-cloak
+                                       class="text-xs text-amber-700 mt-1">{{ t('modal.model_settings.gpu_power_limit_unsupported') }}</p>
+                                </div>
+                                <button type="button"
+                                        @click="if (modelSettings.gpu_power_limit_supported || modelSettings.enableGpuPowerLimit) { modelSettings.enableGpuPowerLimit = !modelSettings.enableGpuPowerLimit; if (modelSettings.enableGpuPowerLimit && !modelSettings.gpu_power_limit_w) modelSettings.gpu_power_limit_w = 10; }"
+                                        :disabled="!modelSettings.gpu_power_limit_supported && !modelSettings.enableGpuPowerLimit"
+                                        :class="[
+                                            modelSettings.enableGpuPowerLimit ? 'bg-black' : 'bg-neutral-200',
+                                            (!modelSettings.gpu_power_limit_supported && !modelSettings.enableGpuPowerLimit) ? 'opacity-40 cursor-not-allowed' : ''
+                                        ]"
+                                        role="switch"
+                                        :aria-checked="modelSettings.enableGpuPowerLimit ? 'true' : 'false'"
+                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                    <span :class="modelSettings.enableGpuPowerLimit ? 'translate-x-5' : 'translate-x-0'"
+                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                </button>
+                            </div>
+                            <div x-show="modelSettings.enableGpuPowerLimit" x-transition class="pt-1 flex items-center gap-2">
+                                <input type="number" x-model.number="modelSettings.gpu_power_limit_w" placeholder="2-1000" min="2" max="1000" step="1"
+                                       class="w-32 px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                <span class="text-sm text-neutral-500">W</span>
+                            </div>
+                            <details class="rounded-lg border border-neutral-200 bg-white px-3 py-2">
+                                <summary class="cursor-pointer select-none text-xs font-medium text-neutral-700">
+                                    {{ t('modal.model_settings.gpu_power_limit_guide_title') }}
+                                </summary>
+                                <table class="mt-2 w-full text-xs text-neutral-600 tabular-nums">
+                                    <thead>
+                                        <tr class="text-left text-neutral-500">
+                                            <th class="py-1 pr-2 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_limit') }}</th>
+                                            <th class="py-1 pr-2 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_answer') }}</th>
+                                            <th class="py-1 pr-2 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_energy') }}</th>
+                                            <th class="py-1 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_prompt') }}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr><td class="py-0.5 pr-2">{{ t('modal.model_settings.gpu_power_limit_guide_none') }}</td><td class="pr-2">GPU 23-27 W</td><td class="pr-2">-</td><td>GPU 67-76 W</td></tr>
+                                        <tr><td class="py-0.5 pr-2">30-40 W</td><td class="pr-2">0%</td><td class="pr-2">0%</td><td>-14 ~ -30%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">20 W</td><td class="pr-2">-3 ~ -4%</td><td class="pr-2">-11 ~ -12%</td><td>-38 ~ -44%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">15 W</td><td class="pr-2">-6 ~ -7%</td><td class="pr-2">-25 ~ -29%</td><td>-49 ~ -53%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">10 W</td><td class="pr-2">-14 ~ -18%</td><td class="pr-2">-37 ~ -43%</td><td>-59 ~ -64%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">5 W</td><td class="pr-2">-36 ~ -48%</td><td class="pr-2">-49 ~ -52%</td><td>-75 ~ -78%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">2 W</td><td class="pr-2">-67 ~ -78%</td><td class="pr-2">-47 ~ -52%</td><td>-90 ~ -91%</td></tr>
+                                    </tbody>
+                                </table>
+                                <p class="mt-2 text-xs text-neutral-500">{{ t('modal.model_settings.gpu_power_limit_guide_note') }}</p>
+                            </details>
+                        </div>
+
+                        <!-- Float16 activations (M1/M2 bf16 checkpoints) -->
+                        <div class="px-4 py-3.5"
+                             x-show="modelSettings.activation_fp16_supported" x-cloak>
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.activation_fp16') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.activation_fp16_hint') }}</p>
+                                </div>
+                                <button type="button" role="switch"
+                                        aria-label="{{ t('modal.model_settings.activation_fp16') }}"
+                                        :aria-checked="!!modelSettings.activation_fp16_enabled"
+                                        @click="modelSettings.activation_fp16_enabled = !modelSettings.activation_fp16_enabled"
+                                        :disabled="modelSettings.moe_expert_offload_enabled && !modelSettings.activation_fp16_enabled"
+                                        :class="[modelSettings.activation_fp16_enabled ? 'bg-black' : 'bg-neutral-200', (modelSettings.moe_expert_offload_enabled && !modelSettings.activation_fp16_enabled) ? 'opacity-40 cursor-not-allowed' : '']"
+                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                    <span :class="modelSettings.activation_fp16_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                </button>
                             </div>
                         </div>
 

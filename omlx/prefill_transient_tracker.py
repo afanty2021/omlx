@@ -24,6 +24,8 @@ class _TransientHistory:
     samples: int = 0
     last_delta_bytes: int = 0
     last_n_tokens: int = 0
+    # Request that measured the last sample when the EWMA rejected it.
+    outlier_owner: str | None = None
     observed_max_bytes: int = 0
     flat_overhead_bytes: int = 0
     reclaim_debt_bytes: int = 0
@@ -91,6 +93,7 @@ class PrefillTransientTracker:
         *,
         floor_sample: bool = False,
         gathered_core: bool = False,
+        request_id: str | None = None,
     ) -> None:
         """Record one chunk observation.
 
@@ -140,6 +143,7 @@ class PrefillTransientTracker:
                 )
 
         per_token = transient_bytes / n_tokens
+        history.outlier_owner = None
         if history.samples == 0:
             history.ewma_per_token = per_token
         elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:
@@ -147,8 +151,9 @@ class PrefillTransientTracker:
             # the running rate is more likely a noisy phys_footprint()
             # delta (see _record_chunk_transient's docstring on
             # buffer-pool-driven noise) than a real per-token cost jump.
-            # last_delta_bytes/last_n_tokens below still record it raw for
-            # diagnostics — only the accumulated EWMA is protected.
+            # last_delta_bytes/last_n_tokens below still record it raw to
+            # protect the owner's next chunk.
+            history.outlier_owner = request_id
             logger.debug(
                 "PrefillTransientTracker(%s): rejected %.1f-byte/token "
                 "outlier from EWMA (current %.1f, ratio limit %.1fx)",
@@ -256,6 +261,10 @@ class PrefillTransientTracker:
     def last_n_tokens_for(self, gathered_core: bool) -> int:
         """Return the latest measured width for the selected regime."""
         return self._history(gathered_core).last_n_tokens
+
+    def outlier_owner_for(self, gathered_core: bool) -> str | None:
+        """Return the request that measured an EWMA-rejected last sample."""
+        return self._history(gathered_core).outlier_owner
 
     def observed_max_bytes_for(self, gathered_core: bool) -> int:
         """Return the floor-size maximum for the selected regime."""

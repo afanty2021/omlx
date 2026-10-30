@@ -10,8 +10,10 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
 import contextlib
+import copy
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -273,9 +275,9 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
     2.5: (3.1, 3.3),
     2.7: (3.25, 3.35),
-    3: (3.5, 3.7),
+    3: (3.6, 3.8),
     3.5: (3.8, 4.0),
-    4: (4.6, 4.7),
+    4: (4.7, 4.8),
     5: (5.5, 5.7),
     6: (6.5, 6.7),
 }
@@ -709,6 +711,9 @@ def universal_quant_predicate(
     if _is_moe_router(path):
         return False  # fp16 — tiny weights, some models (MoEGate) lack to_quantized()
 
+    if ".dash_router." in path:
+        return False  # Unlimited-OCR-2 block router; mlx-vlm keeps it dense too.
+
     if path.endswith("lm_head") and str(config.get("model_type", "")) == "muse_spark":
         # mlx-lm's Muse Spark casts the lm_head input to the weight dtype, so
         # a quantized lm_head gives wrong logits there.
@@ -748,6 +753,10 @@ def universal_quant_predicate(
     if "conv1d" in path_l and "linear_attn" in path_l:
         return bits(8)
     if "linear_attn.out_proj" in path_l:
+        # 5-bit is a floor: the budget plan may already have paid for more.
+        planned = (config.get("_oq_boost_map") or {}).get(path)
+        if planned is not None and int(planned["bits"]) > 5:
+            return dict(planned)
         return bits(5)
 
     # Inkling short-conv weights (k/v/attn/mlp_sconv.conv.weight; the
@@ -1030,12 +1039,15 @@ def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, 
 
     The Qwen4-Exp N-gram table is about 51B parameters. Pricing it would make
     a 4-bit table consume most of a sub-4-bit budget, so it is quantized by its
-    own table policy instead.
+    own table policy instead. Vision and audio tensors are never quantized, so
+    pricing them would only shrink the budget left for the decoder.
     """
     return {
         path: shape
         for path, shape in named_shapes.items()
         if not _is_qwen4_exp_ngram_embedding_tensor(path, config)
+        and not _is_vision_tensor(path)
+        and not _is_audio_tensor(path)
     }
 
 
@@ -1105,6 +1117,17 @@ _ALWAYS_ON_LADDER = (3, 4, 5, 6, 8)
 # Token embeddings above this share of the budgeted parameters cost enough at
 # 8-bit to starve the layers that every token runs through.
 _LARGE_EMBEDDING_SHARE = 0.03
+
+_GLOBAL_ATTENTION_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.[qkvo]_proj$")
+
+
+def _global_attention_layers(config: dict) -> set[int]:
+    """Full-attention layers of a hybrid model (sliding or linear attention elsewhere)."""
+    text_config = config.get("text_config") or {}
+    layer_types = config.get("layer_types") or text_config.get("layer_types") or []
+    if len(set(layer_types)) < 2:
+        return set()
+    return {i for i, kind in enumerate(layer_types) if kind == "full_attention"}
 
 
 def _is_always_on_tensor(path: str) -> bool:
@@ -1283,30 +1306,55 @@ def _build_quant_plan(
     hard_cap_bpw: float = 4.7,
     fixed_overrides: dict[str, dict] | None = None,
     supported_bits: tuple[int, ...] = _VALID_QUANT_BITS,
-    always_on_rules: bool = True,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
     Strategy:
     1. Mandatory pre-allocation: output head and token embeddings, sized by
        _mandatory_head_bits.
-    2. Dense models below 3-bit: every decoder tensor is lifted to 3-bit with
+    2. Hybrid dense models at 3-bit and above: full-attention q/k/v/o get one
+       bit above the base.
+    3. Dense models below 3-bit: every decoder tensor is lifted to 3-bit with
        group 128 first, most sensitive layers first.
-    3. MoE models: after the protection floor, the tensors every token runs
+    4. MoE models: after the protection floor, the tensors every token runs
        through climb one width per round, most sensitive first.
-    4. Data-driven: remaining non-expert tensors compete by layer sensitivity.
-    5. Budget still left returns the output head and embeddings to 8-bit.
-    6. Routed experts stay at base bits except explicit fractional floors and
+    5. Data-driven: remaining non-expert tensors compete by layer sensitivity.
+    6. Budget still left returns the output head and embeddings to 8-bit.
+    7. Routed experts stay at base bits except explicit fractional floors and
        the oQ2.5/oQ2.7 fallback routed-layer boost.
 
-    always_on_rules=False skips steps 2 and 3 for callers with their own
-    allocation or exporter constraints.
+    An MTP head is planned after the backbone (_plan_mtp_head), so an -mtp
+    build keeps the backbone plan of the plain build.
 
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
     priced into the baseline bpw at their true cost and excluded from every
     boost decision.
     """
+    head_shapes = {p: s for p, s in named_shapes.items() if _is_mtp_tensor(p)}
+    if head_shapes:
+        backbone_shapes = {
+            p: s for p, s in named_shapes.items() if p not in head_shapes
+        }
+        plan = _build_quant_plan(
+            backbone_shapes,
+            config,
+            oq_level,
+            target_bpw=target_bpw,
+            hard_cap_bpw=hard_cap_bpw,
+            fixed_overrides=fixed_overrides,
+            supported_bits=supported_bits,
+        )
+        return _plan_mtp_head(
+            plan,
+            backbone_shapes,
+            head_shapes,
+            config,
+            oq_level,
+            fixed_overrides or {},
+            supported_bits,
+        )
+
     base_bits = _base_bits_for_level(oq_level)
     if base_bits not in supported_bits:
         raise ValueError("Base quantization width is not supported by this model")
@@ -1393,6 +1441,46 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
+    # Hybrid dense models: the few full-attention layers carry the long-range
+    # context that the sliding or linear layers cannot. One bit above the base
+    # keeps q/k/v at one width for the fused projection kernels.
+    if not is_moe and base_bits >= 3:
+        global_layers = _global_attention_layers(config)
+        for path, shape in named_shapes.items():
+            if path in boost_map or path in fixed_overrides:
+                continue
+            match = _GLOBAL_ATTENTION_RE.search(path)
+            if match is None or int(match.group(1)) not in global_layers:
+                continue
+            if _is_mtp_tensor(path) or _is_vision_tensor(path):
+                continue
+            if (
+                universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                is False
+            ):
+                continue
+            cand_bits = base_bits + 1
+            if cand_bits not in supported_bits:
+                continue
+            delta = 8 * (
+                _tensor_quantized_bytes(
+                    shape, cand_bits, _OQ_DEFAULT_GROUP_SIZE, "affine"
+                )
+                - _tensor_quantized_bytes(shape, base_bits, base_group_size, base_mode)
+            )
+            next_bpw = (total_bits_f + delta) / total_params
+            if delta <= 0 or next_bpw > hard_cap_bpw:
+                continue
+            boost_map[path] = {
+                "bits": cand_bits,
+                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "mode": "affine",
+            }
+            total_bits_f += delta
+            current_bpw = next_bpw
+
     # Fractional levels with a blanket Super Weights floor: mandatory expert
     # down_proj boost above base bits.
     _down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
@@ -1426,7 +1514,7 @@ def _build_quant_plan(
     # Dense models: affine 2-bit loses too much on tensors every token runs
     # through, so lift them to 3-bit with wider groups before any boost.
     # Most sensitive layers go first in case the cap stops the pass early.
-    if always_on_rules and not is_moe and base_bits < 3:
+    if not is_moe and base_bits < 3:
         for path, shape in _always_on_candidates(
             named_shapes, config, oq_level, fixed_overrides, layer_scores
         ):
@@ -1495,7 +1583,7 @@ def _build_quant_plan(
     # while each routed expert sees a small share of them. After the
     # protection floor, raise them one step per round, most sensitive first:
     # spreading the budget beats a few 8-bit tensors next to low-bit ones.
-    if always_on_rules and expert_params > 0:
+    if expert_params > 0:
         always_on = _always_on_candidates(
             named_shapes, config, oq_level, fixed_overrides, layer_scores
         )
@@ -1550,16 +1638,8 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
-            # MTP-head tensors carry no ``layers.<n>`` index but should
-            # compete like any other non-expert tensor (the stated contract
-            # is backbone-equal treatment for the head's internal block);
-            # score 0 seeds them at the bottom tier and the under-target
-            # fallback lifts them with the rest.
-            if not _is_mtp_tensor(path):
-                continue
-            layer_score = 0.0
-        else:
-            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            continue
+        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
         cur_gs = (
@@ -1745,6 +1825,102 @@ def _build_quant_plan(
         effective_bpw=current_bpw,
         target_bpw=target_bpw,
         hard_cap_bpw=hard_cap_bpw,
+    )
+
+
+def _plan_mtp_head(
+    plan: QuantPlan,
+    backbone_shapes: dict[str, tuple],
+    head_shapes: dict[str, tuple],
+    config: dict,
+    oq_level,
+    fixed_overrides: dict[str, dict],
+    supported_bits: tuple[int, ...],
+) -> QuantPlan:
+    """Add the MTP head to a backbone plan without moving the backbone.
+
+    The head keeps at least max(_MTP_MIN_BITS, base) bits. Room left under the
+    hard cap, counted over backbone and head together, then lifts its
+    non-expert tensors one width per round. Routed experts stay at the floor,
+    as in the backbone.
+    """
+    base_bits = _base_bits_for_level(oq_level)
+    base = {
+        "bits": base_bits,
+        "group_size": _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE),
+        "mode": _mode_for_bits(base_bits),
+    }
+    floor_bits = _mtp_bits_override(base_bits)
+    boost_map = dict(plan.boost_map)
+    lift = []
+    for path, shape in head_shapes.items():
+        if path in fixed_overrides or len(shape) < 2:
+            continue
+        indexer = _indexer_q8_override(path, config)
+        if indexer is not None:
+            # A format invariant, seeded like the backbone indexers.
+            boost_map[path] = indexer
+            continue
+        pred = universal_quant_predicate(
+            path, None, {**config, "_oq_boost_map": {}}, oq_level
+        )
+        if pred is False:
+            continue
+        if floor_bits > base_bits:
+            boost_map[path] = {
+                "bits": floor_bits,
+                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "mode": _mode_for_bits(floor_bits),
+            }
+        if not _is_routed_expert(path):
+            lift.append((path, shape))
+
+    named_shapes = {**backbone_shapes, **head_shapes}
+    total_params = sum(math.prod(shape) for shape in named_shapes.values())
+    total_bits = total_params * _estimate_effective_bpw(
+        named_shapes,
+        base["bits"],
+        base["group_size"],
+        base["mode"],
+        overrides={**fixed_overrides, **boost_map},
+    )
+    ladder = [b for b in _ALWAYS_ON_LADDER if b in supported_bits]
+    raised = True
+    while raised:
+        raised = False
+        for path, shape in lift:
+            cur = boost_map.get(path, base)
+            steps = [b for b in ladder if b > cur["bits"]]
+            if not steps:
+                continue
+            new = {
+                "bits": steps[0],
+                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "mode": _mode_for_bits(steps[0]),
+            }
+            delta = 8 * (
+                _tensor_quantized_bytes(
+                    shape, new["bits"], new["group_size"], new["mode"]
+                )
+                - _tensor_quantized_bytes(
+                    shape, cur["bits"], cur["group_size"], cur["mode"]
+                )
+            )
+            if delta <= 0 or (total_bits + delta) / total_params > plan.hard_cap_bpw:
+                continue
+            boost_map[path] = new
+            total_bits += delta
+            raised = True
+    total_bits += _unify_shared_bits(
+        head_shapes, config, boost_map, fixed_overrides, base
+    )
+    head_bits = sorted({boost_map.get(p, base)["bits"] for p, _ in lift})
+    logger.info(f"  MTP head planned after the backbone: bits {head_bits}")
+    return QuantPlan(
+        boost_map=boost_map,
+        effective_bpw=total_bits / total_params,
+        target_bpw=plan.target_bpw,
+        hard_cap_bpw=plan.hard_cap_bpw,
     )
 
 
@@ -4641,6 +4817,14 @@ def _build_model_sanitizer(
 
             model_config.vision_config = vision_config
             model_config.text_config = text_config
+            # Gemma 4 E2B/E4B carry an audio tower; their sanitize reads
+            # audio_config.subsampling_conv_channels, so leaving the dict in
+            # place made sanitize raise and the build fall back to raw names.
+            audio_config = getattr(model_config, "audio_config", None)
+            if isinstance(audio_config, dict) and hasattr(model_module, "AudioConfig"):
+                model_config.audio_config = model_module.AudioConfig.from_dict(
+                    audio_config
+                )
 
             # Some VLM Model.sanitize implementations (e.g. Gemma 4) drop
             # `audio_tower.*` / `embed_audio.*` weights when `self.audio_tower`
@@ -5932,6 +6116,13 @@ def _source_imatrix_signature(
         # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
         # capture. Older caches completed without either and must not be reused.
         signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
+    else:
+        # The first layer input from the model's own forward, blocks bound by
+        # parameter name, boolean and sliding-window masks, per-row position
+        # ids, plus the family fixes (Gemma 4 walk, DeepSeek V4 prompt caches,
+        # Kimi K3 residual blocks, Mistral attention scale). Older caches saw
+        # other layer inputs.
+        signature["layer_walk"] = "native_inputs_v1"
     return signature
 
 
@@ -8079,6 +8270,9 @@ _QWEN4_EXP_LAYER_STATE_KIND = "qwen4_exp"
 _GLM5_NEXT_LAYER_STATE_KIND = "glm5_next"
 _EMBEDDING_GEMMA2_LAYER_STATE_KIND = "embedding_gemma2"
 _FLINT_LAYER_STATE_KIND = "flint"
+_DEEPSEEK_V4_LAYER_STATE_KIND = "deepseek_v4"
+_KIMI_K3_LAYER_STATE_KIND = "kimi_k3"
+_LLAMA4_SCALED_LAYER_STATE_KIND = "llama4_attn_scale"
 
 
 def _find_layer_model(model, layers):
@@ -8120,13 +8314,15 @@ def _object_config_int(config, key: str, default: int = 0) -> int:
 
 
 def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
-    """Build the stateful E2B/E4B layer-walk inputs.
+    """Build the stateful Gemma 4 layer-walk inputs.
 
     Gemma 4 E2B/E4B cannot be calibrated by invoking each decoder block as an
     independent transformer layer. They project a token-derived input for
     every layer and their tail layers consume K/V tensors produced by earlier
-    blocks. Mirror the native Gemma 4 model loop so imatrix collection and
-    sensitivity measurement see the same activations as inference.
+    blocks. Every Gemma 4 text model also scales its embeddings and gives
+    sliding and full layers different masks. Mirror the native Gemma 4 model
+    loop so imatrix collection and sensitivity measurement see the same
+    activations as inference.
     """
     layer_model = _find_layer_model(model, layers)
     if layer_model is None:
@@ -8143,9 +8339,7 @@ def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
     per_layer_input_size = _object_config_int(
         layer_config, "hidden_size_per_layer_input"
     )
-    if not model_type.startswith("gemma4") or (
-        num_kv_shared_layers <= 0 and per_layer_input_size <= 0
-    ):
+    if not model_type.startswith("gemma4"):
         return None
 
     num_layers = len(layers)
@@ -8345,9 +8539,13 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
             raise RuntimeError(
                 f"Gemma 4 calibration layer {layer_idx} returned invalid state"
             )
-        state["intermediates"][layer_idx] = aux
+        # Keep K/V only for layers a shared-KV tail reads; dense models have none.
+        if layer_idx in state["previous_kvs"][layer_idx + 1 :]:
+            state["intermediates"][layer_idx] = aux
     elif state.get("kind") == "glm_moe_dsa":
         state["prev_topk_indices"] = aux if aux is not None else fallback
+    elif state.get("kind") == _KIMI_K3_LAYER_STATE_KIND:
+        state["blocks"] = aux
 
 
 def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
@@ -8421,6 +8619,47 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         if isinstance(result, tuple):
             return result[0], result[1] if len(result) > 1 else None
         return result, None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _KIMI_K3_LAYER_STATE_KIND
+    ):
+        # A copy per call: block-start layers append to the summaries, and the
+        # sensitivity walk runs each block twice on the same inputs.
+        blocks = copy.copy(position_ids["blocks"])
+        try:
+            result = block(inputs, mask=mask, cache=None, blocks=blocks)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Kimi K3 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
+        return result[0], result[1]
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _LLAMA4_SCALED_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(inputs, position_ids["attn_scale"], mask, cache=None)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Mistral calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
+        return (result[0] if isinstance(result, tuple) else result), None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _DEEPSEEK_V4_LAYER_STATE_KIND
+    ):
+        if layer_idx is None:
+            raise RuntimeError("DeepSeek V4 calibration requires a layer index")
+        # A fresh prompt cache per call: the sensitivity walk runs each block
+        # twice on the same inputs.
+        cache = position_ids["make_cache"]()[int(layer_idx)]
+        try:
+            result = block(inputs, mask, cache, position_ids["input_ids"])
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"DeepSeek V4 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
+        return (result[0] if isinstance(result, tuple) else result), None
     if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
         try:
             result = block(
@@ -8458,30 +8697,44 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         result = block(inputs, mask=mask, cache=None)
         return (result[0] if isinstance(result, tuple) else result), None
 
-    last_exc = None
-    for call_args in [
-        (inputs, mask, None, position_ids),
-        (inputs, mask, None),
-        (inputs, mask),
-        (inputs, None, mask, None),
-        (inputs,),
-    ]:
-        try:
-            result = block(*call_args)
-            if isinstance(result, tuple):
-                return result[0], result[1] if len(result) > 1 else None
-            return result, None
-        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
-            # The traceback references this frame, which holds the block. Kept
-            # as-is it forms a cycle that leaves a streamed layer resident.
-            last_exc = e.with_traceback(None)
-            continue
-    if last_exc is not None:
-        logger.debug(
-            f"_forward_layer: all signatures failed for "
-            f"{type(block).__name__}: {last_exc}"
-        )
-    return None, None
+    try:
+        result = _call_layer_by_name(block, inputs, mask, position_ids)
+    except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+        logger.debug(f"_forward_layer: {type(block).__name__} failed: {e}")
+        return None, None
+    if isinstance(result, tuple):
+        return result[0], result[1] if len(result) > 1 else None
+    return result, None
+
+
+# Parameter names decoder blocks give the attention mask.
+_LAYER_MASK_PARAMS = ("mask", "attention_mask", "attn_mask")
+
+
+def _call_layer_by_name(block, inputs, mask, position_ids):
+    """Run a decoder block on an unpadded prompt without a cache, by name.
+
+    Binding by position put the position ids into whatever the 4th parameter
+    was (an offset, residual state or per-layer input), and retrying other
+    signatures after an error ran some projections twice. Each block is
+    called once; a required parameter without a calibration value fails.
+    """
+    params = list(inspect.signature(block).parameters.values())[1:]
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        # (*args, **kwargs) wrappers forward to an (x, mask, cache) block.
+        return block(inputs, mask)
+    kwargs = {}
+    for p in params:
+        if p.name in _LAYER_MASK_PARAMS and kwargs.keys().isdisjoint(
+            _LAYER_MASK_PARAMS
+        ):
+            kwargs[p.name] = mask
+        elif p.name == "position_ids":
+            kwargs[p.name] = position_ids
+        elif p.default is p.empty and (p.name == "cache" or p.name.endswith("_mask")):
+            # No cache, and an unpadded prompt needs no recurrent padding mask.
+            kwargs[p.name] = None
+    return block(inputs, **kwargs)
 
 
 def _forward_layer(block, inputs, mask, position_ids):
@@ -8489,60 +8742,121 @@ def _forward_layer(block, inputs, mask, position_ids):
     return _forward_layer_result(block, inputs, mask, position_ids)[0]
 
 
+def _is_recurrent_layer(layer) -> bool:
+    """Linear-attention or SSM layer of a hybrid stack."""
+    if hasattr(layer, "is_linear"):
+        return bool(layer.is_linear)
+    if hasattr(layer, "is_global"):
+        return not bool(layer.is_global)
+    return False
+
+
+# Layer or attention attributes that mark a sliding-window layer.
+_SLIDING_LAYER_FLAGS = (
+    "is_sliding",
+    "use_sliding",
+    "use_sliding_window",
+    "is_sliding_window",
+    "is_local",
+    "is_local_attention",
+)
+
+
+def _is_sliding_layer(layer, layer_type) -> bool:
+    for owner in (layer, getattr(layer, "self_attn", None)):
+        for flag in _SLIDING_LAYER_FLAGS:
+            value = getattr(owner, flag, None)
+            if value is not None:
+                return bool(value)
+    return layer_type == "sliding_attention"
+
+
 def _layer_masks_for_model(model, layers, inputs):
-    """Build the per-layer mask schedule used by the original model."""
-    if hasattr(model, "make_cache") and any(
-        hasattr(layer, "is_linear") or hasattr(layer, "is_global")
-        for layer in layers
-    ):
-        try:
-            from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    """Build the per-layer mask schedule used by the original model.
 
-            cache = model.make_cache()
-            model_core = getattr(model, "model", model)
-            fa_idx = getattr(
-                model_core, "fa_idx", getattr(model_core, "_attn_idx", 0)
-            )
-            ssm_idx = getattr(
-                model_core, "ssm_idx", getattr(model_core, "_gla_idx", 0)
-            )
-            fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
-            ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
-            try:
-                fa_mask = create_attention_mask(inputs, fa_cache)
-            except TypeError:
-                # mlx-lm API changed — cache.make_mask signature differs
-                fa_mask = None
-            try:
-                ssm_mask = create_ssm_mask(inputs, ssm_cache)
-            except TypeError:
-                ssm_mask = None
-            if fa_mask is not None or ssm_mask is not None:
-                if fa_mask is None:
-                    fa_mask = nn.MultiHeadAttention.create_additive_causal_mask(
-                        inputs.shape[1]
-                    ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
-                # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
-                # (S, S) causal mask.  During calibration there is no padding,
-                # so None is the correct mask for SSM layers.
-                def _is_ssm_layer(layer):
-                    if hasattr(layer, "is_linear"):
-                        return bool(layer.is_linear)
-                    if hasattr(layer, "is_global"):
-                        return not bool(layer.is_global)
-                    return False
+    Calibration prompts are unpadded and start from an empty cache, so
+    recurrent layers take no mask, sliding layers the windowed causal mask
+    and other attention layers the full one, each as a fresh cache builds
+    it. Boolean, not additive: MLA attention selects scores with
+    mx.where(mask, ...), which reads an additive mask inverted.
+    """
+    text_model = _find_layer_model(model, layers)
+    args = getattr(text_model, "args", None) or getattr(text_model, "config", None)
+    layer_types = (
+        getattr(text_model, "layer_types", None)
+        or getattr(args, "layer_types", None)
+        or []
+    )
+    window = (
+        getattr(text_model, "window_size", None)
+        or getattr(text_model, "sliding_window", None)
+        or getattr(args, "sliding_window", None)
+    )
+    causal = create_attention_mask(inputs, None, return_array=True)
+    sliding = causal
+    if window:
+        sliding = create_attention_mask(
+            inputs, None, window_size=window, return_array=True
+        )
+    masks = []
+    for idx, layer in enumerate(layers):
+        layer_type = layer_types[idx] if idx < len(layer_types) else None
+        if _is_recurrent_layer(layer):
+            masks.append(None)
+        elif _is_sliding_layer(layer, layer_type):
+            masks.append(sliding)
+        else:
+            masks.append(causal)
+    return masks
 
-                return [
-                    ssm_mask if _is_ssm_layer(layer) else fa_mask
-                    for layer in layers
-                ]
-        except (ImportError, AttributeError):
-            pass
 
-    seq_len = inputs.shape[1]
-    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
-    dtype = inputs.dtype if hasattr(inputs, "dtype") else mx.float16
-    return [mask.astype(dtype)] * len(layers)
+class _FirstLayerReachedError(Exception):
+    """Stops a model's own forward at its first decoder layer."""
+
+
+class _FirstLayerProbe:
+    """Stands in for the first decoder layer and raises with its input."""
+
+    def __init__(self, layer):
+        self._layer = layer
+
+    def __getattr__(self, name):
+        return getattr(self._layer, name)
+
+    def __call__(self, hidden, *args, **kwargs):
+        raise _FirstLayerReachedError(hidden)
+
+
+def _native_first_layer_input(text_model, layers, calib_data, inputs):
+    """The hidden state the model's own forward hands its first layer.
+
+    Many families scale or normalize the token embeddings first (Gemma by
+    sqrt(hidden_size), Granite and MiniCPM by a multiplier, Glimmer with
+    embed_norm). Running the forward up to the first layer keeps that
+    without a per-family list.
+    """
+    original = layers[0]
+    layers[0] = _FirstLayerProbe(original)
+    try:
+        text_model(calib_data)
+    except _FirstLayerReachedError as reached:
+        return reached.args[0]
+    except (TypeError, ValueError, RuntimeError, AttributeError, IndexError) as e:
+        logger.warning(
+            "oQe calibration: %s did not reach its first layer (%s); "
+            "walking from the raw token embeddings",
+            type(text_model).__name__,
+            e,
+        )
+        return inputs
+    finally:
+        layers[0] = original
+    logger.warning(
+        "oQe calibration: %s finished without calling its first layer; "
+        "walking from the raw token embeddings",
+        type(text_model).__name__,
+    )
+    return inputs
 
 
 def _qdq_weight_only(weight, bits: int, group_size: int, mode: str):
@@ -8606,12 +8920,17 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     non-causal attention (Decision 3.0).
 
     DeepSeek V4 blocks run on a 4D hidden (B, S, hc_mult, hidden), take a
-    window-limited array mask, and need the real token ids as their 4th
-    argument (hash expert routing indexes tid2eid with them). Everything
-    else keeps the generic 3D inputs + causal masks + position ids.
+    window-limited array mask, need the real token ids as their 4th
+    argument (hash expert routing indexes tid2eid with them), and a fresh
+    prompt cache whose PoolingCache keeps the compressed windows causal.
+    Everything else keeps the generic 3D inputs + causal masks + position ids.
     """
+    # One position row per batch row: the fused MRoPE kernel reads
+    # position_ids[b * S + t], so a shared (1, S) row runs past its end.
+    position_ids = mx.broadcast_to(
+        mx.arange(calib_data.shape[1])[None, :], calib_data.shape
+    )
     if noncausal:
-        position_ids = mx.arange(calib_data.shape[1])[None, :]
         return inputs, [None] * len(layers), position_ids
     model_type = str(
         getattr(model, "model_type", "")
@@ -8667,7 +8986,12 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
             window_size=args.sliding_window,
             return_array=True,
         )
-        return h, [mask] * len(layers), calib_data
+        state = {
+            "kind": _DEEPSEEK_V4_LAYER_STATE_KIND,
+            "input_ids": calib_data,
+            "make_cache": model.make_cache,
+        }
+        return h, [mask] * len(layers), state
     if model_type == "glm_moe_dsa":
         mask = create_attention_mask(inputs, None, return_array=True)
         state = {"kind": "glm_moe_dsa", "prev_topk_indices": None}
@@ -8680,8 +9004,34 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
         # generic signature probe only lands on ``(inputs,)`` after four
         # caught exceptions per layer.
         return inputs, [None] * len(layers), {"kind": "inkling"}
+    text_model = _find_layer_model(model, layers)
+    if text_model is not None:
+        inputs = _native_first_layer_input(text_model, layers, calib_data, inputs)
     masks = _layer_masks_for_model(model, layers, inputs)
-    position_ids = mx.arange(calib_data.shape[1])[None, :]
+    if model_type == "kimi_k3":
+        # Attention-residual layers mix in the block summaries of earlier
+        # layers and extend them; the native loop threads them through.
+        blocks = None
+        if getattr(text_model, "use_attn_res", False):
+            residual_blocks = sys.modules[type(text_model).__module__].ResidualBlocks
+            blocks = residual_blocks(text_model.args.rms_norm_eps)
+        return inputs, masks, {"kind": _KIMI_K3_LAYER_STATE_KIND, "blocks": blocks}
+    text_args = getattr(text_model, "args", None) or getattr(text_model, "config", None)
+    rope_parameters = getattr(text_args, "rope_parameters", None) or {}
+    if "llama_4_scaling_beta" in rope_parameters:
+        # Mistral 3/4 blocks scale queries by position (Llama 4 scaling).
+        positions = mx.arange(calib_data.shape[1])
+        attn_scale = 1 + rope_parameters["llama_4_scaling_beta"] * mx.log(
+            1
+            + mx.floor(
+                positions / rope_parameters["original_max_position_embeddings"]
+            )
+        )
+        state = {
+            "kind": _LLAMA4_SCALED_LAYER_STATE_KIND,
+            "attn_scale": attn_scale[:, None].astype(inputs.dtype),
+        }
+        return inputs, masks, state
     return inputs, masks, position_ids
 
 

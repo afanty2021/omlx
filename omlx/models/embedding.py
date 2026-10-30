@@ -23,7 +23,7 @@ from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import load_audio, load_config, load_processor
 
 from ..patches.modernbert_attention import patch_modernbert_attention
-from ..utils.image import _decode_input_audio_data, validate_image_data_uri
+from ..utils.image import _decode_input_audio_data, load_image, validate_image_data_uri
 from .base_model import (
     ENCODER_BATCH_TOKEN_BUDGET,
     last_token_pool,
@@ -34,6 +34,7 @@ from .base_model import (
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
+    patch_siglip_single_tower_forward,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,43 @@ class _ChatTemplateEmbeddingInputs:
                 f"{self._max_length}-token limit for media inputs"
             )
         return batch
+
+
+class _SiglipEmbeddingInputs:
+    """Build SigLIP text or image inputs. Each item goes to one tower."""
+
+    def __init__(self, processor, text_length: int):
+        self.tokenizer = processor.tokenizer
+        self._image_processor = processor.image_processor
+        self._text_length = text_length
+
+    def split_by_modality(self, items: list[dict[str, Any]]) -> list[list[int]]:
+        if any(item.get("text") and "image" in item for item in items):
+            raise ValueError(
+                "SigLIP embeds text and images separately; send each as its own item"
+            )
+        image_rows = [i for i, item in enumerate(items) if "image" in item]
+        text_rows = [i for i, item in enumerate(items) if "image" not in item]
+        return [rows for rows in (text_rows, image_rows) if rows]
+
+    def prepare_embedding_inputs(self, inputs, return_tensors: str = "mlx"):
+        if "image" in inputs[0]:
+            images = [
+                load_image(item["image"], field="items[].image") for item in inputs
+            ]
+            pixel_values = self._image_processor(images=images, return_tensors="np")[
+                "pixel_values"
+            ]
+            return {"pixel_values": mx.array(pixel_values)}
+        # The text tower pools the last position, so pad to the full length.
+        return self.tokenizer(
+            [item.get("text", "") for item in inputs],
+            padding="max_length",
+            truncation=True,
+            max_length=self._text_length,
+            return_attention_mask=True,
+            return_tensors=return_tensors,
+        )
 
 
 class MLXEmbeddingModel:
@@ -490,6 +528,7 @@ class MLXEmbeddingModel:
         try:
             patch_qwen3_vl_processor_for_torch_free_image_loading()
             patch_qwen3_vl_position_ids_recompute()
+            patch_siglip_single_tower_forward()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
@@ -506,6 +545,12 @@ class MLXEmbeddingModel:
                 self._hidden_size = getattr(config, "hidden_size", None)
                 if self._hidden_size is None and hasattr(config, "text_config"):
                     self._hidden_size = getattr(config.text_config, "hidden_size", None)
+                # SiglipProcessor.__call__ takes images as its first positional
+                # argument, so text and images get their own input builder.
+                if getattr(config, "model_type", None) == "siglip":
+                    self.processor = _SiglipEmbeddingInputs(
+                        self.processor, config.text_config.max_position_embeddings
+                    )
 
             self._using_native = False
             self._detect_input_key_remapping()
@@ -559,6 +604,8 @@ class MLXEmbeddingModel:
 
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
             embeddings = outputs.text_embeds
+        elif getattr(outputs, "image_embeds", None) is not None:
+            embeddings = outputs.image_embeds
         elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             embeddings = outputs.pooler_output
         elif (
@@ -983,7 +1030,9 @@ class MLXEmbeddingModel:
             )
 
         batches = [list(range(len(normalized_inputs)))]
-        if (
+        if isinstance(processor, _SiglipEmbeddingInputs):
+            batches = processor.split_by_modality(normalized_inputs)
+        elif (
             not uses_custom_embedding_inputs
             and 1 < len(input_texts) == len(normalized_inputs)
             and len(input_texts) * max_length > ENCODER_BATCH_TOKEN_BUDGET

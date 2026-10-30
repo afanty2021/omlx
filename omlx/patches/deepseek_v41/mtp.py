@@ -34,9 +34,15 @@ class AcceptanceDepthController:
 class DSparkMixin:
     _omlx_mtp_multi_request = True
 
-    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+    def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
-        return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
+        return self(
+            input_ids,
+            cache=cache,
+            _ced_prefill=True,
+            next_prefill_tokens=next_prefill_tokens,
+            **kwargs,
+        )
 
     @property
     def args(self):
@@ -183,6 +189,7 @@ class DSparkMixin:
             token_types=token_types,
             return_dspark_hidden=capture or prime,
             mtp_verify_states=verify_states,
+            _dspark_prime=prime,
             **kwargs,
         )
         if verify:
@@ -191,7 +198,11 @@ class DSparkMixin:
             logits, hidden = result
             # The draft ring retains one window; reset across omitted spans
             # using the existing absolute-position prompt-capture contract.
-            capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
+            # A chunk that skipped its decoder layers returns no hidden. The
+            # rows may start before input_ids when a skipped window was replayed;
+            # the capture only reads their count.
+            if hidden is not None:
+                capture_prompt(self, hidden[..., 0], hidden, cache)
             return logits
         if verify_only and return_hidden:
             return result, None

@@ -1517,26 +1517,50 @@ class TestGlobalSettings:
             assert custom_cache.exists()
             assert custom_logs.exists()
 
-    def test_ensure_directories_unavailable_model_dir(self):
-        """Test that unavailable model dirs are skipped instead of crashing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base = Path(tmpdir) / "omlx"
-            valid_models = Path(tmpdir) / "valid_models"
-            unavailable = Path("/Volumes/NonExistentDrive/Models")
+    def test_ensure_directories_unavailable_ssd_cache_dir(self, tmp_path):
+        """An unavailable cache dir turns the SSD cache off without a fallback dir."""
+        not_a_dir = tmp_path / "not-a-dir"
+        not_a_dir.write_text("")
+        configured = not_a_dir / "cache"
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        settings.cache.ssd_cache_dir = str(configured)
+        settings.cache.ssd_cache_max_size = "180GB"
 
-            settings = GlobalSettings(base_path=base)
-            settings.model.model_dirs = [str(valid_models), str(unavailable)]
-            settings.ensure_directories()
+        settings.ensure_directories()
+        settings.ensure_directories()  # e.g. save() keeps the SSD cache off
 
-            assert base.exists()
-            assert valid_models.exists()
-            # Unavailable path should be removed from model_dirs
-            resolved_dirs = settings.model.get_model_dirs(base)
-            assert len(resolved_dirs) == 1
-            assert resolved_dirs[0] == valid_models.resolve()
+        assert not (tmp_path / "omlx" / "cache").exists()
+        assert settings.cache.to_dict()["ssd_cache_dir"] == str(configured)
+        assert settings.cache.is_ssd_cache_dir_unavailable()
+        assert settings.to_scheduler_config().paged_ssd_cache_dir is None
 
-    def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
-        """Test that existing but unreadable model dirs are skipped."""
+        # A newly configured dir is used as is.
+        settings.cache.ssd_cache_dir = str(tmp_path / "other")
+        config = settings.to_scheduler_config()
+        assert config.paged_ssd_cache_dir == str((tmp_path / "other").resolve())
+        assert config.paged_ssd_cache_max_size == 180 * 1024**3
+        assert config.paged_ssd_cache_auto_size is False
+
+    def test_ensure_directories_keeps_unavailable_model_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """Unavailable model dirs stay configured and are stored resolved."""
+        base = tmp_path / "omlx"
+        unavailable = Path("/Volumes/NonExistentDrive/Models")
+        monkeypatch.chdir(tmp_path)
+
+        settings = GlobalSettings(base_path=base)
+        settings.model.model_dirs = ["valid_models", str(unavailable)]
+        settings.ensure_directories()
+
+        assert (tmp_path / "valid_models").exists()
+        expected = [str((tmp_path / "valid_models").resolve()), str(unavailable)]
+        assert settings.model.model_dirs == expected
+        # The admin API reports resolved dirs; a mismatch reloads all models.
+        assert [str(d) for d in settings.model.get_model_dirs(base)] == expected
+
+    def test_ensure_directories_keeps_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Existing but unreadable model dirs stay configured."""
         base = tmp_path / "omlx"
         valid_models = tmp_path / "valid_models"
         unreadable = tmp_path / "unreadable_models"
@@ -1555,8 +1579,10 @@ class TestGlobalSettings:
         settings.model.model_dirs = [str(valid_models), str(unreadable)]
         settings.ensure_directories()
 
-        resolved_dirs = settings.model.get_model_dirs(base)
-        assert resolved_dirs == [valid_models.resolve()]
+        assert settings.model.model_dirs == [
+            str(valid_models.resolve()),
+            str(unreadable.resolve()),
+        ]
 
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""

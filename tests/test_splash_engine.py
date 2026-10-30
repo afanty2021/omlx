@@ -3,6 +3,7 @@
 
 import asyncio
 import copy
+import fcntl
 import json
 import os
 import re
@@ -164,6 +165,187 @@ def _engine(tmp_path, version="1.3.1", **options) -> SplashEngine:
         log_dir=tmp_path / "logs",
         options=SplashOptions(**options),
     )
+
+
+def _disk_cache(root):
+    folder = root / ("a" * 32)
+    folder.mkdir(parents=True)
+    files = [
+        folder / name
+        for name in ("kv.slots", "kv.records", "state.slots", "state.records")
+    ]
+    for path in files:
+        path.write_bytes(b"cached")
+    (folder / "lock").touch()
+    return files
+
+
+class TestDiskCache:
+    def test_clear_removes_cache_data_and_keeps_lock_and_other_files(self, tmp_path):
+        root = tmp_path / "splash"
+        files = _disk_cache(root / "model")
+        folder = files[0].parent
+        (folder / "notes.txt").write_text("keep")
+        lock_inode = (folder / "lock").stat().st_ino
+        sparse = files[0]
+        with sparse.open("wb") as stream:
+            stream.truncate(1024**3)
+        expected = sum(path.stat().st_blocks * 512 for path in files)
+
+        assert splash_mod.scan_ssd_cache(root) == (4, expected)
+        assert splash_mod.scan_ssd_cache(root, clear=True) == (4, expected)
+        assert not any(path.exists() for path in files)
+        assert (folder / "lock").stat().st_ino == lock_inode
+        assert (folder / "notes.txt").read_text() == "keep"
+        assert splash_mod.scan_ssd_cache(root) == (0, 0)
+
+    def test_clear_refuses_a_locked_namespace(self, tmp_path):
+        root = tmp_path / "splash"
+        files = _disk_cache(root / "model")
+        with (files[0].parent / "lock").open("r+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(RuntimeError, match="in use by another process"):
+                splash_mod.scan_ssd_cache(root, clear=True)
+        assert all(path.exists() for path in files)
+
+    @pytest.mark.parametrize("level", ["root", "model", "namespace", "file"])
+    def test_scan_and_clear_preserve_symlink_targets(self, tmp_path, level):
+        root = tmp_path / "splash"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = outside / "kv.slots"
+        target.write_text("keep")
+        link = root
+        if level != "root":
+            root.mkdir()
+            link = root / "model"
+        if level in ("namespace", "file"):
+            link.mkdir()
+            link /= "a" * 32
+        if level == "file":
+            link.mkdir()
+            link /= "kv.slots"
+        link.symlink_to(target if level == "file" else outside)
+
+        if level == "root":
+            with pytest.raises(OSError):
+                splash_mod.scan_ssd_cache(root, clear=True)
+        else:
+            assert splash_mod.scan_ssd_cache(root) == (0, 0)
+            assert splash_mod.scan_ssd_cache(root, clear=True) == (0, 0)
+        assert target.read_text() == "keep"
+
+    @pytest.mark.parametrize("custom", [False, True])
+    async def test_api_clears_unloaded_splash_cache_and_usage(
+        self, tmp_path, monkeypatch, custom
+    ):
+        settings = GlobalSettings(base_path=tmp_path)
+        if custom:
+            settings.cache.ssd_cache_dir = str(tmp_path / "custom-cache")
+        root = settings.cache.get_ssd_cache_dir(tmp_path)
+        files = _disk_cache(root / "splash" / "model")
+        pool = EnginePool()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        monkeypatch.setattr(
+            admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+        )
+
+        before = admin_routes._build_runtime_cache_observability(settings)
+        assert before["total_num_files"] == 4
+        assert before["total_size_bytes"] > 0
+        with patch.dict(
+            srv.app.dependency_overrides, {admin_routes.require_admin: lambda: True}
+        ):
+            response = TestClient(srv.app).post("/admin/api/ssd-cache/clear")
+        assert response.status_code == 200
+        assert response.json()["total_deleted"] == 4
+        assert not any(path.exists() for path in files)
+        after = admin_routes._build_runtime_cache_observability(settings)
+        assert after["total_num_files"] == after["total_size_bytes"] == 0
+
+    def test_usage_counts_cold_cache_without_counting_a_loaded_cache_twice(
+        self, tmp_path, monkeypatch
+    ):
+        settings = GlobalSettings(base_path=tmp_path)
+        root = tmp_path / "cache" / "splash"
+        _disk_cache(root / "loaded")
+        cold = _disk_cache(root / "unloaded")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=root / "loaded", cache_disk_bytes=GIB)
+        entry.engine = engine
+        engine._status = {"disk": {"used_bytes": 123, "capacity_bytes": GIB}}
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        stats = admin_routes._build_runtime_cache_observability(settings)
+        assert stats["total_num_files"] == 5
+        assert stats["total_size_bytes"] == 123 + sum(
+            path.stat().st_blocks * 512 for path in cold
+        )
+
+    async def test_clear_also_reaches_a_loaded_models_previous_cache_root(
+        self, tmp_path
+    ):
+        root = tmp_path / "cache" / "splash"
+        old_root = tmp_path / "old-cache" / "splash"
+        files = _disk_cache(root / "unloaded") + _disk_cache(old_root / "loaded")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=old_root / "loaded", cache_disk_bytes=GIB)
+        entry.engine = engine
+        engine.stop = AsyncMock()
+        assert await pool.clear_splash_ssd_cache(root) == 8
+        assert not any(path.exists() for path in files)
+
+    async def test_api_unloads_idle_splash_before_deleting_its_cache(
+        self, tmp_path, monkeypatch
+    ):
+        settings = GlobalSettings(base_path=tmp_path)
+        root = tmp_path / "cache" / "splash"
+        files = _disk_cache(root / "model")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=root / "model", cache_disk_bytes=GIB)
+        entry.engine = engine
+        entry.is_pinned = True
+
+        async def stop():
+            assert all(path.exists() for path in files)
+            assert (
+                pool._acquire_loaded_engine(entry.model_id, False, True, None) is None
+            )
+
+        engine.stop = AsyncMock(side_effect=stop)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        monkeypatch.setattr(
+            admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+        )
+        response = await admin_routes.clear_ssd_cache(is_admin=True)
+
+        assert response["total_deleted"] == 4
+        engine.stop.assert_awaited_once()
+        assert entry.engine is None
+        assert entry.is_pinned
+        assert not any(path.exists() for path in files)
+
+    @pytest.mark.parametrize("busy", ["lease", "request", "loading", "pending"])
+    async def test_api_refuses_to_clear_busy_splash(self, tmp_path, monkeypatch, busy):
+        settings = GlobalSettings(base_path=tmp_path)
+        root = tmp_path / "cache" / "splash"
+        files = _disk_cache(root / "model")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=root / "model", cache_disk_bytes=GIB)
+        entry.engine = engine
+        engine.stop = AsyncMock()
+        entry.in_use = int(busy == "lease")
+        engine._active = int(busy == "request")
+        entry.is_loading = busy == "loading"
+        entry.pending_unload_reason = "manual unload" if busy == "pending" else None
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        with pytest.raises(HTTPException) as error:
+            await admin_routes.clear_ssd_cache(is_admin=True)
+        assert error.value.status_code == 409
+        engine.stop.assert_not_awaited()
+        assert all(path.exists() for path in files)
 
 
 # -- binary ---------------------------------------------------------------------
@@ -350,6 +532,48 @@ class TestCompatibility:
         _, reason = resolve_splash_target(model, None, [])
         assert "tokenizer.json" in reason
 
+    def test_qwen35_122b_checkpoint_needs_splash_1_4_1_and_its_draft(
+        self, tmp_path, launchers
+    ):
+        text = dict(splash_mod.SPLASH_FAMILIES["Qwen3.5-122B-A10B"])
+        model = _write_model(tmp_path / "Ornith-1.5-122B-MLX-4bit", text)
+        draft = _write_draft(tmp_path / "incoai" / "Ornith-1.5-122B-DFlash2", text)
+
+        launchers("splash", version="1.4.0")
+        _, reason = resolve_splash_target(model, None, [str(draft)])
+        assert reason == "Qwen3.5-122B-A10B needs Splash 1.4.1 or later"
+
+        launchers("splash", version="1.4.1")
+        assert (
+            splash_mod.splash_draft_to_download(model, None, [])
+            == "incoai/Ornith-1.5-122B-DFlash2"
+        )
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert reason == ""
+        assert target.draft_path == draft
+
+    def test_flint_mlx_checkpoint_explains_gguf_requirement(self, tmp_path, launchers):
+        launchers("splash", version="1.4.1")
+        # Flint's own config.json is flat: no text_config.
+        model = _write_model(tmp_path / "flint-4bit")
+        config = {**splash_mod.SPLASH_FAMILIES["Flint"], "quantization": MLX_4BIT}
+        (model / "config.json").write_text(json.dumps(config))
+
+        _, reason = resolve_splash_target(model, None, [])
+
+        assert reason == "Flint needs a GGUF; Splash cannot load its MLX checkpoints"
+
+    def test_pruned_mlx_checkpoint_explains_the_expert_count(self, tmp_path, launchers):
+        launchers("splash", version="1.4.1")
+        text = {**splash_mod.SPLASH_FAMILIES["Qwen3.6-35B-A3B"], "num_experts": 128}
+        model = _write_model(tmp_path / "Qwen3.6-35B-A3B-REAP-4bit", text)
+
+        _, reason = resolve_splash_target(model, None, [])
+
+        assert reason == (
+            "Splash serves Qwen3.6-35B-A3B MLX checkpoints with all 256 routed experts"
+        )
+
 
 # -- staging --------------------------------------------------------------------------
 
@@ -533,6 +757,125 @@ class TestGguf:
         assert tokenizer.decode(tokenizer.encode(prompt)) == prompt
         assert tokenizer.encode("<|im_end|>") == [vocab.index("<|im_end|>")]
         assert tokenizer.eos_token == "<|im_end|>"
+
+    def test_flint_gguf_serves_text_only_on_splash_1_4_1(
+        self, tmp_path, monkeypatch, launchers, write_gguf
+    ):
+        vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + ["<|end_of_text|>"]
+        monkeypatch.setitem(
+            splash_mod.SPLASH_FAMILIES["Flint"], "vocab_size", len(vocab)
+        )
+        # Layers 0, 1, 48 and every fourth from 5 attend every key; the rest
+        # slide over 513 tokens.
+        sliding = [2 <= layer < 48 and layer % 4 != 1 for layer in range(49)]
+        metadata = {
+            "general.architecture": "flint",
+            "flint.block_count": 49,
+            "flint.context_length": 262144,
+            "flint.embedding_length": 2048,
+            "flint.attention.head_count": 32,
+            "flint.attention.head_count_kv": 4,
+            "flint.attention.key_length": 128,
+            "flint.expert_count": 256,
+            "flint.expert_used_count": 6,
+            "flint.attention.sliding_window": 513,
+            "flint.attention.sliding_window_pattern": sliding,
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.pre": "flint",
+            "tokenizer.ggml.tokens": vocab,
+            "tokenizer.ggml.token_type": [1] * (len(vocab) - 1) + [3],
+            "tokenizer.ggml.merges": [],
+        }
+        repo = tmp_path / "models" / "unsloth" / "flint-GGUF"
+        write_gguf(repo / "flint-UD-Q4_K_XL.gguf", metadata, size=4096)
+        # A projector beside it does not give Flint a vision tower.
+        write_gguf(repo / "mmproj-BF16.gguf", {"general.architecture": "clip"}, 512)
+        text = {**splash_mod.SPLASH_FAMILIES["Flint"], "vocab_size": len(vocab)}
+        draft = _write_draft(tmp_path / "models" / "incoai" / "Flint-DFlash2", text)
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = Path(models["flint-UD-Q4_K_XL"].model_path)
+
+        launchers("splash", version="1.4.0")
+        _, reason = resolve_splash_target(folder, None, [str(draft)])
+        assert reason == "Flint needs Splash 1.4.1 or later"
+        launchers("splash", version="1.4.1")
+        target, reason = resolve_splash_target(folder, None, [str(draft)])
+        assert reason == ""
+
+        engine = SplashEngine(
+            model_name=str(folder),
+            model_id="flint-UD-Q4_K_XL",
+            target=target,
+            hub_dir=tmp_path / "hub",
+            log_dir=tmp_path / "logs",
+            options=SplashOptions(),
+        )
+        assert "--language-only" in engine._serve_command(9000)
+        gguf_bytes = (repo / "flint-UD-Q4_K_XL.gguf").stat().st_size
+        assert splash_mod._weight_bytes(folder) == gguf_bytes
+        # Only the 14 full-attention layers' KV grows with the context.
+        text_config = json.loads((folder / "config.json").read_text())["text_config"]
+        kv = splash_mod._kv_bytes_per_token(text_config, "bf16")
+        assert kv == 14 * 2 * 4 * 128 * 2
+
+        # Flint's own tokenizer splits digits in runs of up to three and does
+        # not NFC-normalize text.
+        backend = AutoTokenizer.from_pretrained(folder).backend_tokenizer
+        assert backend.normalizer is None
+        pieces = backend.pre_tokenizer.pre_tokenize_str("1234567")
+        assert [piece for piece, _ in pieces] == ["123", "456", "7"]
+
+    def test_pruned_moe_gguf_serves_on_splash_1_4_1(
+        self, tmp_path, monkeypatch, launchers, write_gguf
+    ):
+        vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + ["<|im_end|>"]
+        family = splash_mod.SPLASH_FAMILIES["Qwen3.8-Flash-Next"]
+        monkeypatch.setitem(family, "vocab_size", len(vocab))
+
+        def flash_next(experts: int) -> dict:
+            return {
+                "general.architecture": "qwen4exp",
+                "qwen4exp.block_count": 48,
+                "qwen4exp.context_length": 262144,
+                "qwen4exp.embedding_length": 2560,
+                "qwen4exp.attention.head_count": 24,
+                "qwen4exp.attention.head_count_kv": 2,
+                "qwen4exp.attention.key_length": 256,
+                "qwen4exp.full_attention_interval": 4,
+                "qwen4exp.expert_count": experts,
+                "qwen4exp.expert_used_count": 10,
+                "tokenizer.ggml.model": "gpt2",
+                "tokenizer.ggml.pre": "qwen35",
+                "tokenizer.ggml.tokens": vocab,
+                "tokenizer.ggml.token_type": [1] * (len(vocab) - 1) + [3],
+                "tokenizer.ggml.merges": [],
+            }
+
+        # ISTA's Coder release keeps 256 of Flash-Next's 512 routed experts.
+        repo = tmp_path / "models" / "ISTA-DASLab" / "Flash-Next-Coder-GGUF"
+        write_gguf(repo / "Flash-Next-Coder-IQ1_M.gguf", flash_next(256))
+        write_gguf(repo / "Flash-Next-Odd-Q2_0.gguf", flash_next(260))
+        draft = _write_draft(
+            tmp_path / "draft", {**FLASH_NEXT_TEXT, "vocab_size": len(vocab)}
+        )
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        pruned = models["Flash-Next-Coder-IQ1_M"].model_path
+        odd = models["Flash-Next-Odd-Q2_0"].model_path
+
+        launchers("splash", version="1.4.0")
+        assert resolve_splash_target(pruned, None, [str(draft)]) == (
+            None,
+            "GGUFs pruned to fewer routed experts need Splash 1.4.1 or later",
+        )
+        launchers("splash", version="1.4.1")
+        target, reason = resolve_splash_target(pruned, None, [str(draft)])
+        assert reason == ""
+        assert target.family == "Qwen3.8-Flash-Next"
+        _, reason = resolve_splash_target(odd, None, [str(draft)])
+        assert reason == (
+            "Splash serves Qwen3.8-Flash-Next GGUFs with a multiple of 8 routed "
+            "experts up to 512, not 260"
+        )
 
 
 class TestStaging:
@@ -1218,6 +1561,18 @@ class TestEnginePool:
         engine = pool._external_engine_for(entry, ModelSettings(), "vlm")
         assert isinstance(engine, SplashEngine)
 
+    async def test_gguf_over_the_ceiling_reports_why_splash_cannot_serve(
+        self, tmp_path, launchers, global_settings
+    ):
+        launchers("splash")
+        pool, entry = _pool(tmp_path, with_draft=False)
+        entry.model_format = "gguf"
+        entry.estimated_size = 55 * GIB
+        pool._get_final_ceiling = lambda: 32 * GIB
+
+        with pytest.raises(ModelLoadingError, match="DFlash2 draft"):
+            await pool.get_engine(entry.model_id)
+
     def test_options_follow_omlx_settings(self, tmp_path, launchers, global_settings):
         launchers("splash")
         pool, entry = _pool(tmp_path)
@@ -1886,6 +2241,7 @@ class TestSplashRuntimeCache:
             cache=SimpleNamespace(
                 ssd_cache_max_size="auto",
                 get_ssd_cache_dir=lambda base_path: tmp_path / "ssd_cache",
+                is_ssd_cache_dir_unavailable=lambda: False,
                 get_ssd_cache_max_size_bytes=lambda base_path: 0,
             ),
         )

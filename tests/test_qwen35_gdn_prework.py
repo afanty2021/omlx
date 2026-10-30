@@ -65,7 +65,7 @@ def _composed(qkv, conv_state, conv1d):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9, 16])
 @pytest.mark.parametrize("batch", [1, 2, 4])
 def test_fused_prework_bit_exact(seq, batch, dtype):
     mx.random.seed(11)
@@ -116,7 +116,7 @@ def _composed_l2(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
+@pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9, 16])
 @pytest.mark.parametrize("batch", [1, 2, 4])
 def test_fused_prework_l2_bit_exact(seq, batch):
     mx.random.seed(41)
@@ -617,6 +617,7 @@ def _canonical_qwen4_decode_module(signatures):
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
         ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e, every layer
     ],
 )
 def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
@@ -986,9 +987,10 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("seq", [8, 16])
 @pytest.mark.parametrize("batch,retained", [(1, [3]), (1, [8]), (3, [1, 8, 5])])
 def test_fused_verify_replays_committed_rows_in_the_next_block(
-    monkeypatch, batch, retained, dtype
+    monkeypatch, batch, retained, dtype, seq
 ):
     """The fused verify stores no per-row states: a commit leaves a lazy replay
     that the next block applies in its own launch. Outputs and committed states
@@ -1010,7 +1012,6 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
         linear_conv_kernel_dim=4,
         rms_norm_eps=1e-6,
     )
-    seq = 8
     mx.random.seed(71)
     module = q35.Qwen3_5GatedDeltaNet(args)
     module.set_dtype(dtype)
@@ -1057,6 +1058,74 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
     assert (True, True) in replays
     for actual, reference in zip(cache.state, reference_cache.state):
         assert same(actual, reference)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize(
+    "seq,retained", [(8, [8, 8, 8]), (8, [1, 8, 5]), (16, [3, 16, 11])]
+)
+def test_qwen4_verify_records_replay_rows_instead_of_states(
+    monkeypatch, seq, retained
+):
+    """The L2 verify keeps the stock output kernel but records the block rows,
+    so a batched transaction holds no state per position. Outputs and
+    committed states stay bit-exact to the stock recording across two blocks."""
+    import copy
+
+    q4 = pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    ver_cls = getattr(q4, "_Qwen4Verifier", None) or getattr(
+        q4, "Qwen4ExpBatchInvariantForward", None
+    )
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    batch = 3
+    mx.random.seed(73)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    module.__class__ = type(
+        "Q4GatedDeltaNet",
+        (q35.Qwen3_5GatedDeltaNet,),
+        {"_normalize_qk": q4.Qwen4ExpGatedDeltaNet._normalize_qk},
+    )
+    module.set_dtype(mx.bfloat16)
+    module.eval()
+    blocks = [mx.random.normal((batch, seq, 64)).astype(mx.bfloat16) for _ in range(2)]
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((batch, 3, module.conv_dim)).astype(mx.bfloat16)
+    cache[1] = mx.random.normal((batch, 4, 128, 128)) * 0.01
+    reference_cache = copy.deepcopy(cache)
+
+    def run(target, inputs):
+        transaction = start_speculative_cache([target], seq)
+        out = ver_cls()._gated_delta(module, inputs, None, target)
+        mx.eval(out)
+        return out, transaction
+
+    expected = []
+    for inputs in blocks:
+        out, transaction = run(reference_cache, inputs)
+        transaction.commit(retained)
+        expected.append(out)
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    for index, inputs in enumerate(blocks):
+        out, transaction = run(cache, inputs)
+        assert cache._speculation["records"][1][0] == "replay"
+        assert mx.array_equal(out, expected[index]).item()
+        transaction.commit(retained)
+    assert getattr(cache, "_omlx_gdn_pending", None) is None
+    for actual, reference in zip(cache.state, reference_cache.state):
+        assert mx.array_equal(actual, reference).item()
 
 
 def test_qwen4_decode_setting_is_captured_per_model():
@@ -1174,6 +1243,7 @@ def patched_decode(monkeypatch):
     [
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e
     ],
 )
 @pytest.mark.parametrize("seed", [3, 11])
@@ -1249,8 +1319,8 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, HV, DV, DK)),
     )
     assert not fallbacks
-    # 8-bit in-projections are outside the shipped allocation allow-list.
-    module.in_proj_qkv = _random_projection(2560, C, 8, 64)
+    # 8-bit/g128 in-projections are outside the shipped allocation allow-list.
+    module.in_proj_qkv = _random_projection(2560, C, 8, 128)
     _decode_steps(
         module,
         [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
@@ -1361,8 +1431,14 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", deferred)
     inputs, conv_state, recurrent_state = _verify_inputs(rows, seed + rows)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", False)
+    # The reference keeps the stock per-step state records.
+    replay = prework_mod.qwen35_gdn_verify_fused.replay_eligible
+    monkeypatch.setattr(
+        prework_mod.qwen35_gdn_verify_fused, "replay_eligible", lambda *args: False
+    )
     want, want_cache, want_tx = _verify_block(module, inputs, conv_state, recurrent_state)
     assert qwen4_verify == []
+    monkeypatch.setattr(prework_mod.qwen35_gdn_verify_fused, "replay_eligible", replay)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", True)
     got, got_cache, got_tx = _verify_block(module, inputs, conv_state, recurrent_state)
     assert qwen4_verify == [rows]
@@ -1455,9 +1531,10 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
 @pytest.mark.parametrize("rows", [2, 3])
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
-    monkeypatch, qwen4_verify, rows
+    monkeypatch, qwen4_verify, signatures, rows
 ):
     """Up to the per-row projection limit, every row of a batched one-token
     decode, and its next conv and recurrent states, equal that row decoded
@@ -1465,7 +1542,7 @@ def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     from mlx_vlm.models.cache import ArraysCache
 
     assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
-    module = _real_qwen4_decode_module(((6, 64),) * 4, 17)
+    module = _real_qwen4_decode_module(signatures, 17)
     mx.random.seed(rows)
     inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
     conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)

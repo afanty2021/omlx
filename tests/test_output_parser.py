@@ -1107,6 +1107,8 @@ class TestOutputParserFactory:
         "template, expected",
         [
             ("<tool_call>\n<function=", "qwen3_coder"),
+            # MiMo: no newline, so MLX-LM alone infers json_tools (#4933).
+            ("'<tool_call><function=' ~ tool_call.name ~ '>'", "qwen3_coder"),
             ("<arg_key>", "glm47"),
             ("[TOOL_CALLS]", "mistral"),  # Empty end marker.
         ],

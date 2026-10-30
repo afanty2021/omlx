@@ -345,7 +345,8 @@ _NUMERICS_REVISIONS = {
     # mlx-lm a63e24c scales the GDN q/k l2norm eps by inv_scale**2.
     "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
     "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
-    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
+    # Ling's 2-9 row MLA forwards also moved to the absorbed path.
+    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2+mla-absorbed-1",
     # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
     "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
     # mlx-lm 0d4d3d04 changes these forwards: the YaRN ``truncate`` flag of
@@ -359,8 +360,17 @@ _NUMERICS_REVISIONS = {
     # mlx-lm's Muse Spark keeps the residual stream in FP32; oMLX's own model
     # served Muse Spark before and kept it in BF16.
     "mlx_lm.models.muse_spark": "upstream-1",
+    # mlx-vlm 138d761 changes the DeepSeek-OCR SAM and CLIP encoders (also
+    # used by DeepSeek-OCR 2 and Unlimited-OCR), the MiniCPM-V 4.6/4.7 vision
+    # tower, and per-expert NVFP4 MoE matmuls (gather_qmm global_scale).
+    "mlx_vlm.models.deepseekocr.sam": "mlx-vlm-138d761",
+    "mlx_vlm.models.deepseekocr.vision": "mlx-vlm-138d761",
+    "mlx_vlm.models.minicpmv4_6.vision": "mlx-vlm-138d761",
+    "mlx_vlm.quantization.nvfp4": "mlx-vlm-138d761",
 }
 
+
+_DEEPSEEK_V41_LANGUAGE_MODULE = "omlx.patches.deepseek_v41.language"
 
 # mlx-lm Qwen3.5-family modules whose ``YarnRoPE`` comes from a context window
 # past the native one (see ``omlx.patches.qwen35_yarn``).
@@ -396,6 +406,16 @@ def numerics_revision_for_model(model: Any) -> str | None:
     }
     if yarn := _yarn_revision(modules):
         revisions.add(yarn)
+    # Set by cast_bf16_params_to_fp16: KV computed before the recast is bf16.
+    if any(getattr(module, "_omlx_fp16_recast", False) for module in modules):
+        revisions.add("fp16-recast")
+    # DeepSeek V4.1 CED prefill stores approximate decoder states.
+    if any(
+        type(module).__module__ == _DEEPSEEK_V41_LANGUAGE_MODULE
+        and getattr(getattr(module, "_config", None), "ced_prefill", False)
+        for module in modules
+    ):
+        revisions.add("ced-prefill-1")
     return ",".join(sorted(revisions)) or None
 
 
@@ -1858,8 +1878,10 @@ class PagedSSDCacheManager(CacheManager):
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
         # Numerics revision of the live model (see ``_NUMERICS_REVISIONS``).
-        # None accepts every block, like the TurboQuant depth.
+        # Every block passes until the live revision is known; after that,
+        # None accepts only blocks without a revision.
         self._expected_numerics: str | None = None
+        self._expected_numerics_known = False
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -2915,7 +2937,7 @@ class PagedSSDCacheManager(CacheManager):
 
     def _signature_numerics_match(self, cache_signature: str) -> bool:
         """True when a block was computed with the live model's numerics."""
-        if self._expected_numerics is None:
+        if not self._expected_numerics_known:
             return True
         return _signature_numerics(cache_signature) == self._expected_numerics
 
@@ -4778,7 +4800,10 @@ class PagedSSDCacheManager(CacheManager):
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
-            numerics_changed = numerics != self._expected_numerics
+            numerics_changed = (
+                not self._expected_numerics_known
+                or numerics != self._expected_numerics
+            )
             if (
                 old_canonical == new_canonical
                 and not bits_changed
@@ -4793,6 +4818,7 @@ class PagedSSDCacheManager(CacheManager):
             self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
             self._expected_numerics = numerics
+            self._expected_numerics_known = True
             self._signature_sweep_completed = False
 
         logger.info(

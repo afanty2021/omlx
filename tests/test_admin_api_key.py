@@ -1386,6 +1386,7 @@ async def test_offline_ssd_sidecar_usage_and_clear(tmp_path, monkeypatch, includ
         cache=SimpleNamespace(
             ssd_cache_max_size="1GB",
             get_ssd_cache_dir=lambda _: cache_dir,
+            is_ssd_cache_dir_unavailable=lambda: False,
             get_ssd_cache_max_size_bytes=lambda _: 10**9,
         ),
     )

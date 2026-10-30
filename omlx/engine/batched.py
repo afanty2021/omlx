@@ -13,6 +13,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..model_settings import (
@@ -23,7 +24,7 @@ from ..model_settings import (
 from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
-from ..utils.tokenizer import get_tokenizer_config
+from ..utils.tokenizer import get_tokenizer_config, is_mimo_tool_template
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -132,6 +133,10 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def supports_logprobs(self) -> bool:
+        return True
 
     @property
     def supports_early_tool_call_streaming(self) -> bool:
@@ -340,9 +345,14 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
         )
+        # The scheduler repairs only its deep copy, and API tool parsing reads
+        # this tokenizer. Repair it here only for MiMo-format templates (#4933).
+        if is_mimo_tool_template(getattr(self._tokenizer, "chat_template", None)):
+            repair_tool_parser(self._tokenizer)
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
+            apply_activation_fp16,
             apply_post_load_transforms,
             materialize_lazy_state,
         )
@@ -408,6 +418,12 @@ class BatchedEngine(BaseEngine):
         # inference threads can read them (#1304).
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._model
+        )
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_activation_fp16,
+            self._model,
+            self._model_settings,
         )
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
@@ -515,7 +531,7 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+        if getattr(self._model_settings, "a8_prefill_enabled", False):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -525,7 +541,7 @@ class BatchedEngine(BaseEngine):
                 apply_qwen35_oq_a8_patch(
                     self._model,
                     min_tokens=int(
-                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                     ),
                 )
             except Exception:
@@ -1190,6 +1206,8 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -1215,6 +1233,7 @@ class BatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=output.logprobs,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
@@ -1277,6 +1296,8 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -1318,6 +1339,7 @@ class BatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
+                    logprobs=output.logprobs,
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),

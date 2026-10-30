@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
+from omlx.request import TokenLogprob
 
 logger = logging.getLogger(__name__)
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
@@ -210,6 +211,8 @@ class GenerationOutput:
     finished: bool = True
     # For tool calling (Harmony and other models)
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    # Per-token logprobs: the new tokens when streaming, all tokens otherwise.
+    logprobs: Optional[List[TokenLogprob]] = None
     # Prefix cache stats
     cached_tokens: int = 0
     # Optional engine-native throughput stats. Diffusion models report
@@ -249,6 +252,11 @@ class BaseEngine(ABC):
         terminal output arrives.
         """
 
+        return False
+
+    @property
+    def supports_logprobs(self) -> bool:
+        """Whether chat outputs can carry per-token logprobs."""
         return False
 
     def _generation_prompt_text(

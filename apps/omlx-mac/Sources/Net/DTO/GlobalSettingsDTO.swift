@@ -81,6 +81,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     struct CacheSettings: Codable, Equatable, Sendable {
         let enabled: Bool
         let ssdCacheDir: String?
+        let ssdCacheUnavailable: Bool?
         let ssdCacheMaxSize: String?
         let hotCacheOnly: Bool?
         let hotCacheMaxSize: String?

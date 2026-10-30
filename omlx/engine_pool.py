@@ -48,6 +48,9 @@ from .engine.splash import (
     splash_memory_estimate,
     splash_repo_id,
 )
+from .engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
@@ -66,11 +69,11 @@ from .exceptions import (
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
-    discover_models,
     format_size,
     is_realtime_stt_model,
 )
 from .model_settings import (
+    ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -163,6 +166,10 @@ def build_claude_tier_aliases(claude_code_settings) -> dict[str, str]:
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+# Prompt room the expert-offload residency hint keeps below the prompt line.
+# Measured on 30B-class MoE: about a 16K-token prompt.
+_MOE_OFFLOAD_PROMPT_RESERVE = 4 * 1024**3
+_MOE_OFFLOAD_PERCENTS = range(5, 96)
 # Cluster ranks load the text model through mlx-lm, so a VLM-classified
 # checkpoint is served text-only while its deployment is active.
 _CLUSTER_ENGINE_TYPES = frozenset({"batched", "vlm"})
@@ -591,8 +598,13 @@ class EnginePool:
         *,
         base_size: int | None = None,
         include_ane_reservation: bool = True,
+        log_decision: bool = True,
     ) -> int:
-        """Include Engram runtime storage and optional K2 ANE reservations."""
+        """Include Engram runtime storage and optional K2 ANE reservations.
+
+        ``log_decision=False`` sizes hypothetical settings without logging or
+        recording forced offload decisions.
+        """
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
@@ -605,7 +617,7 @@ class EnginePool:
                 limit = self._splash_admission_target()
                 return min(wanted, limit) if limit > 0 else wanted
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
-            entry, runtime_settings
+            entry, runtime_settings, log_decision=log_decision
         )
         if qwen4_estimate is not None:
             base = min(
@@ -615,7 +627,7 @@ class EnginePool:
                 else qwen4_estimate.resident_bytes,
             )
         v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
-            entry, runtime_settings
+            entry, runtime_settings, log_decision=log_decision
         )
         if v41_estimate is not None:
             base = (
@@ -629,12 +641,13 @@ class EnginePool:
             # retain the quantized estimate. One additional model-sized charge
             # is conservative and lets normal admission produce useful errors.
             extra = entry.estimated_size
-            logger.warning(
-                "Could not determine Qwen CPU-share geometry for %s; "
-                "reserving one additional model-sized memory allowance",
-                entry.model_id,
-            )
-        if extra > 0:
+            if log_decision:
+                logger.warning(
+                    "Could not determine Qwen CPU-share geometry for %s; "
+                    "reserving one additional model-sized memory allowance",
+                    entry.model_id,
+                )
+        if extra > 0 and log_decision:
             logger.info(
                 "Qwen CPU sharing adds %s to the projected memory for %s",
                 format_size(extra),
@@ -748,6 +761,104 @@ class EnginePool:
         footprint = int(estimate.resident_bytes / 1.05)
         return footprint > line >= estimate.mmap_bytes
 
+    def moe_offload_fit(
+        self, entry: EngineEntry, settings: object | None, ceiling: int
+    ) -> dict:
+        """Largest expert residency percent that leaves prompt room.
+
+        The budget is the scheduler's prompt line, (ceiling - hot cache) x
+        tier headroom, less other loaded models and
+        ``_MOE_OFFLOAD_PROMPT_RESERVE``. ``status`` is ``unknown`` (no line),
+        ``resident`` (no offload needed), ``fit`` or ``no_fit``.
+        """
+        result = {
+            "status": "unknown",
+            "max_percent": None,
+            "bytes": 0,
+            "reserve_bytes": _MOE_OFFLOAD_PROMPT_RESERVE,
+        }
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        headroom = getattr(enforcer, "_prefill_headroom_safety", None)
+        if not isinstance(headroom, (int, float)) or not 0 < headroom <= 1:
+            return result
+        if ceiling <= 0 or self._distributed_deployment_for_entry(entry) is not None:
+            return result
+        if self.external_engine_id(entry.model_id, settings):
+            return result
+        # Prompts are admitted under min(headroom, hard watermark).
+        ratio = min(headroom, getattr(enforcer, "_hard_threshold", headroom))
+        hot_cache = int(getattr(self._scheduler_config, "hot_cache_max_size", 0) or 0)
+        others = self._current_model_memory
+        if entry.engine is not None:
+            others -= self._entry_resident_size(entry)
+        budget = (
+            int((ceiling - hot_cache) * ratio) - others - _MOE_OFFLOAD_PROMPT_RESERVE
+        )
+        # A loaded entry's runtime size already includes its offload, so start
+        # from the checkpoint like a fresh load does.
+        base = entry.estimated_size
+        if entry.text_only_size and entry.engine_type == "batched":
+            base = entry.text_only_size
+
+        def probe(percent: int | None, table_on_ssd: bool = False) -> object:
+            p = copy.copy(settings) if settings is not None else ModelSettings()
+            p.moe_expert_offload_enabled = percent is not None
+            if percent is not None:
+                p.moe_expert_offload_resident_fraction = percent / 100
+            if table_on_ssd:
+                p.qwen4_ple_ssd_offload = True
+                p.deepseek_v41_engram_ssd_offload = True
+            return p
+
+        def table_forced(p: object) -> bool:
+            """Whether the load would move a PLE or Engram table to mmap itself."""
+            _, ple, _ = self._qwen4_ple_offload_status(entry, p, log_decision=False)
+            _, engram, _ = self._deepseek_v41_engram_offload_status(
+                entry, p, log_decision=False
+            )
+            return (ple and not getattr(p, "qwen4_ple_ssd_offload", False)) or (
+                engram and not getattr(p, "deepseek_v41_engram_ssd_offload", False)
+            )
+
+        def fit_size(p: object, allow_forced: bool = False) -> int | None:
+            size = self._entry_runtime_resident_size(
+                entry, p, base_size=base, log_decision=False
+            )
+            if size > budget or (not allow_forced and table_forced(p)):
+                return None
+            return size
+
+        def largest(fits) -> tuple[int, int] | None:
+            best = None
+            lo, hi = 0, len(_MOE_OFFLOAD_PERCENTS)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                fitted = fits(_MOE_OFFLOAD_PERCENTS[mid])
+                if fitted is None:
+                    hi = mid
+                else:
+                    best, lo = (_MOE_OFFLOAD_PERCENTS[mid], fitted), mid + 1
+            return best
+
+        if fit_size(probe(None)) is not None:
+            result["status"] = "resident"
+            return result
+        # Sizes grow with the percent until a table is forced to mmap, then
+        # drop and grow again. Prefer the table where the settings put it;
+        # else take the largest percent the forced mmap fits.
+        best = largest(lambda pc: fit_size(probe(pc)))
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if best is None and model_type in ("qwen4_exp", "deepseek_v41"):
+            mmap = largest(lambda pc: fit_size(probe(pc, True), allow_forced=True))
+            if mmap is not None and table_forced(probe(mmap[0])):
+                best = mmap
+        if best is None:
+            result["status"] = "no_fit"
+        else:
+            result["status"] = "fit"
+            result["max_percent"], result["bytes"] = best
+        return result
+
     def _log_offload_decision_once(
         self,
         model_id: str,
@@ -781,6 +892,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -833,19 +945,20 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        self._log_offload_decision_once(
-            entry.model_id,
-            "qwen4_ple_ssd_offload",
-            forced,
-            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-            "room to serve prompts under the %.1fGB memory ceiling (mmap "
-            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-            "resident load.",
-            entry.model_id,
-            estimate.resident_bytes / 1e9,
-            ceiling / 1e9,
-            estimate.mmap_bytes / 1e9,
-        )
+        if log_decision:
+            self._log_offload_decision_once(
+                entry.model_id,
+                "qwen4_ple_ssd_offload",
+                forced,
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+                "room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+                "resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -877,6 +990,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
 
@@ -923,18 +1037,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        self._log_offload_decision_once(
-            entry.model_id,
-            "deepseek_v41_engram_ssd_offload",
-            forced,
-            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-            "needs %.1fGB).",
-            entry.model_id,
-            estimate.resident_bytes / 1e9,
-            ceiling / 1e9,
-            estimate.mmap_bytes / 1e9,
-        )
+        if log_decision:
+            self._log_offload_decision_once(
+                entry.model_id,
+                "deepseek_v41_engram_ssd_offload",
+                forced,
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB "
+                "leaves no room to serve prompts under the %.1fGB memory "
+                "ceiling (mmap needs %.1fGB).",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
@@ -1182,6 +1297,10 @@ class EnginePool:
         if mtp_active:
             add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
             add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
+        add(
+            "activation_fp16_enabled",
+            bool(data.get("activation_fp16_enabled", False)),
+        )
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
@@ -1216,10 +1335,10 @@ class EnginePool:
         # process-wide projection backends, and caches a prepared plan and
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
-        oq_a8_active = bool(data.get("qwen35_oq_a8_enabled", False))
-        add("qwen35_oq_a8_enabled", oq_a8_active)
+        oq_a8_active = bool(data.get("a8_prefill_enabled", False))
+        add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
-            add("qwen35_oq_a8_min_tokens", data.get("qwen35_oq_a8_min_tokens", 128))
+            add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
 
         ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
         model_type = entry.config_model_type if entry else None
@@ -1418,10 +1537,7 @@ class EnginePool:
         self._model_dirs = dirs
 
         gguf_root = _gguf_model_root()
-        if len(dirs) == 1:
-            discovered = discover_models(dirs[0], gguf_root)
-        else:
-            discovered = discover_models_from_dirs(dirs, gguf_root)
+        discovered = discover_models_from_dirs(dirs, gguf_root)
 
         pinned_set = set(pinned_models or [])
 
@@ -2159,13 +2275,13 @@ class EnginePool:
             return next(iter(EXTERNAL_ENGINES))
         return None
 
-    def _external_engine_for(
+    def _selected_splash_target(
         self,
         entry: EngineEntry,
         model_settings: object | None,
         effective_type: str,
-    ) -> SplashEngine | None:
-        """The external engine the model's settings select, else None.
+    ) -> SplashTarget | None:
+        """The Splash target the model's settings select, else None.
 
         A model that cannot run on its selected engine fails to load with the
         reason instead of falling back to MLX, since the user asked for it.
@@ -2186,6 +2302,18 @@ class EnginePool:
             raise ModelLoadingError(
                 entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
             )
+        return target
+
+    def _external_engine_for(
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        effective_type: str,
+    ) -> SplashEngine | None:
+        """The external engine the model's settings select, else None."""
+        target = self._selected_splash_target(entry, model_settings, effective_type)
+        if target is None:
+            return None
         logger.info(
             "Serving %s through %s %s (%s)",
             entry.model_id,
@@ -2719,6 +2847,9 @@ class EnginePool:
             runtime_load_settings = (
                 load_settings if ngram_admission_override else runtime_settings
             )
+            # Without a Splash target the size below falls back to the files'
+            # in-process footprint, so report why Splash cannot serve first.
+            self._selected_splash_target(entry, load_settings, entry.engine_type)
             admission_size = self._entry_runtime_resident_size(
                 entry,
                 load_settings,
@@ -2941,6 +3072,36 @@ class EnginePool:
         self._lease_release_tasks.add(task)
         task.add_done_callback(self._finish_lease_release_task)
         await asyncio.shield(task)
+
+    async def clear_splash_ssd_cache(self, cache_root: Path) -> int:
+        """Stop idle Splash writers before deleting their persistent cache."""
+        async with self._lock:
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir
+            ]
+            for entry in entries:
+                if (
+                    entry.is_loading
+                    or entry.pending_unload_reason
+                    or not self._entry_is_quiescent(entry)
+                ):
+                    raise ModelBusyError(entry.model_id, "delete Splash SSD cache")
+            roots = {cache_root}
+            reason = "delete Splash SSD cache"
+            for entry in entries:
+                roots.add(entry.engine.ssd_cache_dir.parent)
+                # The ready-engine fast path bypasses the pool lock.
+                entry.pending_unload_reason = reason
+            try:
+                for entry in entries:
+                    await self._unload_engine(entry.model_id)
+                return sum(scan_splash_ssd_cache(root, clear=True)[0] for root in roots)
+            finally:
+                for entry in entries:
+                    if entry.pending_unload_reason == reason:
+                        entry.pending_unload_reason = None
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""

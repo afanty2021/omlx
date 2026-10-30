@@ -563,7 +563,11 @@ class TestMSDownloader:
             poll = asyncio.create_task(
                 downloader._poll_progress(task.task_id, target)
             )
-            await asyncio.sleep(0.05)
+            # The ETA rate needs several polls; a fixed sleep can miss them.
+            for _ in range(500):
+                if task.eta_speed_bps > 0:
+                    break
+                await asyncio.sleep(0.01)
             observed_speed = task.speed_bps
             observed_eta_speed = task.eta_speed_bps
             task.status = DownloadStatus.COMPLETED

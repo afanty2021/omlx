@@ -4320,6 +4320,8 @@ class TestLayerSignatureSweep:
             tmp_path,
             expected_layer_cache_types=["ArraysCache", "KVCache"],
         )
+        # The first call also pins the numerics revision.
+        assert mgr.set_expected_layer_signature(["ArraysCache", "KVCache"]) is True
         mgr._signature_sweep_completed = True
 
         changed = mgr.set_expected_layer_signature(["SizedArraysCache", "KVCache"])
@@ -4335,6 +4337,8 @@ class TestLayerSignatureSweep:
             tmp_path,
             expected_layer_cache_types=["KVCache", "RotatingKVCache"],
         )
+        # The first call also pins the numerics revision.
+        assert mgr.set_expected_layer_signature(["KVCache", "RotatingKVCache"]) is True
         mgr._signature_sweep_completed = True
 
         changed = mgr.set_expected_layer_signature(

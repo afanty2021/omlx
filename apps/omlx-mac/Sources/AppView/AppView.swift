@@ -1,5 +1,5 @@
 // AppView shell. NavigationSplitView backed by the `AppSection` enum, one
-// sidebar row per screen, grouped into Server / Models / Benchmark / General
+// sidebar row per screen, grouped into Server / App / Models / Benchmark / General
 // sections. Sized close to the minimum comfortable settings window so the
 // first open does not feel oversized, while still surviving a resize.
 //
@@ -81,7 +81,9 @@ struct AppView: View {
                 },
                 onConfirm: {
                     services.updates.confirmUpdate(update)
-                    presentedUpdate = nil
+                    if services.updates.confirmationUpdate == nil {
+                        presentedUpdate = nil
+                    }
                 }
             )
                 .environment(\.omlxTheme, theme)
@@ -126,6 +128,7 @@ struct AppView: View {
         case .appearance:   AppearanceScreen()
         case .network:      NetworkScreen()
         case .performance:  PerformanceScreen()
+        case .askAI:        AskAIScreen()
         case .status:       StatusScreen()
         case .logs:         LogsScreen()
         case .models:
@@ -195,9 +198,13 @@ private struct UpdateConfirmationSheet: View {
                             comment: "Update confirmation sheet title; placeholder is the version"))
                     .font(.omlxText(DesignTokens.FontSize.title2, weight: .semibold))
                     .foregroundStyle(theme.text)
-                Text(String(localized: "update.confirm.subtitle",
-                            defaultValue: "Review the release notes before downloading and relaunching.",
-                            comment: "Subtitle for the update confirmation sheet"))
+                Text(isStaged
+                     ? String(localized: "update.confirm.subtitle_ready",
+                              defaultValue: "The update is downloaded. Review the release notes before relaunching.",
+                              comment: "Subtitle for the update confirmation sheet when the update is already downloaded")
+                     : String(localized: "update.confirm.subtitle",
+                              defaultValue: "Review the release notes before downloading and relaunching.",
+                              comment: "Subtitle for the update confirmation sheet"))
                     .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textSecondary)
             }
@@ -255,9 +262,18 @@ private struct UpdateConfirmationSheet: View {
     private var footer: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(String(localized: "update.confirm.size",
-                            defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
-                            comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown"))
+                if let error = updates.lastError {
+                    Text(error)
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
+                        .foregroundStyle(theme.redDot)
+                }
+                Text(isStaged
+                     ? String(localized: "update.confirm.downloaded",
+                              defaultValue: "Downloaded and ready to install",
+                              comment: "Update confirmation footer line when the update is already downloaded")
+                     : String(localized: "update.confirm.size",
+                              defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
+                              comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown"))
                     .font(.omlxText(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
                 Text(String(localized: "update.confirm.restart_notice",
@@ -468,7 +484,6 @@ private struct SettingsSidebar: View {
         List(selection: $selection) {
             Section {
                 SidebarRow(section: .status)
-                SidebarRow(section: .appearance)
                 SidebarRow(section: .server)
                 SidebarRow(section: .network)
                 SidebarRow(section: .performance)
@@ -477,6 +492,14 @@ private struct SettingsSidebar: View {
                 Text(String(localized: "sidebar.group.server",
                             defaultValue: "Server",
                             comment: "Sidebar group heading for server-related screens"))
+            }
+            Section {
+                SidebarRow(section: .appearance)
+                SidebarRow(section: .askAI)
+            } header: {
+                Text(String(localized: "sidebar.group.app",
+                            defaultValue: "App",
+                            comment: "Sidebar group heading for settings stored by the Mac app itself"))
             }
             Section {
                 SidebarRow(section: .models)

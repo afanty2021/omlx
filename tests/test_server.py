@@ -24,12 +24,14 @@ from omlx.exceptions import (
     ModelUnavailableError,
 )
 from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.request import TokenLogprob
 from omlx.server import (
     EngineType,
     SamplingDefaults,
     ServerState,
     _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
+    _remove_legacy_ced_ssd_cache_for_server,
     _reset_boundary_snapshots_for_server,
     _resolve_metric_durations,
     app,
@@ -75,6 +77,24 @@ class TestBoundarySnapshotLifecycle:
             _reset_boundary_snapshots_for_server()
 
         assert stale_dir.exists()
+
+
+def test_legacy_ced_ssd_cache_is_removed_and_root_kept(tmp_path):
+    root_block = tmp_path / "a" / "root.safetensors"
+    legacy_block = tmp_path / "deepseek_v41_ced_v1" / "a" / "ced.safetensors"
+    for block in (root_block, legacy_block):
+        block.parent.mkdir(parents=True)
+        block.write_text("cache")
+
+    state = ServerState()
+    state.engine_pool = SimpleNamespace(
+        _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=tmp_path)
+    )
+    with patch("omlx.server._server_state", state):
+        _remove_legacy_ced_ssd_cache_for_server()
+
+    assert not (tmp_path / "deepseek_v41_ced_v1").exists()
+    assert root_block.exists()
 
 
 @pytest.mark.asyncio
@@ -1302,6 +1322,38 @@ class TestExposedProfileModels:
 
         assert budget == 512
 
+    def test_gpu_power_limit_takes_lower_of_request_and_settings(self, manager):
+        pool = srv.EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(gpu_power_limit_w=30))
+        self._save_exposed_profile(manager, {"gpu_power_limit_w": 20})
+        srv._server_state.engine_pool = pool
+        resolve = srv._resolve_gpu_power_limit
+
+        assert resolve(object(), "qwen-base") == 30
+        assert resolve(object(), "qwen-base:thinking") == 20
+        assert resolve(SimpleNamespace(gpu_power_limit_w=10), "qwen-base") == 10
+        assert resolve(SimpleNamespace(gpu_power_limit_w=25), "qwen-base") == 25
+        assert resolve(SimpleNamespace(gpu_power_limit_w=40), "qwen-base") == 30
+        # Responses requests pass extra fields through unvalidated.
+        for raw in (True, 1, "10", 7.5):
+            assert resolve(SimpleNamespace(gpu_power_limit_w=raw), "qwen-base") == 30
+
+    @pytest.mark.asyncio
+    async def test_lease_acquires_and_releases_gpu_power_once(self, monkeypatch):
+        limiter = MagicMock()
+        monkeypatch.setattr(srv._server_state, "gpu_power_limiter", limiter)
+        lease = srv._LLMEngineLease()
+
+        lease.limit_gpu_power(None)
+        lease.limit_gpu_power(10)
+        lease.limit_gpu_power(5)
+        await lease.release()
+        await lease.release()
+
+        limiter.acquire.assert_called_once_with(10)
+        limiter.release.assert_called_once_with(10)
+
     def test_max_context_window_uses_exposed_profile_settings(self, manager):
         import omlx.server as server_module
         from omlx.engine_pool import EnginePool
@@ -1619,6 +1671,83 @@ def prepared_chat_engine():
     engine.start = AsyncMock()
     engine.supports_request_scoped_abort = False
     return engine
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_completion_returns_token_logprobs(
+    monkeypatch, prepared_chat_engine, stream
+):
+    def entry(text):
+        alt = TokenLogprob(token_id=9, text="x", token_bytes=[120], logprob=-3.0)
+        return TokenLogprob(1, text, list(text.encode()), -0.5, top=[alt])
+
+    # The last token adds no text, so its logprob rides on the finish chunk.
+    chunks = [("Hel", [entry("Hel")]), ("lo", [entry("lo")]), ("", [entry("<e>")])]
+    engine = prepared_chat_engine
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(
+        return_value=GenerationOutput(
+            text="Hello", logprobs=[e for _, lps in chunks for e in lps]
+        )
+    )
+    streamed_kwargs = []
+
+    async def stream_chat(**kwargs):
+        streamed_kwargs.append(kwargs)
+        for i, (text, lps) in enumerate(chunks):
+            done = i == len(chunks) - 1
+            yield GenerationOutput(
+                text=text, new_text=text, logprobs=lps, finished=done
+            )
+
+    engine.stream_chat = stream_chat
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {
+        "model": "test-model",
+        "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "logprobs": True,
+        "top_logprobs": 1,
+    }
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs
+    assert (generated["logprobs"], generated["top_logprobs"]) == (True, 1)
+    if stream:
+        choices = [
+            json.loads(line.removeprefix("data: "))["choices"][0]
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        content = [
+            lp for c in choices for lp in (c.get("logprobs") or {}).get("content", [])
+        ]
+        assert choices[-1]["finish_reason"] == "stop"
+        assert choices[-1]["logprobs"]["content"][0]["token"] == "<e>"
+    else:
+        content = response.json()["choices"][0]["logprobs"]["content"]
+    assert [lp["token"] for lp in content] == ["Hel", "lo", "<e>"]
+    assert content[0]["bytes"] == list(b"Hel")
+    assert content[0]["top_logprobs"] == [
+        {"token": "x", "logprob": -3.0, "bytes": [120]}
+    ]
 
 
 @pytest.mark.parametrize("subclass", [False, True])

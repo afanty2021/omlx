@@ -43,6 +43,7 @@ class FakeStreamingCore:
             finished=False,
             finish_reason=None,
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
         )
 
@@ -910,6 +911,7 @@ class TestBatchedEngineSpecPrefillForwarding:
             completion_tokens=2,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -1367,3 +1369,57 @@ class TestBatchedEngineMoeOffloadWiring:
             "test-model",
             engine._model_settings.moe_expert_offload_resident_fraction,
         )
+
+
+class TestBatchedEngineToolParserRepair:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "template, expected",
+        [
+            ("'<tool_call><function=' ~ tool_call.name ~ '>'", "qwen3_coder"),
+            # Other stale labels keep their API parser at load.
+            ("<tool_call>\n<function=", "json_tools"),
+        ],
+        ids=["mimo", "other-stale-label"],
+    )
+    async def test_api_tokenizer_repair_is_limited_to_mimo(self, template, expected):
+        """The scheduler repairs only its deep copy, so the engine tokenizer
+        that API tool parsing reads is repaired at load for MiMo (#4933)."""
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+        from mlx_lm.tool_parsers import json_tools
+
+        from omlx.engine.batched import BatchedEngine
+        from omlx.model_settings import ModelSettings
+
+        class _Abort(Exception):
+            """Unwinds start() right after the model load."""
+
+        tokenizer = TokenizerWrapper.__new__(TokenizerWrapper)
+        tokenizer._tokenizer = SimpleNamespace(
+            chat_template=template,
+            encode=lambda text, **kwargs: list(text.encode()),
+        )
+        tokenizer._chat_template = None
+        tokenizer._tool_parser = json_tools.parse_tool_call
+        tokenizer._tool_call_start = "<tool_call>"
+        tokenizer._tool_call_end = "</tool_call>"
+
+        engine = BatchedEngine(model_name="test-model", model_settings=ModelSettings())
+        with (
+            patch("omlx.engine.batched.get_tokenizer_config", return_value={}),
+            patch("omlx.utils.model_loading.maybe_apply_pre_load_patches"),
+            patch(
+                "omlx.utils.model_loading.maybe_load_custom_quantization",
+                return_value=(object(), SimpleNamespace(tokenizer=tokenizer)),
+            ),
+            patch(
+                "omlx.utils.model_loading.apply_post_load_transforms",
+                side_effect=_Abort,
+            ),
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
+        ):
+            with pytest.raises(_Abort):
+                await engine.start()
+
+        assert engine.tokenizer is tokenizer
+        assert tokenizer.tool_parser.__module__ == f"mlx_lm.tool_parsers.{expected}"

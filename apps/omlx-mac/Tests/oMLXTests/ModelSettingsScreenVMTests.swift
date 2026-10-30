@@ -8,12 +8,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testSnapshotResultHelpersFormatSkippedStatsAndAppliedJSON() {
         let skipped = [
             SkippedFeatureDTO(feature: "dflash", reason: "draft model 'x' is not installed"),
-            SkippedFeatureDTO(feature: "oq_a8", reason: "cannot be combined with qwen35_ane_prefill_enabled"),
+            SkippedFeatureDTO(feature: "a8_prefill", reason: "cannot be combined with qwen35_ane_prefill_enabled"),
         ]
         XCTAssertEqual(
             ModelSettingsScreenVM.summarizeSkipped(skipped),
             ["dflash: draft model 'x' is not installed",
-             "oq_a8: cannot be combined with qwen35_ane_prefill_enabled"]
+             "a8_prefill: cannot be combined with qwen35_ane_prefill_enabled"]
         )
         XCTAssertEqual(ModelSettingsScreenVM.summarizeSkipped(nil), [])
 
@@ -380,18 +380,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
     }
 
-    func testQwenOqA8ModelGateCoversQwen4ExpOnly() {
+    func testA8PrefillModelGateCoversExactFamilies() {
         let vm = ModelSettingsScreenVM()
-        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp"] {
+        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp", "deepseek_v41"] {
             vm.model = makeModel(id: "m", configModelType: type)
-            XCTAssertTrue(vm.isQwenOqA8Model, type)
+            XCTAssertTrue(vm.isA8PrefillModel, type)
         }
-        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon"] {
+        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon", "deepseek_v4"] {
             vm.model = makeModel(id: "m", configModelType: type)
-            XCTAssertFalse(vm.isQwenOqA8Model, type)
+            XCTAssertFalse(vm.isA8PrefillModel, type)
         }
         vm.model = makeModel(id: "m", configModelType: nil)
-        XCTAssertFalse(vm.isQwenOqA8Model)
+        XCTAssertFalse(vm.isA8PrefillModel)
     }
 
     func testQwen4SsdOffloadWireKeysAndCompatibility() throws {
@@ -621,14 +621,17 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.showsEnginePages)
 
         XCTAssertFalse(vm.showsEmbeddingContextWindow)
+        XCTAssertFalse(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "embed", configModelType: "bert", modelType: "embedding")
         XCTAssertFalse(vm.showsGenerationSection)
         XCTAssertFalse(vm.showsEnginePages)
         XCTAssertTrue(vm.showsEmbeddingContextWindow)
+        XCTAssertFalse(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "rerank", configModelType: "xlm-roberta", modelType: "reranker")
         XCTAssertFalse(vm.showsEmbeddingContextWindow)
+        XCTAssertTrue(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "diffusion", configModelType: "diffusion_gemma")
         XCTAssertTrue(vm.showsGenerationSection)
@@ -813,6 +816,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
     }
 
+    func testGPUPowerLimitSendsZeroWhenOff() throws {
+        let vm = ModelSettingsScreenVM()
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)
+        vm.limitGpuPower = true
+        vm.gpuPowerLimitWatts = "12"
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 12)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.model = try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"gpu_power_limit_supported":true,"settings":{"gpu_power_limit_w":20}}"#.utf8))
+        XCTAssertTrue(vm.gpuPowerLimitSupported)
+        XCTAssertEqual(vm.model?.settings?.gpuPowerLimitW, 20)
+    }
+
     func testQwenInt8RowNeedsSupportedHardwareUnlessAlreadyOn() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -820,13 +837,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"qwen3_5"\#(extra)}"#.utf8))
         }
         let vm = ModelSettingsScreenVM()
-        vm.model = try model(#","qwen35_oq_a8_supported":false"#)
-        XCTAssertTrue(vm.isQwenOqA8Model)
-        XCTAssertFalse(vm.showsQwenOqA8)
-        vm.model = try model(#","qwen35_oq_a8_supported":true"#)
-        XCTAssertTrue(vm.showsQwenOqA8)
-        vm.model = try model(#","qwen35_oq_a8_supported":false,"settings":{"qwen35_oq_a8_enabled":true}"#)
-        XCTAssertTrue(vm.showsQwenOqA8)
+        vm.model = try model(#","a8_prefill_supported":false"#)
+        XCTAssertTrue(vm.isA8PrefillModel)
+        XCTAssertFalse(vm.showsA8Prefill)
+        vm.model = try model(#","a8_prefill_supported":true"#)
+        XCTAssertTrue(vm.showsA8Prefill)
+        vm.model = try model(#","a8_prefill_supported":false,"settings":{"a8_prefill_enabled":true}"#)
+        XCTAssertTrue(vm.showsA8Prefill)
     }
 
     func testLoadDefaultsStagesGenerationFieldsOnly() {

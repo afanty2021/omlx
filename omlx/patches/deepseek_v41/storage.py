@@ -6,6 +6,7 @@ Copies leave the mapping under the lock, so close cannot invalidate a live view.
 Resident tables retain their packed bytes; prefetch workers only copy CPU rows.
 """
 
+import ctypes
 import fcntl
 import json
 import math
@@ -47,6 +48,12 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
 # On a cold SSD one read across a hole up to 64KiB is faster than two reads.
 ROW_BATCH_ROWS = 256
 ROW_BATCH_MAX_GAP = 65536
+ROW_READ_RETRY_SECONDS = 60.0
+
+# mincore observes the file cache without faulting the mapping into memory.
+_MINCORE = ctypes.CDLL(None).mincore
+_MINCORE.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+_MINCORE.restype = ctypes.c_int
 
 
 def _read_row_runs(fd, rows, base, row_bytes):
@@ -137,6 +144,8 @@ class TensorFile:
             self._file_size = os.fstat(self._file.fileno()).st_size
             self._seen_pages = None
             self._last_rearm = 0.0
+            # Per tensor: weights can leave the file cache while scales stay.
+            self._row_reads_until = {}
             # Engram hashes select sparse rows throughout the table. Whole-tensor
             # resident reads use readinto below and do not use this mapping.
             if hasattr(self._mapping, "madvise"):
@@ -200,30 +209,49 @@ class TensorFile:
                 if rows.size and (rows.min() < 0 or rows.max() >= view.shape[0]):
                     raise IndexError("Engram row outside table")
                 gather_start = None
+                gather_rows = rows.size
+                copied = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
                 if rows.size and 0 < row_bytes <= PAGE_SIZE:
                     base = self._start + start
-                    fresh = self._unseen_pages(rows, base, row_bytes)
-                    if fresh.size:
-                        # Read the rows, not their pages: a page read copies
-                        # 16KiB per 128B Engram row, then the gather faults it.
-                        copied = _read_row_runs(
-                            self._file.fileno(), rows.reshape(-1), base, row_bytes
+                    flat = rows.reshape(-1)
+                    fresh, cold = self._unseen_rows(flat, base, row_bytes)
+                    # Wide reads gather warm rows from the mapping only while
+                    # their pages are still cached. Narrow mixed reads read all.
+                    if flat.size > PAGE_IO_WORKERS * ROW_BATCH_ROWS:
+                        if self._warm_evicted(key, flat[~cold], base, row_bytes):
+                            cold[:] = True
+                    elif cold.any():
+                        cold[:] = True
+                    if cold.any():
+                        exact = (
+                            _read_row_runs(
+                                self._file.fileno(), flat[cold], base, row_bytes
+                            )
+                            .view(dt)
+                            .reshape((-1,) + view.shape[1:])
                         )
+                        if cold.all():
+                            copied = exact
+                        else:
+                            copied = np.empty((flat.size,) + view.shape[1:], dtype=dt)
+                            copied[cold] = exact
+                            gather_rows = int(np.count_nonzero(~cold))
+                            gather_start = time.perf_counter()
+                            copied[~cold] = view[flat[~cold]]
+                        copied = copied.reshape(rows.shape + view.shape[1:])
                         self._seen_pages[fresh] = 1
-                        return (
-                            copied.view(dt).reshape(rows.shape + view.shape[1:]),
-                            dtype,
-                        )
-                    gather_start = time.perf_counter()
-                copied = view[rows]  # Advanced indexing already copies the rows.
+                    else:
+                        gather_start = time.perf_counter()
+                if copied is None:
+                    copied = view[rows]  # Advanced indexing already copies the rows.
                 if gather_start is not None:
                     elapsed = time.perf_counter() - gather_start
                     now = time.monotonic()
                     # As in Qwen4-Exp, a slow warm gather can indicate eviction.
                     # This only changes I/O scheduling, never the selected rows.
                     if (
-                        elapsed > 0.0005 + 2e-6 * rows.size
+                        elapsed > 0.0005 + 2e-6 * gather_rows
                         and now - self._last_rearm >= 60
                     ):
                         self._seen_pages = None
@@ -231,23 +259,48 @@ class TensorFile:
                 return copied, dtype
             return np.array(view, copy=True), dtype
 
-    def _unseen_pages(self, rows, base, row_bytes):
-        """Pages holding the rows that no read has fetched yet."""
-        if self._seen_pages is None:
-            self._seen_pages = np.zeros(
-                (self._file_size + PAGE_SIZE - 1) // PAGE_SIZE, dtype=np.uint8
-            )
-        offsets = base + rows.reshape(-1) * row_bytes
+    def _warm_evicted(self, key, rows, base, row_bytes):
+        """Sample warm rows; one uncached page keeps the key on reads for a while."""
+        now = time.monotonic()
+        if now < self._row_reads_until.get(key, 0.0):
+            return True
+        count = min(rows.size, PAGE_IO_WORKERS)
+        offsets = (
+            base + rows[np.linspace(0, rows.size - 1, count, dtype=np.intp)] * row_bytes
+        )
         pages = np.unique(
             np.concatenate(
                 (offsets // PAGE_SIZE, (offsets + row_bytes - 1) // PAGE_SIZE)
             )
         )
-        return pages[self._seen_pages[pages] == 0]
+        address = np.frombuffer(self._mapping, dtype=np.uint8, count=1).ctypes.data
+        state = ctypes.c_ubyte()
+        for page in pages.tolist():
+            if (
+                _MINCORE(address + page * PAGE_SIZE, PAGE_SIZE, ctypes.byref(state))
+                or not state.value & 1
+            ):
+                self._row_reads_until[key] = now + ROW_READ_RETRY_SECONDS
+                return True
+        return False
+
+    def _unseen_rows(self, rows, base, row_bytes):
+        """Unseen pages and a mask of rows touching any of those pages."""
+        if self._seen_pages is None:
+            self._seen_pages = np.zeros(
+                (self._file_size + PAGE_SIZE - 1) // PAGE_SIZE, dtype=np.uint8
+            )
+        offsets = base + rows.reshape(-1) * row_bytes
+        first = offsets // PAGE_SIZE
+        last = (offsets + row_bytes - 1) // PAGE_SIZE
+        cold = (self._seen_pages[first] == 0) | (self._seen_pages[last] == 0)
+        pages = np.unique(np.concatenate((first[cold], last[cold])))
+        return pages[self._seen_pages[pages] == 0], cold
 
     def close(self):
         with self._lock:
             self._seen_pages = None
+            self._row_reads_until.clear()
             if self._mapping is not None:
                 self._mapping.close()
                 self._mapping = None

@@ -8,10 +8,14 @@ All unit tests run with mocked TTSEngine and EnginePool — mlx-audio is not
 required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
+import asyncio
 import base64
 import io
 import struct
+import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
@@ -96,6 +100,7 @@ def server_tts_client():
         mock_state.global_settings = None
         mock_state.distributed_inference_enabled = False
         mock_state.process_memory_enforcer = None
+        mock_state.gpu_power_limiter = None
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
@@ -748,6 +753,87 @@ class TestTTSStreaming:
 
 
 # ---------------------------------------------------------------------------
+# LFM3-Audio / LFM3-Omni speech on the VLM engine
+# ---------------------------------------------------------------------------
+
+
+class TestTTSLFM3Speech:
+    def test_vlm_engine_speech_serves_speech(self, server_tts_client):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        client, mock_pool = server_tts_client
+        engine = MagicMock(spec=VLMBatchedEngine)
+        engine.speech.synthesize = AsyncMock(return_value=DUMMY_WAV)
+        mock_pool.get_engine.return_value = engine
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "lfm3", "input": "Hi", "voice": "male", "language": "ko"},
+        )
+        assert response.status_code == 200
+        kwargs = engine.speech.synthesize.call_args.kwargs
+        assert (kwargs["voice"], kwargs["language"]) == ("male", "ko")
+
+    def test_vlm_engine_without_speech_is_rejected(self, server_tts_client):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        client, mock_pool = server_tts_client
+        engine = MagicMock(spec=VLMBatchedEngine)
+        engine.speech = None
+        mock_pool.get_engine.return_value = engine
+        response = client.post("/v1/audio/speech", json={"model": "vl", "input": "Hi"})
+        assert response.status_code == 400
+
+    def test_speech_runs_on_engine_executor_and_keeps_engine_active(self):
+        from omlx.engine.lfm3_speech import LFM3Speech
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine(model_name="lfm3-audio")
+        executor = ThreadPoolExecutor(1, thread_name_prefix="mlx-engine-test")
+        engine._engine = SimpleNamespace(_mlx_executor=executor, engine=None)
+        speech = LFM3Speech(engine)
+        seen = {}
+
+        def run(*args, **kwargs):
+            seen["thread"] = threading.current_thread().name
+            seen["active"] = engine.has_active_requests()
+            return SimpleNamespace(text="hi", prompt_tokens=1, generation_tokens=1)
+
+        try:
+            with patch.object(LFM3Speech, "_run", side_effect=run):
+                asyncio.run(speech.transcribe("clip.wav"))
+            assert seen["thread"].startswith("mlx-engine-test")
+            assert seen["active"] is True
+            assert engine.has_active_requests() is False
+
+            with patch.object(LFM3Speech, "_run", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError, match="boom"):
+                    asyncio.run(speech.transcribe("clip.wav"))
+            assert engine.has_active_requests() is False
+        finally:
+            executor.shutdown()
+
+    def test_tts_prompt_names_the_locale_and_voice(self):
+        from omlx.engine.lfm3_speech import tts_prompt
+
+        assert tts_prompt(None, None) == (
+            "Perform TTS in American English using a female voice."
+        )
+        assert tts_prompt("en-GB", "male") == (
+            "Perform TTS in British English using a male voice."
+        )
+        assert tts_prompt("ko", "Female") == (
+            "Perform TTS in Korean using a female voice."
+        )
+        assert tts_prompt("japanese", None) == (
+            "Perform TTS in Japanese using a female voice."
+        )
+        with pytest.raises(ValueError, match="voice"):
+            tts_prompt("en", "alloy")
+        with pytest.raises(ValueError, match="language"):
+            tts_prompt("xx", None)
+
+
+# ---------------------------------------------------------------------------
 # TestTTSModelAliasResolution
 # ---------------------------------------------------------------------------
 
@@ -774,6 +860,7 @@ class TestTTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -806,6 +893,7 @@ class TestTTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -1204,6 +1292,7 @@ class TestTTSVoiceCloneEndpoint:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None

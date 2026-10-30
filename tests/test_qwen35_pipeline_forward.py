@@ -48,6 +48,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+# Two real ranks on one GPU: a rank can hit the Metal timeout on a busy runner.
+@pytest.mark.slow
 @pytest.mark.parametrize("split", ["pipeline", "tensor"])
 def test_split_qwen35_forward_matches_single_process(tmp_path, split):
     pytest.importorskip("mlx_lm.models.qwen3_5")

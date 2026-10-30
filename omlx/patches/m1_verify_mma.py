@@ -28,8 +28,9 @@
 # The weights-as-MMA-operand layout with masked fields against pre-scaled
 # inputs is mlx-dspark's (which credits TensorFold's simd_qmm and llama.cpp's
 # pre-scaled-input dot product). oMLX adds fp16 inputs (mlx-dspark reads bf16
-# bit patterns only), the applegpu_g13 gate and the verify routing.
-"""Verify-width (5-16 rows) 4-bit quantized matmul on simdgroup matrices, M1.
+# bit patterns only), 5-bit weights, the applegpu_g13 gate and the verify
+# routing.
+"""Verify-width (5-16 rows) 4- and 5-bit quantized matmul on simdgroup matrices, M1.
 
 Speculative verify on M1 multiplies 5-16 rows against every projection; the
 multi-row qmv (``m1_verify_qmv``) stops paying from 5 rows, and sg8 / mma land
@@ -43,6 +44,15 @@ against inputs pre-scaled by ``2^-4s`` (exact in fp32), and scale/bias factor
 out per group (``acc += scale * P + bias * sum(x)``). Groups are interleaved
 over the threadgroup's simdgroups (split-K) and reduced at the end.
 
+5-bit packing puts 8 values in 5 bytes, so the 8-value chunk k = 8j..8j+7 of
+a group is bytes 5j..5j+4. A lane's two chunks (j = fn, fn + 1, fn even) are
+10 bytes at an even offset, read as three aligned words and split into a
+32-bit low word and an 8-bit high byte per chunk. MMA step s takes field s:
+fields 0..5 masked in place in the low word against inputs pre-scaled by
+2^-5s, field 7 masked in place in the high byte against 2^-3, and field 6,
+which straddles the two, shifted out (pre-scale 1). Only the weight load and
+the per-step field extraction differ (``_UNPACK``).
+
 Numerics: fp32 accumulation; row-count invariant; not bit-identical to the
 one-row decode (same class as the other verify kernels).
 
@@ -52,6 +62,15 @@ per projection; one-row decode is 0.169):
     rows        5      6      8    9-16
     before  0.315  0.328  0.353   0.660   (sg8 / mma)
     this    0.289  0.288  0.287   0.471
+
+5-bit, chain over the Qwen3.8-27B layers whose projection is 5-bit, vs the
+sg8 / mma route it replaces:
+
+    rows             5     8     9    12    16
+    mlp.down_proj  -29%  -33%  -45%  -44%  -43%
+    gdn.in_proj_z   -9%  -20%  -39%  -38%  -36%
+    gdn.out_proj   -10%  -22%  -41%  -40%  -38%
+    attn.o_proj    -10%  -19%  -38%  -38%  -36%
 
 Gating: applegpu_g13 only (where it was measured).
 """
@@ -65,9 +84,8 @@ from functools import cache
 logger = logging.getLogger(__name__)
 
 GROUP = 64
-BITS = 4
 RT_MAX = 2  # 8-row tiles per threadgroup (16 rows)
-# Measured window on M1 Max (4-bit, 5-16 rows).
+# Measured window on M1 Max (4- and 5-bit, 5-16 rows).
 MIN_ROWS = 5
 MAX_ROWS = 16
 # Small outputs (GDN a/b heads) stay on the stock path.
@@ -86,8 +104,7 @@ inline float x_at(uint w, int e) {
 
 _SRC = r"""
   constexpr int G = K / 64;                   // quant groups along K
-  constexpr int FIELDS = 8;                   // 4-bit fields per word = MMA steps
-  constexpr int WPR = K / 8;                  // packed words per weight row
+@STRIDE@
   const int lane = int(thread_index_in_simdgroup);
   const int c = int(simdgroup_index_in_threadgroup);
   const int fm = ((lane >> 4) << 2) + ((lane >> 1) & 3);       // fragment row
@@ -115,9 +132,7 @@ _SRC = r"""
       sum0[r] = 0.0f; sum1[r] = 0.0f;
       for (int t = 0; t < NT; ++t) P[r][t] = simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    uint2 w[NT];
-    for (int t = 0; t < NT; ++t)
-      w[t] = *(const device uint2*)((const device uint*)Wq + size_t(nrow[t]) * WPR + 8 * g + fn);
+@LOAD@
     const int xo = 64 * g + FIELDS * fm;      // this lane's 8-input run
     uint4 xa[RT], xb[RT];
     for (int r = 0; r < RT; ++r) {
@@ -130,8 +145,7 @@ _SRC = r"""
     }
     #pragma clang loop unroll(full)
     for (int s = 0; s < FIELDS; ++s) {
-      const uint mask = 0xFu << (4 * s);
-      const float pre = as_type<float>(uint(127 - 4 * s) << 23);  // 2^-(4s)
+@PRE@
       simdgroup_matrix<float, 8, 8> b[RT];
       for (int r = 0; r < RT; ++r) {
         b[r].thread_elements()[0] = x_at<T>(xa[r][s / 2], s) * pre;
@@ -139,8 +153,7 @@ _SRC = r"""
       }
       for (int t = 0; t < NT; ++t) {
         simdgroup_matrix<float, 8, 8> a;
-        a.thread_elements()[0] = float(w[t].x & mask);
-        a.thread_elements()[1] = float(w[t].y & mask);
+@FIELD@
         for (int r = 0; r < RT; ++r) simdgroup_multiply_accumulate(P[r][t], a, b[r], P[r][t]);
       }
     }
@@ -175,6 +188,82 @@ _SRC = r"""
   }
 """
 
+# Per-bit-width pieces of _SRC: row stride, weight load, step pre-scale and
+# field extraction.
+_UNPACK = {
+    4: {
+        "@STRIDE@": r"""
+  constexpr int FIELDS = 8;                   // 4-bit fields per word = MMA steps
+  constexpr int WPR = K / 8;                  // packed words per weight row
+""",
+        "@LOAD@": r"""
+    uint2 w[NT];
+    for (int t = 0; t < NT; ++t)
+      w[t] = *(const device uint2*)((const device uint*)Wq + size_t(nrow[t]) * WPR + 8 * g + fn);
+""",
+        "@PRE@": r"""
+      const uint mask = 0xFu << (4 * s);
+      const float pre = as_type<float>(uint(127 - 4 * s) << 23);  // 2^-(4s)
+""",
+        "@FIELD@": r"""
+        a.thread_elements()[0] = float(w[t].x & mask);
+        a.thread_elements()[1] = float(w[t].y & mask);
+""",
+    },
+    5: {
+        "@STRIDE@": r"""
+  constexpr int FIELDS = 8;                   // 5-bit fields per chunk = MMA steps
+  constexpr int UPR = K * 5 / 16;             // packed ushorts per weight row
+""",
+        "@LOAD@": r"""
+    // Chunks fn and fn + 1 of group g (10 bytes at byte 5 * fn of the
+    // group's 40) from three aligned words. The group starts 8-byte aligned;
+    // for fn = 2 and 6 the run starts 2 bytes into its first word.
+    uint lo0[NT], hi0[NT], lo1[NT], hi1[NT];
+    const int wfirst = (5 * fn) / 4;            // 0, 2, 5, 7
+    const int sh = ((5 * fn) % 4) * 8;          // 0 or 16 bits
+    for (int t = 0; t < NT; ++t) {
+      const device uint* p = (const device uint*)Wq + size_t(nrow[t]) * (UPR / 2) + 10 * g + wfirst;
+      const uint w0 = p[0], w1 = p[1], w2 = p[2];
+      // The 10 bytes as b[0..9]: a = bytes 0..3, b = bytes 4..7, c = bytes 8..9.
+      const uint a = sh ? ((w0 >> 16) | (w1 << 16)) : w0;
+      const uint b = sh ? ((w1 >> 16) | (w2 << 16)) : w1;
+      const uint c = sh ? (w2 >> 16) : (w2 & 0xFFFFu);
+      lo0[t] = a;
+      hi0[t] = b & 0xFFu;
+      lo1[t] = (b >> 8) | (c << 24);
+      hi1[t] = c >> 8;
+    }
+""",
+        "@PRE@": r"""
+      // 2^-(5s) for the in-place fields 0..5, 1 for the shifted field 6,
+      // 2^-3 for field 7 (bits 3..7 of the high byte).
+      const float pre = s < 6 ? as_type<float>(uint(127 - 5 * s) << 23)
+                              : (s == 6 ? 1.0f : 0.125f);
+""",
+        "@FIELD@": r"""
+        if (s < 6) {
+          const uint mask = 0x1Fu << (5 * s);
+          a.thread_elements()[0] = float(lo0[t] & mask);
+          a.thread_elements()[1] = float(lo1[t] & mask);
+        } else if (s == 6) {
+          a.thread_elements()[0] = float((lo0[t] >> 30) | ((hi0[t] & 7u) << 2));
+          a.thread_elements()[1] = float((lo1[t] >> 30) | ((hi1[t] & 7u) << 2));
+        } else {
+          a.thread_elements()[0] = float(hi0[t] & 0xF8u);
+          a.thread_elements()[1] = float(hi1[t] & 0xF8u);
+        }
+""",
+    },
+}
+
+
+def _source(bits: int) -> str:
+    src = _SRC
+    for marker, text in _UNPACK[bits].items():
+        src = src.replace(marker, text.strip("\n"))
+    return src
+
 
 @cache
 def enabled() -> bool:
@@ -182,14 +271,16 @@ def enabled() -> bool:
 
     on = get_apple_gpu_generation() == 13
     if on:
-        logger.info("M1 verify MMA enabled (4-bit rows %d..%d)", MIN_ROWS, MAX_ROWS)
+        logger.info(
+            "M1 verify MMA enabled (4- and 5-bit rows %d..%d)", MIN_ROWS, MAX_ROWS
+        )
     return on
 
 
 def eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     import mlx.core as mx
 
-    if int(bits) != BITS or not enabled():
+    if int(bits) not in _UNPACK or not enabled():
         return False
     return (
         MIN_ROWS <= int(M) <= MAX_ROWS
@@ -209,30 +300,32 @@ def geometry(n: int, rt: int) -> tuple[int, int]:
         return 4, 4
     if n >= 4096:
         return 4, 8
-    return 4, 16
+    # Small N: two tiles keep the 4 x 16 simdgroup count in 256 threads; the
+    # 5-bit bf16 pipeline admits only 448 threads on M1 and M2.
+    return 2, 8
 
 
 @cache
-def _kernel():
+def _kernel(bits: int):
     import mlx.core as mx
 
     return mx.fast.metal_kernel(
-        name="omlx_m1_verify_mma",
+        name="omlx_m1_verify_mma" if bits == 4 else f"omlx_m1_verify_mma{bits}",
         input_names=["X", "Wq", "SC", "BI"],
         output_names=["OUT"],
-        source=_SRC,
+        source=_source(bits),
         header=_HEADER,
     )
 
 
-def m1_mma_qmm(x2, w_q, scales, biases, *, bits: int = 4, group_size: int = 64):
-    """(M, K) x (N, K)^T -> (M, N), 4-bit affine groups of 64, M in 5..16."""
-    del bits, group_size
+def m1_mma_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int = 64):
+    """(M, K) x (N, K)^T -> (M, N), 4- or 5-bit affine groups of 64, M in 5..16."""
+    del group_size
     rows, k = int(x2.shape[0]), int(x2.shape[1])
     n = int(w_q.shape[0])
     rt = min(RT_MAX, (rows + 7) // 8)
     nt, s = geometry(n, rt)
-    (y,) = _kernel()(
+    (y,) = _kernel(int(bits))(
         inputs=[x2, w_q, scales, biases],
         template=[
             ("T", x2.dtype),

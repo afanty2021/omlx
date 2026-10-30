@@ -161,10 +161,14 @@ class PackedSparseAttentionPrimitive : public Primitive {
     }
 
     // Long prefill chunks decode each KV row once into temporary BF16 rows.
-    // The scratch is bounded, so very long contexts keep reading packed rows.
+    // The scratch budget grows with the chunk (80 KiB per query, 80-512 MiB);
+    // longer contexts keep reading packed rows.
     const size_t unpack_bytes =
         size_t(B) * (localL + std::max(pooledL, 1)) * dim * sizeof(uint16_t);
-    const bool unpack_kv = qL >= 256 && unpack_bytes <= 80 * 1024 * 1024;
+    const size_t unpack_budget = std::min(
+        size_t(512 * 1024 * 1024),
+        std::max(size_t(80 * 1024 * 1024), size_t(qL) * 80 * 1024));
+    const bool unpack_kv = qL >= 256 && unpack_bytes <= unpack_budget;
     if (unpack_kv) {
       base_name += "_unpacked";
     }
