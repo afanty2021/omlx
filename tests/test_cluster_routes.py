@@ -722,6 +722,55 @@ def test_new_cluster_plans_follow_the_saved_lightning_mtp_setting(monkeypatch):
         routes._cluster_mtp(True, plain, None)
 
 
+def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            tensor_parallel_ssd_layer_bytes=(0, 3 * gib, 0, 0),
+            supports_pipeline=True,
+        ),
+    )
+    saved = {"v41": True}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [{"id": "v41", "model_path": "/models/v41", "model_type": "llm"}]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(
+            deepseek_v41_engram_ssd_offload=saved[model_id]
+        ),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    body = {
+        "model_path": "/models/v41",
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    offloaded = _client().post("/admin/api/cluster/plan", json=body)
+    saved["v41"] = False
+    resident = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert offloaded.status_code == resident.status_code == 200
+    assert offloaded.json()["assignments"][0]["ssd_weight_bytes"] == 3 * gib
+    assert resident.json()["assignments"][0]["ssd_weight_bytes"] == 0
+    assert (
+        offloaded.json()["placement_signature"]
+        != resident.json()["placement_signature"]
+    )
+
+
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
     from omlx.cluster.planner import ModelLayout
 

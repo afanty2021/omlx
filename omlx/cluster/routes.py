@@ -291,8 +291,8 @@ def set_cluster_getters(
     _get_settings_manager = settings_manager_getter
 
 
-def _saved_lightning_mtp(model_path: str) -> bool | None:
-    """The coordinator's saved Lightning MTP setting for this model, if any."""
+def _saved_model_settings(model_path: str) -> Any:
+    """The coordinator's saved settings for this model, if any."""
 
     manager = _get_settings_manager() if _get_settings_manager else None
     if manager is None or _get_engine_pool is None:
@@ -303,8 +303,22 @@ def _saved_lightning_mtp(model_path: str) -> bool | None:
             continue
         if not manager.has_settings(item["id"]):
             return None
-        return bool(manager.get_settings(item["id"]).mtp_enabled)
+        return manager.get_settings(item["id"])
     return None
+
+
+def _saved_lightning_mtp(model_path: str) -> bool | None:
+    """The coordinator's saved Lightning MTP setting for this model, if any."""
+
+    settings = _saved_model_settings(model_path)
+    return None if settings is None else bool(settings.mtp_enabled)
+
+
+def _saved_engram_ssd_offload(model_path: str | None) -> bool:
+    """Whether the saved settings keep DeepSeek V4.1 Engram tables on SSD."""
+
+    settings = _saved_model_settings(model_path) if model_path else None
+    return bool(getattr(settings, "deepseek_v41_engram_ssd_offload", False))
 
 
 def _cluster_mtp(
@@ -895,6 +909,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     )
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
+    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
@@ -922,6 +937,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
             ),
             context_tokens=request.target_context_tokens,
+            engram_ssd_offload=engram_ssd_offload,
         )
     else:
         plan = plan_unequal_pipeline(
@@ -932,6 +948,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
             ),
             context_tokens=request.target_context_tokens,
+            engram_ssd_offload=engram_ssd_offload,
         )
     if path_map:
         plan = replace(plan, path_map=path_map)
@@ -1218,6 +1235,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         mtp = _cluster_mtp(request.mtp, model, request.model_path)
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
 
     transports: tuple[Any, ...] = ()
     transport_error: str | None = None
@@ -1284,6 +1302,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+            engram_ssd_offload=engram_ssd_offload,
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1392,6 +1411,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+            engram_ssd_offload=engram_ssd_offload,
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -1528,6 +1548,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 microbatch_size=probe_execution.pipeline_microbatch_size,
                 context_tokens=request.target_context_tokens,
                 mtp=mtp,
+                engram_ssd_offload=engram_ssd_offload,
             )
             performance_changes = _plan_changes(
                 choice.plan.to_dict(),
@@ -2985,6 +3006,7 @@ def _build_performance_plan(
     microbatch_size: int,
     context_tokens: int,
     mtp: bool = False,
+    engram_ssd_offload: bool = False,
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
@@ -3004,6 +3026,7 @@ def _build_performance_plan(
         workload_profile=workload_profile,
         microbatch_size=microbatch_size,
         context_tokens=context_tokens,
+        engram_ssd_offload=engram_ssd_offload,
     )
 
 
@@ -3036,6 +3059,8 @@ def _performance_optimized_deployment(
     # a capped, Workstation-marked Mac came out of the probe holding almost its
     # whole ceiling.
     nodes = _node_budgets(request.nodes, profiles=profiles)
+    # Keep the approved plan's Engram decision instead of rereading settings.
+    engram_ssd_offload = any(item.ssd_weight_bytes for item in deployment.assignments)
     plan = _build_performance_plan(
         model,
         nodes,
@@ -3044,6 +3069,7 @@ def _performance_optimized_deployment(
         microbatch_size=deployment.execution.pipeline_microbatch_size,
         context_tokens=request.target_context_tokens,
         mtp=deployment.execution.mtp,
+        engram_ssd_offload=engram_ssd_offload,
     )
     execution = tune_execution_settings(
         deployment.execution,
@@ -3062,6 +3088,7 @@ def _performance_optimized_deployment(
             microbatch_size=execution.pipeline_microbatch_size,
             context_tokens=request.target_context_tokens,
             mtp=deployment.execution.mtp,
+            engram_ssd_offload=engram_ssd_offload,
         )
     deployment_id = (
         request.deployment_id.strip()

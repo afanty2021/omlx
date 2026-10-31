@@ -4895,12 +4895,36 @@ async def test_qwen_unrecoverable_sibling_is_not_success(api, valid_prefix, bad,
 
 
 @pytest.mark.asyncio
-async def test_qwen_length_does_not_repair_missing_envelope_close():
-    events = await _recovery_stream(
-        _RECOVERY_CALL.removesuffix("</tool_call>"), finish_reason="length"
-    )
-    assert not _recovery_calls(events, "chat")
-    assert events[-1]["error"]["code"] == "incomplete_tool_call"
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "raw,calls",
+    [
+        (_RECOVERY_CALL.removesuffix("</tool_call>"), 0),
+        (
+            "Saving. "
+            + _RECOVERY_CALL
+            + "<tool_call><function=write><parameter=content>cut",
+            1,
+        ),
+    ],
+    ids=["missing_close", "valid_sibling"],
+)
+async def test_qwen_length_cut_call_reports_length(api, raw, calls):
+    events = await _recovery_stream(raw, api, finish_reason="length")
+
+    assert len(_recovery_calls(events, api)) == calls
+    assert _recovery_error_codes(events, api) == []
+    assert "<tool_call>" not in _recovery_text(events, api)
+    if api == "chat":
+        assert _chat_finish_reasons(events) == ["length"]
+    elif api == "anthropic":
+        assert [
+            e["delta"]["stop_reason"]
+            for e in events
+            if e.get("type") == "message_delta"
+        ] == ["max_tokens"]
+    else:
+        assert events[-1]["type"] == "response.incomplete"
 
 
 @pytest.mark.asyncio
@@ -5023,12 +5047,19 @@ async def test_length_cut_payload_without_qwen_parser_keeps_length(api):
         assert _chat_finish_reasons(events) == ["length"]
 
 
-def test_nonstream_length_cut_payload_without_qwen_parser_keeps_length(monkeypatch):
+@pytest.mark.parametrize(
+    "raw,qwen_parser,content",
+    [
+        (_RECOVERY_TRUNCATED_JSON, False, _RECOVERY_TRUNCATED_JSON),
+        ("Saving. <tool_call><function=write><parameter=content>cut", True, "Saving."),
+    ],
+    ids=["no_qwen_parser", "qwen3_coder"],
+)
+def test_nonstream_length_cut_payload_keeps_length(
+    monkeypatch, raw, qwen_parser, content
+):
     client = _nonstream_tool_call_client(
-        monkeypatch,
-        _RECOVERY_TRUNCATED_JSON,
-        qwen_parser=False,
-        finish_reason="length",
+        monkeypatch, raw, qwen_parser=qwen_parser, finish_reason="length"
     )
     response = client.post(
         "/v1/chat/completions",
@@ -5038,7 +5069,7 @@ def test_nonstream_length_cut_payload_without_qwen_parser_keeps_length(monkeypat
 
     assert response.status_code == 200, response.text
     choice = response.json()["choices"][0]
-    assert choice["message"]["content"] == _RECOVERY_TRUNCATED_JSON
+    assert choice["message"]["content"] == content
     assert choice["finish_reason"] == "length"
 
 

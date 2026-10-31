@@ -1516,6 +1516,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             if key != "phase"
                         },
                     ),
+                    engram_ssd_offload=assignment.ssd_weight_bytes > 0,
                 ),
             ):
                 provider.load_default()

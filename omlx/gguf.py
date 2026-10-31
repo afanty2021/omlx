@@ -356,8 +356,18 @@ class _Reader:
     def string(self) -> str:
         return self.take(self.length(_MAX_STRING)).decode("utf-8", "replace")
 
-    def skip_string(self) -> None:
-        self._stream.seek(self.length(_MAX_STRING), os.SEEK_CUR)
+    def skip_strings(self, count: int) -> None:
+        # A 250K-entry vocabulary spends its time in per-string method calls.
+        read, seek = self._stream.read, self._stream.seek
+        unpack = struct.Struct("<Q").unpack
+        for _ in range(count):
+            data = read(8)
+            if len(data) != 8:
+                raise GgufError("truncated GGUF header")
+            (size,) = unpack(data)
+            if size > _MAX_STRING:
+                raise GgufError("GGUF header length out of range")
+            seek(size, os.SEEK_CUR)
 
     def value(self, kind: int, keep: bool):
         if kind in _SCALARS:
@@ -371,8 +381,7 @@ class _Reader:
         if keep:
             return [self.value(item, keep=True) for _ in range(count)]
         if item == _STRING:
-            for _ in range(count):
-                self.skip_string()
+            self.skip_strings(count)
         elif item in _SCALARS:
             self._stream.seek(struct.calcsize(_SCALARS[item]) * count, os.SEEK_CUR)
         else:

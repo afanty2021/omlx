@@ -612,16 +612,21 @@ def _canonical_qwen4_decode_module(signatures):
 
 
 @pytest.mark.parametrize(
-    "signatures",
+    "signatures,out_proj",
     [
-        ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
-        ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
-        ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
-        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e, every layer
+        (((6, 64), (6, 64), (6, 64), (6, 64)), (5, 128)),  # physical layer 0
+        (((4, 64), (5, 128), (5, 128), (5, 128)), (5, 128)),  # physical layer 1
+        (((5, 64), (6, 64), (6, 64), (6, 64)), (5, 128)),  # physical layer 29
+        (((8, 64), (8, 64), (8, 64), (8, 64)), (5, 128)),  # re-quantized oQ4e
+        # oQ2.5e to oQ6e after the out_proj floor change: all five at 8-bit/g64.
+        (((8, 64), (8, 64), (8, 64), (8, 64)), (8, 64)),
     ],
 )
-def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
+def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(
+    signatures, out_proj
+):
     module = _canonical_qwen4_decode_module(signatures)
+    module.out_proj = _fake_quantized_linear(6144, 2560, *out_proj)
 
     assert prework_mod._qwen4_decode_static_eligible(module)
     module.in_proj_z.group_size = 64 if module.in_proj_z.group_size == 128 else 128
@@ -631,8 +636,8 @@ def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
 @pytest.mark.parametrize(
     "signatures,out_proj",
     [
-        # Community Qwen3.8-Flash-Next opt8: every GDN projection is 8-bit/g64.
-        (((8, 64), (8, 64), (8, 64), (8, 64)), (8, 64)),
+        # oQ8e: every GDN projection is 8-bit/g128.
+        (((8, 128), (8, 128), (8, 128), (8, 128)), (8, 128)),
         # 27B Qwen3.5-lineage exports: 5-bit/g64 projections, 4-bit/g64 out_proj.
         (((5, 64), (5, 64), (5, 64), (5, 64)), (4, 64)),
         # Mixed per-tensor allocations from a sensitivity search.
@@ -1129,8 +1134,8 @@ def test_qwen4_verify_records_replay_rows_instead_of_states(
 
 
 def test_qwen4_decode_setting_is_captured_per_model():
-    module = _canonical_qwen4_decode_module(((8, 64),) * 4)
-    module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    module = _canonical_qwen4_decode_module(((8, 128),) * 4)
+    module.out_proj = _fake_quantized_linear(6144, 2560, 8, 128)
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
     prework_mod.configure_qwen4_decode(
@@ -1138,8 +1143,8 @@ def test_qwen4_decode_setting_is_captured_per_model():
     )
     assert prework_mod._qwen4_decode_static_eligible(module)
 
-    other = _canonical_qwen4_decode_module(((8, 64),) * 4)
-    other.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    other = _canonical_qwen4_decode_module(((8, 128),) * 4)
+    other.out_proj = _fake_quantized_linear(6144, 2560, 8, 128)
     prework_mod.configure_qwen4_decode(
         SimpleNamespace(modules=lambda: [other]), wide_projections=False
     )

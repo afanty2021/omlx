@@ -1,7 +1,9 @@
 // Multi-line prompt field for the Ask AI panel. An NSTextView instead of a
-// SwiftUI TextEditor, so Command-Return can commit an in-progress IME
-// composition (Korean, Japanese, Chinese) before the text is sent, and the
+// SwiftUI TextEditor, so the field can commit an in-progress IME composition
+// (Korean, Japanese, Chinese) before Return or Command-Return acts, and the
 // panel can take Return, Tab, arrows, and Escape while suggestions are open.
+// Command-Return always sends. With `sendOnEnter`, Return sends too and
+// Shift-Return inserts the newline.
 
 import AppKit
 import SwiftUI
@@ -34,6 +36,7 @@ struct AskAIInputView: NSViewRepresentable {
     @Binding var text: String
     @Binding var height: CGFloat
     let suggestionsVisible: Bool
+    let sendOnEnter: Bool
     let focus: AskAIInputFocus
     let onCommand: (AskAIInputCommand) -> Void
     /// Returns true when the paste was taken as image attachments.
@@ -123,8 +126,23 @@ struct AskAIInputView: NSViewRepresentable {
             case #selector(NSResponder.cancelOperation(_:)):
                 parent.onCommand(.escape)
                 return true
-            case #selector(NSResponder.insertNewline(_:)) where suggestions,
-                 #selector(NSResponder.insertTab(_:)) where suggestions:
+            case #selector(NSResponder.insertNewline(_:)):
+                if suggestions {
+                    parent.onCommand(.acceptSuggestion)
+                    return true
+                }
+                // Shift-Return arrives as insertNewline: too and keeps the newline.
+                let shifted = NSApp.currentEvent?.modifierFlags.contains(.shift) == true
+                guard parent.sendOnEnter, !shifted else { return false }
+                // A live IME composition owns Return; commit it, don't send.
+                if textView.hasMarkedText() {
+                    textView.unmarkText()
+                    parent.text = textView.string
+                    return true
+                }
+                parent.onCommand(.submit)
+                return true
+            case #selector(NSResponder.insertTab(_:)) where suggestions:
                 parent.onCommand(.acceptSuggestion)
                 return true
             case #selector(NSResponder.moveUp(_:)) where suggestions:

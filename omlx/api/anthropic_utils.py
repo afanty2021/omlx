@@ -1089,6 +1089,10 @@ def map_finish_reason_to_stop_reason(
     Returns:
         Anthropic stop_reason
     """
+    # A length stop can cut a later call, so it wins over tool_use.
+    if finish_reason == "length":
+        return "max_tokens"
+
     if has_tool_calls:
         return "tool_use"
 

@@ -2001,6 +2001,7 @@ _MTPLX_CONTRACT_ALLOWLIST = {
     "concat_order": ("embedding_hidden",),
     "mtp_position_mode": ("local", "cache"),
 }
+_MTPLX_DELTA_NORM_ENCODINGS = {"delta", "delta_plus_one", "mlx_delta"}
 
 
 def validate_gemma4_assistant_pair(
@@ -2233,10 +2234,15 @@ def _validate_mtplx_runtime_contract(model_path: Path, config: dict) -> None:
     MTPLX documented defaults filling anything omitted.
     """
     runtime_path = model_path / MTPLX_RUNTIME_FILE
-    if not runtime_path.exists():
+    if runtime_path.exists():
+        with open(runtime_path) as f:
+            runtime = json.load(f)
+    elif _is_optiq_mtp_sidecar(config) and _mtp_family_token(config):
+        # OptiQ ships the stock Qwen MTP head, which uses the MTPLX defaults,
+        # without a runtime contract file.
+        runtime = {"arch_id": "qwen3-next-mtp"}
+    else:
         raise ValueError(f"Missing required runtime contract: {runtime_path}")
-    with open(runtime_path) as f:
-        runtime = json.load(f)
 
     checks: dict = dict(_MTPLX_CONTRACT_DEFAULTS)
     for layer in (config.get("mtplx_mtp_contract"), runtime.get("mtp_contract")):
@@ -2250,6 +2256,30 @@ def _validate_mtplx_runtime_contract(model_path: Path, config: dict) -> None:
                 f"Unsupported MTPLX contract {field}={checks.get(field)!r}; "
                 f"oMLX's MTP runtime supports {' / '.join(allowed)}"
             )
+
+
+def _is_optiq_mtp_sidecar(config: dict) -> bool:
+    return str(config.get("mtp_policy") or "").startswith("optiq")
+
+
+def _mtplx_head_norms_are_zero_centered(config: dict) -> bool:
+    """Whether the side-car head stores raw (zero-centered) RMSNorm gammas.
+
+    MTPLX declares this with a ``delta`` norm encoding (same keys as
+    ``mtplx.mtp_patch._mtp_norms_are_delta_encoded``). OptiQ copies the
+    Hugging Face head unchanged and does not declare it.
+    """
+    declared = [config.get("mtplx_mtp_norm_encoding"), config.get("mtp_norm_encoding")]
+    mtp_quant = config.get("mtplx_mtp_quantization")
+    if isinstance(mtp_quant, dict):
+        declared += [
+            mtp_quant.get("norm_encoding"),
+            mtp_quant.get("norm_weight_encoding"),
+        ]
+    declared = [str(value).strip().lower() for value in declared if value is not None]
+    if declared:
+        return any(value in _MTPLX_DELTA_NORM_ENCODINGS for value in declared)
+    return _is_optiq_mtp_sidecar(config)
 
 
 def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
@@ -2283,12 +2313,16 @@ def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
         else ""
     )
 
+    shift_norms = _mtplx_head_norms_are_zero_centered(config)
     sidecar_weights = mx.load(str(sidecar))
     mtp_weights = {}
     for key, value in sidecar_weights.items():
         bare = _strip_mtp_key_prefix(key)
-        if bare is not None:
-            mtp_weights[recipient_prefix + bare] = value
+        if bare is None:
+            continue
+        if shift_norms and value.ndim == 1 and bare.endswith(_QWEN_MTP_NORM_SUFFIXES):
+            value = value + 1.0
+        mtp_weights[recipient_prefix + bare] = value
     if not mtp_weights:
         raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
 
@@ -2304,7 +2338,7 @@ def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
             return {"merge_mode": "noop", "mtp_tensors": len(mtp_weights)}
 
     shard_path = output / GEMMA4_ASSISTANT_MTP_SHARD
-    if set(mtp_weights) == set(sidecar_weights):
+    if set(mtp_weights) == set(sidecar_weights) and not shift_norms:
         merge_mode = "rename"
         if sidecar != shard_path:
             sidecar.replace(shard_path)
@@ -2312,13 +2346,13 @@ def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
             output, mtp_weights, write_shard=False
         )
     else:
-        # VLM-shaped checkpoints need the language_model. prefix on disk.
-        # Materialize before touching files: the loaded arrays lazily
-        # reference the side-car file.
+        # VLM-shaped checkpoints need the language_model. prefix on disk,
+        # and zero-centered heads need the +1 shift. Materialize before
+        # touching files: the loaded arrays lazily reference the side-car.
         merge_mode = "remap"
         mx.eval(*mtp_weights.values())
         mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
-        if sidecar.parent == output:
+        if sidecar.parent == output and sidecar != shard_path:
             # Keep the consumed side-car out of mlx-vlm's *.safetensors
             # glob; sub-directory side-cars are invisible to it already.
             sidecar.replace(sidecar.with_name(sidecar.name + ".orig"))

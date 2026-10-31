@@ -150,6 +150,7 @@ def choose_parallelism(
     workload_profile: str = "balanced",
     context_tokens: int = 8192,
     head_rank_extra_bytes: int = 0,
+    engram_ssd_offload: bool = False,
 ) -> ParallelismChoice:
     """Pick the tensor-parallel degree and produce the plan it implies.
 
@@ -272,6 +273,7 @@ def choose_parallelism(
                 workload_profile=workload_profile,
                 context_tokens=context_tokens,
                 head_rank_extra_bytes=head_rank_extra_bytes,
+                engram_ssd_offload=engram_ssd_offload,
             )
         except PlanningError as exc:
             last_error = exc

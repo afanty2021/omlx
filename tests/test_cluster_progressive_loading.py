@@ -555,7 +555,9 @@ def test_a_model_with_its_own_stage_loader_bypasses_mlx_lm_loading(
 
     calls = []
     module = SimpleNamespace(
-        load_pipeline_stage=lambda path, group: calls.append((path, group)) or "stage"
+        load_pipeline_stage=lambda path, group, engram_ssd_offload: (
+            calls.append((path, group, engram_ssd_offload)) or "stage"
+        )
     )
     monkeypatch.setitem(sys.modules, "mlx_lm.models.own_format", module)
     utils = SimpleNamespace(
@@ -567,11 +569,15 @@ def test_a_model_with_its_own_stage_loader_bypasses_mlx_lm_loading(
     group = SimpleNamespace()
 
     loaded = progressive_sharded_load(
-        tmp_path, pipeline_group=group, utils_module=utils, mx_module=_FakeMX()
+        tmp_path,
+        pipeline_group=group,
+        engram_ssd_offload=True,
+        utils_module=utils,
+        mx_module=_FakeMX(),
     )
 
     assert loaded == ("stage", "tokenizer")
-    assert calls == [(tmp_path, group)]
+    assert calls == [(tmp_path, group, True)]
     with pytest.raises(ValueError, match="pipeline parallelism only"):
         progressive_sharded_load(
             tmp_path, tensor_group=group, utils_module=utils, mx_module=_FakeMX()

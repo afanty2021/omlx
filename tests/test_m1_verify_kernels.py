@@ -124,7 +124,7 @@ def mma_on(monkeypatch):
     monkeypatch.setattr(m1_verify_qmv, "enabled", lambda: True)
 
 
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("rows", [5, 7, 8, 9, 13, 16])
 @pytest.mark.parametrize("n", [1024, 4096])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -160,8 +160,11 @@ def test_window_and_route_order(mma_on):
     assert route(3, 5120, 17408, 4, 64, f16) == "m1"
     assert route(8, 5120, 17408, 4, 64, f16) == "m1_mma"
     assert route(12, 5120, 17408, 4, 64, f16) == "m1_mma"
-    # 5-bit beyond the qmv window takes the MMA kernel too
+    # 5-bit beyond the qmv window takes the MMA kernel too, and so do 6- and 8-bit
     assert route(8, 5120, 17408, 5, 64, f16) == "m1_mma"
+    assert route(5, 2048, 8192, 6, 64, f16) == "m1_mma"
+    assert route(8, 2048, 248320, 8, 64, f16) == "m1_mma"
+    assert route(8, 2048, 8192, 8, 128, f16) != "m1_mma"
 
 
 def test_disabled_when_the_gate_is_off(monkeypatch):
@@ -170,11 +173,12 @@ def test_disabled_when_the_gate_is_off(monkeypatch):
     assert qwen35_verify_qmm._verify_route(8, 5120, 17408, 5, 64, mx.float16) == "sg8"
 
 
-def test_armed_5bit_linear_takes_mma(mma_on):
+@pytest.mark.parametrize("bits", [5, 6, 8])
+def test_armed_linear_takes_mma(mma_on, bits):
     assert qwen35_verify_qmm.apply_verify_qmm_patch()
-    linear = nn.QuantizedLinear(2048, 1024, bias=False, group_size=64, bits=5)
+    linear = nn.QuantizedLinear(2048, 1024, bias=False, group_size=64, bits=bits)
     linear.weight, linear.scales, linear.biases = _quantized(
-        2048, 1024, 5, 64, mx.float16
+        2048, 1024, bits, 64, mx.float16
     )
     x = mx.random.normal((1, 8, 2048)).astype(mx.float16)
     stock = linear(x)
@@ -193,5 +197,5 @@ def test_armed_5bit_linear_takes_mma(mma_on):
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False)
         m1_verify_mma.m1_mma_qmm = real
-    assert calls == [((8, 2048), 5)]
+    assert calls == [((8, 2048), bits)]
     assert mx.allclose(routed, stock, atol=2e-2, rtol=2e-2).item()

@@ -302,6 +302,67 @@ def test_ring_launch_reserves_full_collective_port_span():
     )
 
 
+def test_launch_ports_stay_below_the_ephemeral_window():
+    low, high = launch._SAFE_PORT_RANGE
+
+    for _ in range(8):
+        api_port, collective_port = _available_launch_ports(_deployment())
+        assert low <= api_port <= high
+        assert low <= collective_port <= high
+
+
+def test_reap_stale_remote_workers_kills_only_peer_workers(monkeypatch):
+    scanned = []
+    killed = []
+
+    def fake_scan(ssh_target, deployment_id, *, runner):
+        scanned.append((ssh_target, deployment_id))
+        return [4711, 4712], ""
+
+    def fake_kill(ssh_target, pid, *, grace, runner):
+        killed.append((ssh_target, pid))
+        return True
+
+    monkeypatch.setattr(launch, "_remote_deployment_worker_pids", fake_scan)
+    monkeypatch.setattr(launch, "_kill_remote_pid", fake_kill)
+
+    launch._reap_stale_remote_workers(_deployment())
+
+    assert scanned == [("user@studio.local", "cluster-test")]
+    assert killed == [("user@studio.local", 4711), ("user@studio.local", 4712)]
+
+
+@pytest.mark.parametrize(
+    ("scan", "message"),
+    [
+        ((None, "ssh transport broken"), "ssh transport broken"),
+        (([4711], ""), r"survived SIGKILL.*Reboot"),
+    ],
+)
+def test_reap_stale_remote_workers_blocks_launch(monkeypatch, scan, message):
+    monkeypatch.setattr(
+        launch, "_remote_deployment_worker_pids", lambda *_a, **_k: scan
+    )
+    monkeypatch.setattr(launch, "_kill_remote_pid", lambda *_a, **_k: False)
+
+    with pytest.raises(launch.DistributedLaunchError, match=message):
+        launch._reap_stale_remote_workers(_deployment())
+
+
+def test_remote_worker_scan_quotes_peer_stderr_when_output_is_not_json():
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="", stderr="No user exists for uid 501"
+        )
+
+    pids, error = launch._remote_deployment_worker_pids(
+        "user@spark-a", "cluster-test", runner=runner
+    )
+
+    assert pids is None
+    assert "No user exists for uid 501" in error
+
+
 def test_supervisor_preserves_structured_peer_loss_reason():
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     reason = "rank 1 on studio stopped reporting"

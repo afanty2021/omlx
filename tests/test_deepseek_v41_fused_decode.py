@@ -219,7 +219,7 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("batch", [3, 8])   # odd: a tile lane holds half a vector pair
+@pytest.mark.parametrize("batch", [3, 8, 17])   # odd: a tile lane holds half a vector pair
 def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
     B single-token requests through decode_block_nb give each request the logits it gets
@@ -229,11 +229,12 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
     model = verify_exact(build(fmt=fmt))   # affine batches always run on matrix tiles
-    calls = {"nb": 0}
+    batches = []
     real = decode_fused.decode_block_nb
 
     def counted(*args, **kwargs):
-        calls["nb"] += 1
+        batches.append(args[1].shape[0])
+        assert 1 <= batches[-1] <= decode_fused.MAX_BATCH
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_nb", counted)
@@ -255,6 +256,8 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
             mx.eval(model(mx.array([p[:-1]]), cache=cache))
             target.append(cache)
     batched = [DeepseekV41Cache.merge([rows[r][i] for r in range(batch)]) for i in range(len(rows[0]))]
+    for item in batched:
+        item.prepare(lengths=[4] * batch)
     tokens = [p[-1] for p in prompts]
     # The first step decodes an even position, the second an odd one: only the second
     # completes a ratio-2 compression group.
@@ -263,9 +266,16 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
         got = np.asarray(model(mx.array([[t] for t in tokens]), cache=batched)[:, -1].astype(mx.float32))
         for r in range(batch):
             np.testing.assert_allclose(got[r], expected[r], rtol=0, atol=1e-6 * np.abs(expected[r]).max())
+            for i, (item, single) in enumerate(zip(batched, singles[r])):
+                row = item.extract(r)
+                assert row.size() == single.size()
+                assert row._ds41_buffers is rows[r][i]._ds41_buffers
+        assert all(item.lengths.tolist() == [3 - step] * batch for item in batched)
         tokens = [int(e.argmax()) for e in expected]
-    assert calls["nb"] == 2 * model._config.n_layers
-    assert attention["batched"] == 2 * model._config.n_layers   # windows are full: request-batched attention
+    chunks = [min(decode_fused.MAX_BATCH, batch - start)
+              for start in range(0, batch, decode_fused.MAX_BATCH)]
+    assert batches == [n for n in chunks for _ in model.layers] * 2
+    assert attention["batched"] == len(batches)   # windows are full: request-batched attention
 
 
 def _aq(rng, nb, k):

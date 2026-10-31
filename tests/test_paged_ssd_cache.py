@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from omlx.cache.paged_ssd_cache import (
+    GDNCheckpointMetadata,
     PagedSSDBlockMetadata,
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
@@ -1395,6 +1396,57 @@ class TestPagedSSDCacheManagerWithMLX:
         ]
         assert scan_lines, "scan completion log not emitted"
         assert "skipped_incompatible=3 blocks" in scan_lines[-1]
+
+    def test_model_stats_count_old_layout_blocks_and_sidecars(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """#4911: a model row counts every file the SSD budget charges to it."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        def write(i, model_name, block_size):
+            path = self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x90 + i]) + b"\x00" * 31,
+                num_layers=1,
+                model_name=model_name,
+                block_size=block_size,
+            )
+            return path.stat().st_size
+
+        current = sum(write(i, "model-a", 256) for i in range(2))
+        old_layout = sum(write(2 + i, "model-a", 2048) for i in range(3))
+        write(5, "model-b", 256)
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            manager._gdn_sidecar_index.add(
+                GDNCheckpointMetadata(
+                    source_block_hash=b"\x01" * 32,
+                    cache_signature_digest="digest",
+                    file_path=tmp_path / "sidecar",
+                    file_size=300,
+                    token_count=0,
+                    model_name="model-a",
+                    block_size=256,
+                    created_at=0.0,
+                    last_access=0.0,
+                )
+            )
+
+            stats = manager.get_stats_for_model("model-a")
+
+            assert stats.num_files == 6
+            assert stats.total_size_bytes == current + old_layout + 300
+        finally:
+            manager.close()
 
     def test_model_switch_enforces_shared_ssd_limit_on_new_save(
         self, tmp_path: Path, mock_mlx

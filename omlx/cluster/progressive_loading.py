@@ -80,6 +80,7 @@ def progressive_sharded_load(
     tokenizer_config: dict[str, Any] | None = None,
     trust_remote_code: bool = False,
     progress: ProgressCallback | None = None,
+    engram_ssd_offload: bool = False,
     utils_module: Any = None,
     mx_module: Any = None,
 ) -> Any:
@@ -136,7 +137,9 @@ def progressive_sharded_load(
             model = tensor_loader(model_path, tensor_group)
         else:
             model = stage_loader(
-                model_path, pipeline_group or mx_module.distributed.init()
+                model_path,
+                pipeline_group or mx_module.distributed.init(),
+                engram_ssd_offload=engram_ssd_offload,
             )
         if return_config:
             return model, tokenizer, metadata_config
@@ -284,13 +287,19 @@ def install_progressive_loader(
     server_module: Any,
     *,
     progress: ProgressCallback | None = None,
+    engram_ssd_offload: bool = False,
 ) -> Any:
     """Install the loader only around ``ModelProvider.load_default()``."""
 
     original = server_module.sharded_load
 
     def load(*args: Any, **kwargs: Any) -> Any:
-        return progressive_sharded_load(*args, **kwargs, progress=progress)
+        return progressive_sharded_load(
+            *args,
+            **kwargs,
+            progress=progress,
+            engram_ssd_offload=engram_ssd_offload,
+        )
 
     server_module.sharded_load = load
     try:

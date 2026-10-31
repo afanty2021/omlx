@@ -2059,7 +2059,7 @@ private struct AccelerationSection: View {
                                   defaultValue: "Qwen4 Extended Fused Decode",
                                   comment: "Row label for the Qwen4 extended fused decode toggle"),
                     sublabel: String(localized: "settings.acceleration.qwen4_wide_decode.sub",
-                                     defaultValue: "Speeds up decode on Qwen4 oQ2.5e, oQ2.7e, oQ6e, oQ8e and 8-bit community models (about 3-6% on an 8-bit model, up to 1.5 GiB more memory). No effect on oQ3e to oQ4e or fp16 builds, and little effect with Lightning MTP on.",
+                                     defaultValue: "Speeds up decode on Qwen4 oQ8e and other GDN layouts, such as some older oQ downloads and community models (up to 1.5 GiB more memory). No effect on current oQ2.5e to oQ6e or fp16 builds, and little effect with Lightning MTP on.",
                                      comment: "Sublabel for the Qwen4 extended fused decode toggle"),
                     isLast: !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.qwen4GdnDecodeWideProj, save: {

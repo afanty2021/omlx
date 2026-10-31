@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -957,6 +958,15 @@ def _run_rank(
     monkeypatch.setattr(inference_worker, "watch_rank_load", fake_watch)
 
     @contextlib.contextmanager
+    def fake_progressive_loader(_server, **kwargs):
+        record["progressive_loader_kwargs"] = kwargs
+        yield None
+
+    monkeypatch.setattr(
+        inference_worker, "install_progressive_loader", fake_progressive_loader
+    )
+
+    @contextlib.contextmanager
     def fake_pipeline_compat(_assignments):
         yield None
 
@@ -1221,6 +1231,19 @@ def test_the_wired_limit_is_not_raised_before_anything_admits_the_rank(
         "the rank called mx.set_wired_limit directly, bypassing the sysctl-unset "
         "skip and the 5% OS margin the engine honours"
     )
+
+
+@pytest.mark.parametrize("ssd_weight_bytes", [0, 4 * GiB])
+def test_the_rank_loads_engram_from_ssd_only_when_its_plan_offloads_it(
+    monkeypatch, tmp_path, ssd_weight_bytes
+):
+    plan = _uneven_plan()
+    assignments = (replace(plan[0], ssd_weight_bytes=ssd_weight_bytes), plan[1])
+
+    record = _run_rank(monkeypatch, tmp_path, assignments=assignments)
+
+    offload = record["progressive_loader_kwargs"]["engram_ssd_offload"]
+    assert offload is (ssd_weight_bytes > 0)
 
 
 def test_the_wired_limit_asks_for_the_admission_budget_not_apples_maximum(

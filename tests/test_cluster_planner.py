@@ -7,6 +7,7 @@ import struct
 import pytest
 from mlx_lm.models.pipeline import PipelineMixin
 
+from omlx.cluster.deployment import _assignment_from_dict
 from omlx.cluster.planner import (
     ModelLayout,
     NodeBudget,
@@ -733,6 +734,32 @@ def test_tensor_plan_leaves_ssd_tables_out_of_rank_memory():
     assert [item.layer_weight_bytes for item in tensor.assignments] == [150, 150]
     assert sum(item.layer_weight_bytes for item in pipeline.assignments) == 500
     assert ModelLayout.from_dict(layout.to_dict()) == layout
+
+
+def test_offloaded_engram_tables_stay_out_of_pipeline_rank_memory():
+    layout = ModelLayout(
+        source="tables",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(100, 300, 100),
+        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
+        supports_pipeline=True,
+    )
+    small = [NodeBudget(node_id="mini", capacity_bytes=320, rank=0)]
+
+    for planner in (plan_unequal_pipeline, plan_proportional_pipeline):
+        with pytest.raises(PlanningError):
+            planner(layout, small)
+        (assignment,) = planner(layout, small, engram_ssd_offload=True).assignments
+        assert assignment.layer_weight_bytes == 500
+        assert assignment.ssd_weight_bytes == 200
+        assert assignment.planned_weight_bytes == 300
+        assert _assignment_from_dict(assignment.to_dict()) == assignment
+
+    large = [NodeBudget(node_id="studio", capacity_bytes=1000, rank=0)]
+    assert (
+        plan_unequal_pipeline(layout, large, engram_ssd_offload=True).plan_hash
+        != plan_unequal_pipeline(layout, large).plan_hash
+    )
 
 
 def test_complete_model_layout_cache_invalidates_on_shard_overwrite(

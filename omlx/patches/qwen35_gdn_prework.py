@@ -1412,8 +1412,9 @@ def _qwen4_decode_static_check(module) -> bool:
     # out_proj sits after the fused norm/gate, so its allocation cannot reach
     # the fused kernels at all; in the opt-in arm only the canonical-layout
     # checks remain. Its input is the concatenated value stream, not the
-    # residual stream.
-    out_signatures = None if wide else {(5, 128)}
+    # residual stream. oQ gives it a 5-bit/g128 floor that its budget plan
+    # may raise to 6- or 8-bit/g64.
+    out_signatures = None if wide else {(5, 128), (6, 64), (8, 64)}
     return _canonical_projection(
         out,
         _QWEN4_HIDDEN_SIZE,
