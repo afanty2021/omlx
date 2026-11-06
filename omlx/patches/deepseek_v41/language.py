@@ -7,7 +7,8 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
-from contextlib import nullcontext
+import threading
+from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
 
 import mlx.core as mx
@@ -18,6 +19,7 @@ from mlx_lm.models.switch_layers import SwitchLinear
 
 from omlx.custom_kernels.attention import fast as attention_fast
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.utils.hardware import get_max_working_set_bytes
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
 from . import decode_fused, growth
@@ -815,6 +817,41 @@ def _gather_stage(x):
     return gathered[: x.shape[0]]
 
 
+# The server pins the cache limit to total memory (#300). Wide prefill bounds
+# the pool instead, so odd-size buffers do not pile up through a chunk.
+_PREFILL_CACHE_CAP = 8 << 30
+_PREFILL_CACHE_SHARE = 16
+
+
+@cache
+def _prefill_cache_limit():
+    return min(_PREFILL_CACHE_CAP, get_max_working_set_bytes() // _PREFILL_CACHE_SHARE)
+
+
+# The cache limit is process-global and each engine runs on its own thread, so
+# scopes can exit out of order. Only the last scope to exit restores the limit.
+_prefill_cache_scope_lock = threading.Lock()
+_prefill_cache_scope_depth = 0
+_prefill_cache_scope_saved = None
+
+
+@contextmanager
+def _prefill_cache_scope():
+    """Bound the allocator pool for one wide-prefill layer loop."""
+    global _prefill_cache_scope_depth, _prefill_cache_scope_saved
+    with _prefill_cache_scope_lock:
+        if _prefill_cache_scope_depth == 0:
+            _prefill_cache_scope_saved = mx.set_cache_limit(_prefill_cache_limit())
+        _prefill_cache_scope_depth += 1
+    try:
+        yield
+    finally:
+        with _prefill_cache_scope_lock:
+            _prefill_cache_scope_depth -= 1
+            if _prefill_cache_scope_depth == 0:
+                mx.set_cache_limit(_prefill_cache_scope_saved)
+
+
 @mx.compile
 def _hc_mix_weights(mixes, scale, base, n, hc_eps, iters):
     pre = mx.sigmoid(mixes[..., :n] * scale[0] + base[:n]) + hc_eps
@@ -834,9 +871,10 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
 
 
 def hc_mixes(x, fn, scale, base, c):
+    # One row keeps the FP32 GEMV. Multi-row MLX matmuls run at TF32 on M5.
     if (
         x.ndim == 4
-        and x.shape[1] >= 256
+        and x.shape[1] >= 2
         and x.shape[-2] == c.hc_mult == 4
         and x.shape[-1] > 0
         and x.dtype == mx.bfloat16
@@ -1071,6 +1109,77 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         return next(
             (i for i, layer in stage if i > layer_id and "engram" in layer), None
         )
+
+    def prefetch_engram(self, next_ids, current_ids, cache=None):
+        """Start the next prefill chunk's first Engram table while this chunk runs.
+
+        Table 0 is consumed immediately after layer 0; the next chunk's read
+        otherwise starts only at its first Engram layer. Hashes and history are
+        already known at the chunk boundary, so a byte-bounded worker can finish
+        the read during this chunk's GPU work. The carry stays in a separate
+        manager until the next forward activates it; the current forward's drain
+        cannot discard it.
+        """
+        hasher = getattr(self, "_hasher", None)
+        current = getattr(self, "_engram_prefetch", None)
+        following = getattr(self, "_engram_next_prefetch", None)
+        if hasher is None or current is None or following is None:
+            return
+        current_ids = np.asarray(current_ids, dtype=np.int64)
+        next_ids = np.asarray(next_ids, dtype=np.int64)
+        if current_ids.ndim != 2 or next_ids.ndim != 2:
+            return
+        if current_ids.shape[1] == 0:
+            # A new request's first chunk starts with no active rows; discard
+            # any stale carry left by a different request before installing the
+            # current table read.
+            following.drain()
+            current_ids_are_empty = True
+        else:
+            current_ids_are_empty = False
+            if following.has_pending():
+                # Activate the carry that belongs to this chunk. A carry from
+                # another request can still be installed; its requested IDs
+                # will mismatch at the layer and fall back to a synchronous read.
+                self._engram_prefetch, self._engram_next_prefetch = (
+                    following,
+                    current,
+                )
+                current, following = following, current
+                current.activate()
+        if next_ids.shape[1] == 0:
+            return
+        stage = self._stage()
+        first = self._next_engram(stage, -1)
+        if first is None:
+            return
+        engram_ids = list(self._config.engram_layer_ids)
+        ix = engram_ids.index(first)
+        depth = self._config.engram_max_ngram_size - 1
+        history = None
+        if cache:
+            try:
+                history = np.asarray(cache[0][6], dtype=np.int64)
+            except (IndexError, TypeError, ValueError):
+                history = None
+        batch = int(next_ids.shape[0])
+        if history is None or history.ndim != 2 or history.shape[0] != batch:
+            history = np.full((batch, depth), -1, dtype=np.int64)
+        elif history.shape[1] != depth:
+            history = np.full((batch, depth), -1, dtype=np.int64)
+        if not current_ids_are_empty:
+            if current_ids.shape[0] != batch:
+                history = np.full((batch, depth), -1, dtype=np.int64)
+            else:
+                tokens = hasher.token_map[current_ids]
+                history = np.concatenate([history, tokens], axis=1)[:, -depth:]
+        hashes, _ = hasher(next_ids, history)
+        ids = hashes[:, :, ix]
+        embed = self.layers[first].engram.embed
+        if current_ids_are_empty:
+            current.submit(embed, ids)
+        else:
+            following.submit_carry(embed, ids)
 
     def _stage_output(self, h, pre, skip_logits):
         """Hand the stage to the next rank, then logits from rank 0's hidden."""
@@ -1327,9 +1436,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             pre = mx.broadcast_to(
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
-            if self.pipeline_rank < self.pipeline_size - 1:
+            # A prefill helper ran the layers before this stage on another Mac.
+            stage_input = kwargs.get("_stage_input")
+            if stage_input is not None:
+                h, pre = stage_input["h"], stage_input["pre"]
+            elif self.pipeline_rank < self.pipeline_size - 1:
                 h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
-            shared = {}
+            shared = {} if stage_input is None else dict(stage_input["shared"])
             # An MTP verify block runs through the fused decode kernels token-exactly
             # (decode_fused.decode_block_verify: each token gets its single-token decode
             # result, so speculation cannot change greedy output) when every layer has them.
@@ -1357,19 +1470,15 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                 and int(kwargs.get("next_prefill_tokens") or 0) > c.window_size
             )
             prefetch = getattr(self, "_engram_prefetch", None)
-            # The CPU enqueues a whole prefill chunk in ~1s while the GPU runs
-            # ~15x longer; with the layer loop fully lazy every intermediate
-            # (fp32 hyper-connection streams across hc_mult, gathered sparse
-            # attention loads, MoE routes) stays pinned until the final logits
-            # eval and the Metal pool hoards every freed size class as
-            # IOAccelerator footprint (measured +14.5GB per 2048-token chunk).
-            # Eval the running stream at each layer boundary during prefill so
-            # intermediates retire as the GPU progresses, and clear the pool at
-            # the same points (per-layer widths vary across the ratio switch,
-            # CED tail and 2047/2048 chunk widths, so size classes never
-            # reuse). Decode/verify widths are only submitted (async_eval).
+            # A fully lazy prefill loop pins every intermediate until the logits
+            # eval (+14.5GB per 2048-token chunk). Prefill evals each layer so
+            # intermediates retire as the GPU runs, under a bounded pool.
+            # Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
-            with prefetch.forward() if prefetch is not None else nullcontext():
+            with (
+                _prefill_cache_scope() if prefill_backpressure else nullcontext(),
+                prefetch.forward() if prefetch is not None else nullcontext(),
+            ):
                 first = self._next_engram(stage, -1)
                 if prefetch is not None and first is not None:
                     prefetch.submit(
@@ -1421,7 +1530,6 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                         )
                     if prefill_backpressure:
                         mx.eval(h, pre)
-                        mx.clear_cache()
                     else:
                         # The GPU runs this layer while the next one is built.
                         mx.async_eval(h, pre)
@@ -1442,6 +1550,9 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 mx.zeros((1, 0), mx.int64) if slot == 6 else empty
                             )
                     rows[j].append(rc[j])
+            stage_capture = kwargs.get("_stage_capture")
+            if stage_capture is not None:
+                stage_capture.update(h=h, pre=pre, shared=shared)
             if skip_decoder:
                 # Cache-only: a skipped chunk has no decoder output to project.
                 width = c.dim if skip_logits else c.vocab_size

@@ -4,7 +4,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 BASE = (ROOT / "omlx_web/templates/base.html").read_text(encoding="utf-8")
-LOGIN = (ROOT / "omlx_web/templates/login.html").read_text(encoding="utf-8")
 THEME = (ROOT / "omlx_web/static/css/theme.css").read_text(encoding="utf-8")
 TAILWIND = (ROOT / "omlx_web/static/css/tailwind.css").read_text(encoding="utf-8")
 PAGES = sorted((ROOT / "omlx_web/templates").rglob("*.html")) + sorted(
@@ -47,7 +46,11 @@ def _contrast_ratio(first: str, second: str) -> float:
 
 
 def test_focus_ring_uses_theme_aware_two_pixel_outline():
-    focus_rule = re.search(r":focus-visible\s*\{([^}]*)\}", BASE, re.DOTALL)
+    focus_rule = re.search(
+        r"\[data-enhanced-readability\] :focus-visible[^{]*\{([^}]*)\}",
+        BASE,
+        re.DOTALL,
+    )
     assert focus_rule is not None
     assert "outline: 2px solid var(--focus-ring-color) !important" in focus_rule.group(
         1
@@ -58,11 +61,8 @@ def test_focus_ring_uses_theme_aware_two_pixel_outline():
 def test_focus_ring_contrasts_with_login_backgrounds():
     light_ring = _css_color(THEME, r":root", "--focus-ring-color")
     dark_ring = _css_color(THEME, r'\[data-theme="dark"\]', "--focus-ring-color")
-    dark_page = _css_color(LOGIN, r'\[data-theme="dark"\] body', "background-color")
-    dark_control = _css_color(
-        LOGIN, r'\[data-theme="dark"\] \.bg-neutral-50', "background-color"
-    )
-
+    dark_page = _css_color(THEME, r'\[data-theme="dark"\]', "--bg-primary")
+    dark_control = _css_color(THEME, r'\[data-theme="dark"\]', "--bg-secondary")
     assert _contrast_ratio(light_ring, "#ffffff") >= 3
     assert _contrast_ratio(dark_ring, dark_page) >= 3
     assert _contrast_ratio(dark_ring, dark_control) >= 3

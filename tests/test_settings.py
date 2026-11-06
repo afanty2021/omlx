@@ -3110,7 +3110,11 @@ class TestUISettings:
 
         layout = {"version": 1, "width": "wide", "blocks": []}
         result = UISettings(language="ko", dashboard_layout=layout).to_dict()
-        assert result == {"language": "ko", "dashboard_layout": layout}
+        assert result == {
+            "language": "ko",
+            "dashboard_layout": layout,
+            "custom_theme": None,
+        }
 
     def test_from_dict_legacy_without_layout(self):
         from omlx.settings import UISettings
@@ -3137,6 +3141,46 @@ class TestUISettings:
 
         restored = GlobalSettings.load(base_path=tmp_path)
         assert restored.ui.dashboard_layout == layout
+
+
+class TestCustomThemeRoute:
+    """/api/global-settings validates and persists ui_custom_theme."""
+
+    def _post(self, gs, monkeypatch, body):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        request = admin_routes.GlobalSettingsRequest.model_validate(body)
+        return asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+
+    def test_post_persists_and_null_restores(self, tmp_path, monkeypatch):
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        theme = {"light": {"bg-primary": "#FDF6E3"}, "dark": {}}
+        self._post(gs, monkeypatch, {"ui_custom_theme": theme})
+        saved = {"light": {"bg-primary": "#fdf6e3"}, "dark": {}}
+        assert GlobalSettings.load(base_path=tmp_path).ui.custom_theme == saved
+        assert admin_routes.configured_custom_theme() == saved
+
+        self._post(gs, monkeypatch, {"ui_custom_theme": None})
+        assert gs.ui.custom_theme is None
+
+    @pytest.mark.parametrize(
+        "colors",
+        [{"bg-primary": "red"}, {"text-primary": "#00000000"}, {"Bad Key": "#000000"}],
+    )
+    def test_rejects_malformed_colors(self, colors):
+        from pydantic import ValidationError
+
+        from omlx.admin.routes import CustomThemeRequest
+
+        with pytest.raises(ValidationError):
+            CustomThemeRequest.model_validate({"light": colors})
 
 
 class TestDashboardLayoutRoute:

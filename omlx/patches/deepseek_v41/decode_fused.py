@@ -38,11 +38,11 @@ def _cos_sin(c, compressed, start):
 
 
 @lru_cache(maxsize=None)
-def _window_idx(window, start, old_len):
-    """Attention.__call__ window indices for one query at `start` (host-side, cached)."""
-    local = start - window + 1 + np.arange(window)
-    valid = (local >= max(0, start - old_len)) & (local <= start)
-    return mx.array(np.where(valid, local - (start - old_len), -1).astype(np.int32)[None, None])
+def _window_idx(window, old_len):
+    """Attention.__call__ window indices for one query after old_len window rows (host-side,
+    cached). They do not depend on the position, so the cache holds at most window + 1 arrays."""
+    idx = old_len - window + 1 + np.arange(window)
+    return mx.array(np.where(idx >= 0, idx, -1).astype(np.int32)[None, None])
 
 
 @lru_cache(maxsize=None)
@@ -367,7 +367,7 @@ def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
     kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
     cache[1] = kv[:, -c.window_size:]
-    idx = _window_idx(c.window_size, start, old_len)
+    idx = _window_idx(c.window_size, old_len)
     pooled, ci = compress_index(att, x, qr, cache, shared, start, c)
     return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
 
@@ -591,8 +591,9 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         pooled, ncs, cs_, offs, ci, cmax = _dummy(mx.uint8), [0] * b_n, [0] * b_n, [0] * b_n, _dummy(mx.int32), 1
     nbs = [max(1, (w + cr + 63) // 64) for cr in cs_]
     nbmax = max(nbs)
-    meta = mx.array([[w, cs_[r], w, ncs[r], nbs[r], offs[r], 0, 0] for r in range(b_n)], mx.int32)
-    tmpl = [("D", d), ("H", h), ("NBMAX", nbmax), ("WSTRIDE", w * (d + d // 32)), ("WIS", 0), ("CMAX", cmax)]
+    # Slots 6 and 7 are the kernels' slice strides: ci's column count and the output block count.
+    meta = mx.array([[w, cs_[r], w, ncs[r], nbs[r], offs[r], cmax, nbmax] for r in range(b_n)], mx.int32)
+    tmpl = [("D", d), ("H", h), ("WSTRIDE", w * (d + d // 32)), ("WIS", 0)]
     grid = (h // 8 * 1024, nbmax, b_n)
     s, bmax = DL.kernel("attn_scores_bq")(
         inputs=[q, win, pooled, _arange_i32(w), ci, meta, _const((d**-0.5,))],
@@ -604,7 +605,7 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         output_shapes=[(b_n * h * nbmax * d,), (b_n * h * nbmax,)], output_dtypes=[mx.float32, mx.float32])
     return DL.kernel("o_merge_bq")(
         inputs=[pv, den, bmax, att.attn_sink, meta, cos, sin],
-        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024), ("NBMAX", nbmax)],
+        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024)],
         grid=((h * d // 32 + 31) // 32 * 1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * h * d,)], output_dtypes=[mx.float32])[0].reshape(b_n, h * d)
 

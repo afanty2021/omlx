@@ -307,7 +307,7 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | 유형 | 모델 |
 |------|------|
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)이 지원하는 모든 모델 |
-| VLM | Qwen3.5 시리즈, GLM-4V, Pixtral 및 기타 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 모델 |
+| VLM | Qwen3.5 시리즈, GLM-4V, Pixtral 및 기타 [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) 모델 |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | 임베딩 | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | 리랭커 | ModernBERT, XLM-RoBERTa |
@@ -442,7 +442,7 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ## 감사의 말
 
 - [MLX](https://github.com/ml-explore/mlx)와 [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Apple Silicon에서의 비전-언어 모델 추론
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Apple Silicon에서의 비전-언어 모델 추론
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX는 vllm-mlx v0.1.0에서 시작하여 멀티 모델 서빙, 계층형 KV 캐시, 페이지드 캐시를 완전 지원하는 VLM, 관리자 패널, macOS 메뉴 바 앱으로 크게 발전했습니다
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 앱 번들을 위한 포터블 Python 환경 레이어링
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon을 위한 임베딩 모델 지원
@@ -451,3 +451,4 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었고, Qwen4의 fused GDN decode·prefill 커널은 mlx-serve의 MIT 라이선스 `transformer.zig`를 바탕으로 수정되었습니다
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 메뉴 바 통계의 디자인과 렌더링 방식은 Kennt Kim의 SiliconScope에서 가져왔으며, 에너지 효율적인 리렌더 게이팅도 여기서 영감을 받았습니다
 - [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 전력 제한은 beamivalice의 m5gpu가 정리한 AGX GPU 전력 목표값(`SetMaxGPUAbsolutePower`와 `AbsoluteTarget`, 해제값 `-1000`)을 사용합니다
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts의 파이프라인 디코드 루프는 Stéphane Busso의 ming-tts-serve 설계를 따르며, fused DiT 커널은 ming-tts-serve의 MIT 라이선스 `ming_fused.zig`에서 가져왔습니다

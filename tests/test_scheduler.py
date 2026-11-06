@@ -1180,7 +1180,8 @@ class TestSchedulerAddRequest:
     def test_admission_freshness_gate_skips_tail_not_covering_the_prompt(
         self, mock_model, mock_tokenizer
     ):
-        """A store longer than the prompt cannot serve it from a tail block."""
+        """A store longer than the prompt cannot serve it from a tail block,
+        unless the store also writes a shared prefix tail the prompt covers."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
         scheduler.config.paged_cache_block_size = 2048
@@ -1204,6 +1205,8 @@ class TestSchedulerAddRequest:
 
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
+        scheduler._inflight_store_info["req-prev"].shared_prefix_len = 900
+        assert scheduler._should_defer_for_cache_freshness(request) is True
         future.result.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -3801,6 +3804,46 @@ class TestSchedulerBoundarySnapshots:
         assert provider.tail_terminal_token_count == (7 if not persists else None)
         assert 4 in provider
 
+    def test_boundary_override_keeps_system_prefix_tail_for_its_own_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """Only the side store picks the system-prefix tail as its terminal."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        request = Request(
+            request_id="req-system-tail",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.generation_prompt_start = 7
+        request.system_prefix_end = 6
+        scheduler.requests[request.request_id] = request
+        raw = {4: object(), 6: object(), 7: object()}
+        extracted = {tc: [{"state": (tc,)}] for tc in raw}
+
+        def extract(raw_cache):
+            for tc, obj in raw.items():
+                if raw_cache is obj:
+                    return extracted[tc], f"config-{tc}"
+            raise AssertionError("unexpected raw cache")
+
+        def override(snapshots, tokens, **kwargs):
+            scheduler._boundary_cache_snapshots[request.request_id] = {
+                tc: raw[tc] for tc in snapshots
+            }
+            with patch.object(scheduler, "_extract_cache_states", side_effect=extract):
+                tokens, _, _, provider = scheduler._get_boundary_store_override(
+                    request.request_id, tokens, **kwargs
+                )
+            return len(tokens), provider.tail_terminal_token_count, 4 in provider
+
+        assert override((4, 6, 7), list(range(9))) == (7, 7, True)
+        assert override((4, 6, 7), list(range(6)), system_tail=True) == (6, 6, False)
+        # A requeue store before the marker keeps the aligned prefix only.
+        assert override(
+            (4, 6), list(range(9)), stop_at_generation_prompt=False
+        ) == (4, None, False)
+
     def test_boundary_override_prefers_aligned_snapshot_past_tail(
         self, mock_model, mock_tokenizer
     ):
@@ -4083,6 +4126,38 @@ class TestSchedulerBoundarySnapshots:
         recorded = scheduler._boundary_cache_snapshots[request.request_id]
         assert set(recorded) == {3}
         assert recorded[3] == snapshot_cache
+
+    @pytest.mark.parametrize(
+        "prompt,gen_start,expected",
+        [
+            ([1, 2, 3, 4, 5, 6, 7, 8, 9], 7, 6),
+            # The user text merged into the last prefix token: keep the LCP.
+            ([1, 2, 3, 4, 5, 9, 8, 9], 6, 5),
+            # The prefix reaches the generation prompt: nothing is shared.
+            ([1, 2, 3, 4, 5, 6, 7], 6, 0),
+            # On the block grid: the boundary snapshot already covers it.
+            ([1, 2, 3, 4, 9, 9, 9], 6, 0),
+            # A template that moves the system block shares only a few tokens.
+            ([1, 9, 9, 9, 9, 9, 9, 9], 6, 0),
+        ],
+    )
+    def test_resolve_system_prefix_end(
+        self, mock_model, mock_tokenizer, prompt, gen_start, expected
+    ):
+        """The shared prefix ends at the token LCP, off the grid, before the marker."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-system", prompt="hello", sampling_params=SamplingParams()
+        )
+        request.prompt_token_ids = prompt
+        request.generation_prompt_start = gen_start
+        request.system_prefix_ids = [1, 2, 3, 4, 5, 6]
+        scheduler._resolve_system_prefix_end(request)
+        assert request.system_prefix_end == expected
 
     def test_resolve_generation_prompt_start_requires_exact_suffix_match(
         self, mock_model, mock_tokenizer
@@ -7358,7 +7433,8 @@ class TestOutputParserSmoke:
         assert outputs[-1].new_token_ids == []
         assert outputs[-1].output_token_ids == []
 
-    def test_parser_stop_sets_finish_reason(self, mock_model):
+    @pytest.mark.parametrize("ignore_eos", [False, True])
+    def test_parser_stop_sets_finish_reason(self, mock_model, ignore_eos):
         tokenizer = self._GemmaTokenizer({11: "<|return|>"})
         scheduler = Scheduler(
             model=mock_model,
@@ -7370,7 +7446,7 @@ class TestOutputParserSmoke:
         request = Request(
             request_id="parser-stop-req",
             prompt="prompt",
-            sampling_params=SamplingParams(max_tokens=5),
+            sampling_params=SamplingParams(max_tokens=5, ignore_eos=ignore_eos),
             prompt_token_ids=[1, 2, 3],
             num_prompt_tokens=3,
             status=RequestStatus.RUNNING,
@@ -7382,14 +7458,21 @@ class TestOutputParserSmoke:
         scheduler.request_id_to_uid[request.request_id] = 99
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": token, "finish_reason": None})()
+            for token in (11, 12)
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
-        assert finished_ids == {"parser-stop-req"}
-        assert outputs[-1].finished is True
-        assert outputs[-1].finish_reason == "stop"
+        if ignore_eos:
+            # The latched parser stop neither ends the row nor drops tokens.
+            assert finished_ids == set()
+            assert outputs[-1].finished is False
+            assert request.output_token_ids == [11, 12]
+        else:
+            assert finished_ids == {"parser-stop-req"}
+            assert outputs[-1].finished is True
+            assert outputs[-1].finish_reason == "stop"
 
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"

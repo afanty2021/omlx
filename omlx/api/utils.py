@@ -9,6 +9,7 @@ import re
 from typing import Any, List
 
 from .openai_models import Message
+from .thinking import extract_thinking
 
 # Model families whose chat templates consume message.reasoning_content directly.
 _NATIVE_REASONING_MODEL_TYPES = {
@@ -24,6 +25,8 @@ _NATIVE_REASONING_MODEL_TYPES = {
     "muse_spark",
     # K2 requires a reasoning field for every assistant turn.
     "k2_horizon",
+    # GLM-5.3's chat template renders history reasoning_content into <think> blocks.
+    "glm5_next",
 }
 
 
@@ -179,8 +182,6 @@ def clean_output_text(text: str) -> str:
     if not text:
         return text
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
-    from .thinking import extract_thinking
-
     _, content = extract_thinking(text)
     return content.strip()
 
@@ -924,6 +925,36 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
     return [merged_system] + non_system
 
 
+def _sort_tool_messages_by_call_order(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sort each run of tool messages into the preceding assistant's tool_calls order."""
+    ordered: list[dict[str, Any]] = []
+    call_order: dict[str, int] = {}
+    run: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        run.sort(key=lambda m: call_order.get(m.get("tool_call_id", ""), float("inf")))
+        ordered.extend(run)
+        run.clear()
+
+    for msg in messages:
+        if msg.get("role") == "tool":
+            run.append(msg)
+            continue
+        flush()
+        if msg.get("role") == "assistant":
+            call_order = {
+                call.get("id"): index
+                for index, call in enumerate(msg.get("tool_calls") or [])
+                if call.get("id")
+            }
+        ordered.append(msg)
+
+    flush()
+    return ordered
+
+
 def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     """Merge consecutive messages with the same mergeable role.
 
@@ -999,8 +1030,6 @@ def _apply_reasoning_reconstruction(
         text = content if isinstance(content, str) else ""
         if isinstance(content, list):
             text = _extract_text_from_content_list(content)
-        from .thinking import extract_thinking
-
         inline_reasoning, inline_content = extract_thinking(text)
         if inline_reasoning:
             return inline_content, inline_reasoning
@@ -1008,6 +1037,10 @@ def _apply_reasoning_reconstruction(
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
+    # Clients may echo the same reasoning inline and as a field. Keep one copy.
+    inline_reasoning, inline_content = extract_thinking(text)
+    if inline_reasoning and inline_reasoning.strip() == reasoning.strip():
+        return (inline_content, reasoning) if native else (text, None)
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
@@ -1200,6 +1233,7 @@ def extract_text_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
@@ -1378,6 +1412,7 @@ def extract_multimodal_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 

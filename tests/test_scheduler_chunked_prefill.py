@@ -31,6 +31,7 @@ from omlx.prefill.packed import (
     PackedBatch,
     PackedRow,
     PackedRows,
+    _wrap_mixer,
     install_packed_prefill,
     packed_min_row_tokens,
     run_packed_prefill,
@@ -1633,6 +1634,83 @@ def test_external_prefill_announces_the_next_chunk_to_the_model():
     assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
 
 
+def test_external_prefill_announces_engram_next_chunk_to_the_model():
+    """Engram lookahead is told every chunk's successor, and the final chunk
+    still gets an empty successor so its carry can be activated."""
+    import types
+
+    class EngramLookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_engram(self, next_ids, current_ids, cache=None):
+            self.seen.append(
+                (next_ids.tolist()[0], current_ids.tolist()[0], cache)
+            )
+
+    model = EngramLookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(prefill_step_size=4, paged_cache_block_size=0),
+    )
+    tokens = list(range(10, 21))  # 10 prefill tokens, the last goes to the generator
+    request = _make_request("engram-lookahead-external", n_tokens=11)
+    cache = [types.SimpleNamespace(state=mx.array([0]))]
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._do_external_prefill(request, tokens, cache)
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [
+        ([10, 11, 12, 13], [], cache),
+        ([14, 15, 16, 17], [10, 11, 12, 13], cache),
+        ([18, 19], [14, 15, 16, 17], cache),
+        ([], [18, 19], cache),
+    ]
+
+
+def test_step_prefill_chunk_announces_engram_next_chunk_to_the_model():
+    """Chunked prefill passes the Engram successor through every step, with
+    an empty successor on the final step."""
+
+    class EngramLookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_engram(self, next_ids, current_ids, cache=None):
+            self.seen.append(
+                (next_ids.tolist()[0], current_ids.tolist()[0], cache)
+            )
+
+    model = EngramLookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            prefill_step_size=4, chunked_prefill=True, paged_cache_block_size=0
+        ),
+    )
+    request = _make_request("engram-lookahead-chunked", n_tokens=11)
+    state = _make_prefill_state(scheduler, request, n_remaining=10)
+    state.tokens_remaining = mx.arange(10, 20, dtype=mx.int32)[None]
+    cache = state.cache
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        while not scheduler._step_prefill_chunk(state):
+            pass
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [
+        ([10, 11, 12, 13], [], cache),
+        ([14, 15, 16, 17], [10, 11, 12, 13], cache),
+        ([18, 19], [14, 15, 16, 17], cache),
+        ([], [18, 19], cache),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Packed prefill
 # ---------------------------------------------------------------------------
@@ -1902,6 +1980,22 @@ def _assert_same_cache(actual, expected):
     for a, b in zip(actual, expected):
         assert a.shape == b.shape
         assert mx.array_equal(a, b).item()
+
+
+def test_packed_wrapper_follows_a_later_patch_of_an_inherited_call():
+    """Qwen4 GDN inherits __call__; a patch of the base class applied after
+    the packed wrapper (the GDN prework decode) must still reach it."""
+
+    class Base:
+        def __call__(self, inputs, mask=None, cache=None):
+            return "original"
+
+    class Child(Base):
+        pass
+
+    _wrap_mixer(Child, lambda x, cache: None, x_arg="inputs")
+    Base.__call__ = lambda self, inputs, mask=None, cache=None: "patched"
+    assert Child()(mx.zeros((1, 2))) == "patched"
 
 
 @pytest.mark.parametrize(

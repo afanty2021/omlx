@@ -1067,10 +1067,19 @@ class TestRequestTranslation:
         for flag in (
             "--max-context",
             "--max-memory",
-            "--max-cache-disk",
             "--disable-ane",
         ):
             assert flag not in command
+
+    def test_serve_command_turns_ssd_cache_off_without_omlx_ssd_cache(self, tmp_path):
+        # Cache disabled, hot cache only and a Splash SSD size of 0 all reach
+        # Splash as cache_disk_bytes == 0.
+        command = _engine(tmp_path)._serve_command(9000)
+
+        assert command[command.index("--max-cache-disk") + 1] == "0"
+        # Splash rejects --persistent-cache next to --max-cache-disk 0.
+        assert "--persistent-cache" not in command
+        assert "--cache-dir" not in command
 
     def test_request_body_passes_sampling_through(self, tmp_path):
         body = _engine(tmp_path)._request_body(
@@ -2270,6 +2279,25 @@ class TestSplashRuntimeCache:
         assert engine._status == payload
         await engine.stop()
         assert engine._status_task is None
+
+    async def test_status_refresh_keeps_a_cancel_raised_as_timeout(self, tmp_path):
+        # Older anyio raises the request timeout in place of a cancel that
+        # lands with the deadline.
+        fetching = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            fetching.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise httpx.ReadTimeout("timed out", request=request) from None
+
+        engine = _engine_with_transport(tmp_path, handler)
+        task = asyncio.create_task(engine._refresh_status())
+        await fetching.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     def test_cache_dashboard_lists_splash_next_to_mlx(self, tmp_path):
         settings = SimpleNamespace(

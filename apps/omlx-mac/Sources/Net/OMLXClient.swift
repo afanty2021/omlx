@@ -195,6 +195,30 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.importMtplx(id))
     }
 
+    // MARK: - Prefill Accelerator
+
+    func prefillHelperCandidates(id: String) async throws -> PrefillHelperCandidatesDTO {
+        try await get(AdminAPI.prefillHelperCandidates, query: [URLQueryItem(name: "model_id", value: id)])
+    }
+
+    func prefillHelperStatus(id: String) async throws -> PrefillHelperStatusDTO {
+        try await get(AdminAPI.prefillHelperStatus(id))
+    }
+
+    /// `action` is copy, retry or stop.
+    func prefillHelperAction(id: String, action: String) async throws -> PrefillHelperStatusDTO {
+        try await postEmpty(AdminAPI.prefillHelperAction(id, action))
+    }
+
+    func prefillLending() async throws -> PrefillLendingDTO {
+        try await get(AdminAPI.prefillLending)
+    }
+
+    @discardableResult
+    func stopPrefillLending() async throws -> PrefillLendingDTO {
+        try await postEmpty(AdminAPI.prefillLendingStop)
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }
@@ -247,6 +271,14 @@ final class OMLXClient: ObservableObject {
 
     func listHFTasks() async throws -> HFTaskListResponse {
         try await get(AdminAPI.hfTasks)
+    }
+
+    func listHFLocalModels() async throws -> HFLocalModelsResponse {
+        try await get(AdminAPI.hfModels)
+    }
+
+    func checkHFModelUpdates(repoIds: [String]) async throws -> HFUpdateCheckResponse {
+        try await post(AdminAPI.hfUpdates, body: HFUpdateCheckRequest(repoIds: repoIds), timeout: 120)
     }
 
     func startHFDownload(
@@ -567,9 +599,11 @@ final class OMLXClient: ObservableObject {
         try await request("GET", path: path, query: query, body: nil)
     }
 
-    private func post<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
+    private func post<U: Encodable, T: Decodable>(
+        _ path: String, body: U, timeout: TimeInterval? = nil
+    ) async throws -> T {
         let data = try encoder.encode(body)
-        return try await request("POST", path: path, body: data)
+        return try await request("POST", path: path, body: data, timeout: timeout)
     }
 
     private func put<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
@@ -598,6 +632,7 @@ final class OMLXClient: ObservableObject {
         path: String,
         query: [URLQueryItem] = [],
         body: Data?,
+        timeout: TimeInterval? = nil,
         isRetry: Bool = false
     ) async throws -> T {
         var components = URLComponents()
@@ -609,6 +644,7 @@ final class OMLXClient: ObservableObject {
         guard let url = components.url else { throw OMLXClientError.invalidURL }
 
         var req = URLRequest(url: url)
+        if let timeout { req.timeoutInterval = timeout }
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil {
@@ -624,7 +660,7 @@ final class OMLXClient: ObservableObject {
                 throw OMLXClientError.unauthenticated
             }
             try await login(apiKey: key)
-            return try await request(method, path: path, query: query, body: body, isRetry: true)
+            return try await request(method, path: path, query: query, body: body, timeout: timeout, isRetry: true)
         }
 
         guard 200..<300 ~= http.statusCode else {
