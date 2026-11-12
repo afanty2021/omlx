@@ -76,6 +76,8 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// "context" (default) | "speed" — what the prefill memory guard
         /// optimizes under pressure.
         let prefillPriority: String?
+        /// "prefill" | "balanced" (default) | "decode": how prefill shares the GPU.
+        let concurrentPriority: String?
     }
 
     struct CacheSettings: Codable, Equatable, Sendable {
@@ -190,6 +192,11 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let hermesModel: String?
         let copilotModel: String?
         let dshModel: String?
+        let markitdownEnabled: Bool?
+        let markitdownExposeModel: Bool?
+        let markitdownMaxFileSizeMb: Int?
+        let markitdownMaxFilesPerRequest: Int?
+        let markitdownPdfProcessingEngine: String?
         /// Splash launcher path; nil means the server detects it.
         let splashPath: String?
         let splashKvFormat: String?
@@ -296,6 +303,13 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsCopilotModel: String? = nil
     var integrationsDshModel: String? = nil
 
+    // MarkItDown document conversion.
+    var markitdownEnabled: Bool? = nil
+    var markitdownExposeModel: Bool? = nil
+    var markitdownMaxFileSizeMb: Int? = nil
+    var markitdownMaxFilesPerRequest: Int? = nil
+    var markitdownPdfProcessingEngine: String? = nil
+
     // External engines: Splash. An empty path returns to automatic
     // detection; `.null` sizes return to automatic sizing.
     var splashPath: String? = nil
@@ -377,6 +391,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil
     var prefillPriority: String? = nil
+    var concurrentPriority: String? = nil
 
     var cacheEnabled: Bool? = nil
     var hotCacheOnly: Bool? = nil

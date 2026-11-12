@@ -45,20 +45,23 @@ def _template_safe_description(value: Any) -> str:
     return str(value)
 
 
+# Fully sorted keys put "type" last, and Qwen3.6 then makes fewer direct
+# tool calls. These keys keep the order clients usually send.
+_SCHEMA_LEADING_KEYS = ("type", "description", "properties", "required")
+
+
 def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
-    """Copy JSON Schema with stable object order and template descriptions."""
+    """Copy JSON Schema with stable key order and template descriptions."""
     if isinstance(value, dict):
         copied = {}
-        # Equivalent client JSON key orders must render the same token prefix.
-        # Keep array order intact: only object member order is canonicalized.
-        for key in sorted(value):
-            child = value[key]
+        for key, child in value.items():
             if key == "properties" and isinstance(child, dict):
+                # Property order is part of the tool definition; keep it.
                 copied[key] = {
                     name: _copy_schema_with_template_defaults(
-                        child[name], is_schema=True
+                        prop_schema, is_schema=True
                     )
-                    for name in sorted(child)
+                    for name, prop_schema in child.items()
                 }
             elif key in {
                 "items",
@@ -87,7 +90,10 @@ def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
             copied["description"] = _template_safe_description(
                 copied.get("description")
             )
-        return copied
+        # Equivalent client key orders must render the same token prefix.
+        leading = [key for key in _SCHEMA_LEADING_KEYS if key in copied]
+        rest = sorted(key for key in copied if key not in _SCHEMA_LEADING_KEYS)
+        return {key: copied[key] for key in leading + rest}
 
     if isinstance(value, list):
         return [
@@ -2590,6 +2596,10 @@ def extract_tool_calls_with_thinking(
                     tool_calls = None
                     tool_calls_from_thinking = False
 
+    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+        # A remote backend can consume the call span and still report this finish.
+        parse_errors = ("malformed",)
+
     return ToolCallExtraction(
         cleaned_text=cleaned_text,
         tool_calls=tool_calls,
@@ -2793,9 +2803,13 @@ class ToolCallStreamFilter:
         if self._opens_payload_at(tail, 0):
             return True
         start = len(self._opener_at(tail, 0))
-        # A declared tool name is call evidence in any call format.
+        # A declared tool name is call evidence only in call position, right
+        # after the opener (`<tool_call>write(...`, `<tool_call>name\n<arg_key>`,
+        # MiniCPM5 `<function name="write">`).
+        # Coding-agent tool names are common words (read, write, edit, bash):
+        # anywhere else they are prose, and counting them failed quoted markers.
         for name in self._registered_tool_names:
-            if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", tail[start:]):
+            if re.match(rf"\s*[\"']?{re.escape(name)}(?![\w-])", tail[start:]):
                 return True
         # One forward cursor per marker keeps marker-heavy tails linear.
         cursors = {

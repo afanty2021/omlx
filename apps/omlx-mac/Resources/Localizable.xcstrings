@@ -1,6 +1,162 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "integrations.claude.desktop" : {
+      "comment" : "Row label for the Claude Desktop aliases toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Desktop"
+          }
+        }
+      }
+    },
+    "settings.search.prompt" : {
+      "comment" : "Placeholder for the global settings search field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Search Settings"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen suchen"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "設定を検索"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 검색"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поиск настроек"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜索设置"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜尋設定"
+          }
+        }
+      }
+    },
+    "settings.search.empty" : {
+      "comment" : "Empty state for global settings search results",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No settings found"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Einstellungen gefunden"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "設定が見つかりません"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정을 찾을 수 없습니다"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Настройки не найдены"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未找到设置"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "找不到設定"
+          }
+        }
+      }
+    },
+    "downloads.format.label" : {
+      "comment" : "Accessible label for the Hugging Face model format preference",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model Format"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellformat"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデル形式"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 형식"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Формат модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型格式"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型格式"
+          }
+        }
+      }
+    },
     "models.updates.check" : {
       "localizations" : {
         "en" : {
@@ -5201,19 +5357,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill-Priorität"
+            "value" : "Umgang mit langen Prompts"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill Priority"
+            "value" : "Long Prompt Handling"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка длинных промптов"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充优先级"
+            "value" : "长提示词处理"
           }
         }
       }
@@ -7635,6 +7797,96 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "保存"
+          }
+        }
+      }
+    },
+    "concurrent_priority.option.balanced" : {
+      "comment" : "Concurrent request priority option that adapts how much GPU time running responses keep",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgewogen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Balanced"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Баланс"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "平衡"
+          }
+        }
+      }
+    },
+    "concurrent_priority.option.decode" : {
+      "comment" : "Concurrent request priority option that keeps running responses decoding first",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decodierung zuerst"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decode First"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сначала декодирование"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "解码优先"
+          }
+        }
+      }
+    },
+    "concurrent_priority.option.prefill" : {
+      "comment" : "Concurrent request priority option that prefills new prompts first",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill zuerst"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill First"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сначала префилл"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充优先"
           }
         }
       }
@@ -10201,6 +10453,258 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "将 Claude Code 请求路由到本地模型或云端"
+          }
+        }
+      }
+    },
+    "integrations.section.markitdown" : {
+      "comment" : "Section header for MarkItDown document conversion",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.enabled" : {
+      "comment" : "Row label for enabling MarkItDown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown aktivieren"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enable MarkItDown"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.enabled.sub" : {
+      "comment" : "Sublabel for enabling MarkItDown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unterstützte Dateianhänge vor LLM-Anfragen vorverarbeiten."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Preprocess supported file attachments before LLM requests."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.expose_model" : {
+      "comment" : "Row label for exposing MarkItDown in model lists",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Als Modell anzeigen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show as model"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.expose_model.sub" : {
+      "comment" : "Sublabel for exposing MarkItDown in model lists",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MarkItDown in Modelllisten anzeigen, um direkte Anfragen zur Markdown-Konvertierung zu ermöglichen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Expose MarkItDown in model lists for direct Markdown conversion requests."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_file_size" : {
+      "comment" : "Row label for the maximum MarkItDown file size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Dateigröße"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max file size"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_file_size.sub" : {
+      "comment" : "Sublabel for the maximum MarkItDown file size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Größere Dokumentanhänge vor der Konvertierung ablehnen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reject larger document attachments before conversion."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_files" : {
+      "comment" : "Row label for the maximum MarkItDown files per request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Dateien pro Anfrage"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max files per request"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.max_files.sub" : {
+      "comment" : "Sublabel for the maximum MarkItDown files per request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Anzahl der Dokumentanhänge begrenzen, die in einer Anfrage konvertiert werden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limit document attachments converted in one request."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_engine" : {
+      "comment" : "Row label for the MarkItDown PDF processing engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Engine für die PDF-Verarbeitung"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PDF processing engine"
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_engine.sub" : {
+      "comment" : "Sublabel for the MarkItDown PDF processing engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Festlegen, ob PDF-Dokumentanfragen von MarkItDown selbst oder von einer OCR-Engine verarbeitet werden."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_missing_model" : {
+      "comment" : "Warning when the configured PDF OCR model is unavailable",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das ausgewählte OCR-Modell ist nicht verfügbar. PDFs werden mit MarkItDown verarbeitet, bis das Modell wieder verfügbar ist oder Sie eine andere Engine auswählen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The selected OCR model is unavailable. PDFs use MarkItDown until the model is available again or you select another engine."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.pdf_processing_markitdown_warning" : {
+      "comment" : "Warning when PDFs are processed by MarkItDown without OCR",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gescannte PDFs und PDFs, die nur Bilder enthalten, können mit MarkItDown nicht verarbeitet werden. PDFs mit Tabellen werden möglicherweise nicht korrekt verarbeitet."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly."
+          }
+        }
+      }
+    },
+    "integrations.markitdown.limits.invalid" : {
+      "comment" : "Error when a MarkItDown file limit is not a positive integer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geben Sie eine ganze Zahl größer als null ein."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a whole number greater than zero."
           }
         }
       }
@@ -13889,6 +14393,36 @@
         }
       }
     },
+    "models.library.copy_alias" : {
+      "comment" : "Tooltip and context menu item that copies a model's alias",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alias kopieren"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy alias"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скопировать псевдоним"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制别名"
+          }
+        }
+      }
+    },
     "models.library.empty.sub" : {
       "comment" : "Empty-state subtitle directing the user to the Downloads screen",
       "extractionState" : "manual",
@@ -15183,7 +15717,7 @@
         },
         "en" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Custom Ceiling"
           }
         },
@@ -15273,7 +15807,7 @@
         },
         "en" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Memory Guard Tier"
           }
         },
@@ -15891,6 +16425,66 @@
         }
       }
     },
+    "performance.scheduler.concurrent_priority" : {
+      "comment" : "Row label for the concurrent request priority popup",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Priorität bei gleichzeitigen Anfragen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concurrent Request Priority"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приоритет одновременных запросов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "并发请求优先级"
+          }
+        }
+      }
+    },
+    "performance.scheduler.concurrent_priority.sub" : {
+      "comment" : "Sublabel for the concurrent request priority popup",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Was zuerst läuft, wenn ein neuer Prompt eintrifft, während andere Antworten generiert werden. „Prefill zuerst“ kann laufende Antworten während eines langen Prompts anhalten."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "What runs first when a new prompt arrives while other responses are generating. Prefill First can pause them during a long prompt."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Что выполняется первым, когда новый промпт приходит во время генерации других ответов. «Сначала префилл» может приостанавливать ответы во время длинного промпта."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在其他响应生成期间收到新提示词时，先处理哪一方。“预填充优先”在长提示词期间可能会暂停正在生成的响应。"
+          }
+        }
+      }
+    },
     "performance.scheduler.prefill_priority" : {
       "comment" : "Row label for the prefill priority segmented control",
       "extractionState" : "manual",
@@ -15898,19 +16492,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill-Priorität"
+            "value" : "Umgang mit langen Prompts"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Prefill Priority"
+            "value" : "Long Prompt Handling"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка длинных промптов"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预填充优先级"
+            "value" : "长提示词处理"
           }
         }
       }
@@ -15922,19 +16522,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "„Maximaler Kontext“ ermöglicht bei Speicherdruck größere Prompts auf Kosten der Prefill-Geschwindigkeit. „Geschwindigkeit“ behält die volle Prefill-Geschwindigkeit bei und lehnt Prompts ab, die nicht in den Speicher passen."
+            "value" : "Bei Speicherdruck nimmt „Maximaler Kontext“ längere Prompts mit langsamerem Prefill an. „Volle Geschwindigkeit“ hält den Prefill schnell und lehnt Prompts ab, die nicht passen."
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Max Context trades prefill speed for larger prompts under memory pressure; Speed keeps full prefill speed and rejects prompts that would not fit."
+            "value" : "Under memory pressure, Max Context accepts longer prompts at a slower prefill speed. Full Speed keeps prefill at full speed and rejects prompts that would not fit."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "При нехватке памяти «Максимальный контекст» принимает более длинные промпты ценой более медленного префилла. «Полная скорость» сохраняет скорость префилла и отклоняет промпты, которые не помещаются."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最大上下文在内存压力下以预填充速度换取更大的提示；速度保持完整预填充速度并拒绝不适合的提示。"
+            "value" : "内存紧张时，“最大上下文”会降低预填充速度以接受更长的提示词，“全速”保持预填充全速并拒绝放不下的提示词。"
           }
         }
       }
@@ -15955,6 +16561,12 @@
             "value" : "Max Context"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный контекст"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15970,19 +16582,25 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Geschwindigkeit"
+            "value" : "Volle Geschwindigkeit"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Speed"
+            "value" : "Full Speed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Полная скорость"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "速度"
+            "value" : "全速"
           }
         }
       }
@@ -26404,7 +27022,7 @@
         },
         "en" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Use Hugging Face local cache"
           }
         },
@@ -26522,7 +27140,7 @@
         },
         "en" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Model Directories"
           }
         },
@@ -27797,13 +28415,13 @@
       }
     },
     "settings.acceleration.prefill_helper.update" : {
-      "comment" : "Picker suffix for a paired Mac on another oMLX version",
+      "comment" : "Picker suffix for a paired helper that needs an update",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "needs the same oMLX version"
+            "value" : "needs an update"
           }
         }
       }

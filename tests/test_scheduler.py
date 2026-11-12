@@ -2378,6 +2378,35 @@ class TestSchedulerStatistics:
 class TestSchedulerReset:
     """Tests for Scheduler reset methods."""
 
+    def test_dropped_generator_keeps_wired_limit_for_other_models(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Unloading one model must not unwire a model still serving (#5165)."""
+        small = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        large = Scheduler(model=type(mock_model)(), tokenizer=mock_tokenizer)
+        recommended = 64 * 1024**3
+        limit = {"bytes": 0}
+
+        def set_wired_limit(value):
+            previous, limit["bytes"] = limit["bytes"], value
+            return previous
+
+        monkeypatch.setattr(mx, "set_wired_limit", set_wired_limit)
+        monkeypatch.setattr(mx, "synchronize", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            mx,
+            "device_info",
+            lambda: {"max_recommended_working_set_size": recommended},
+        )
+
+        small._ensure_batch_generator(SamplingParams())
+        large._ensure_batch_generator(SamplingParams())
+        small.batch_generator = None
+        gc.collect()
+
+        assert large.batch_generator is not None
+        assert limit["bytes"] == recommended
+
     def test_reset_clears_state(self, mock_model, mock_tokenizer):
         """Test reset() clears all scheduler state."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -4568,7 +4597,7 @@ class TestSchedulerArraysCacheBlockAlignment:
         assert not Scheduler._cache_tree_has_arrays_cache(KVCache())
 
     @staticmethod
-    def _hybrid_model(model_type="qwen3_5"):
+    def _hybrid_model(model_type="qwen3_5_moe"):
         class ArraysCache:
             def __init__(self):
                 self.state = [mx.zeros((1,))]
@@ -4594,9 +4623,12 @@ class TestSchedulerArraysCacheBlockAlignment:
 
         return HybridModel()
 
-    @pytest.mark.parametrize("model_type", ["qwen3_5", "prism_hadamard_qwen35"])
-    def test_qwen35_wide_prefill_aligns_block_size_to_4096(
-        self, mock_tokenizer, tmp_path, model_type
+    @pytest.mark.parametrize(
+        ("model_type", "expected"),
+        [("qwen3_5_moe", 4096), ("qwen3_5", 2048), ("prism_hadamard_qwen35", 2048)],
+    )
+    def test_qwen35_wide_prefill_aligns_block_size(
+        self, mock_tokenizer, tmp_path, model_type, expected
     ):
         with (
             patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
@@ -4612,9 +4644,8 @@ class TestSchedulerArraysCacheBlockAlignment:
             )
 
         try:
-            assert scheduler._qwen35_prefill_floor == 4096
-            assert scheduler._prefill_step_size_for_progress(0, 4096) == 4096
-            assert scheduler.config.paged_cache_block_size == 4096
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == expected
+            assert scheduler.config.paged_cache_block_size == expected
         finally:
             scheduler.shutdown()
 

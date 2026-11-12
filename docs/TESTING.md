@@ -1,6 +1,8 @@
 # Test layout
 
-Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`. The standalone dashboard script tests are the `apps/omlx-web/tests/*.test.cjs` files except `network_auth_ui.test.cjs`, which `test_admin_network_auth_ui.py` runs with its input.
+Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`.
+
+Run `node --test` from `apps/omlx-web/tests/` to discover the standalone dashboard script tests. `test_admin_network_auth_ui.py` runs `network_auth_ui_runner.cjs` with backend-generated cases on stdin.
 
 # Qwen3.5 text-only checkpoint tests
 
@@ -10,6 +12,10 @@ checkpoints. Small local dense and MoE models, with and without an MTP head,
 cover the Hugging Face `_text` names and the existing mlx-lm name, including
 strict loading of quantized output.
 No model download is required.
+
+# LFM3-Omni oQ tests
+
+Run `python -m pytest -q tests/test_oq.py -k 'Lfm3OmniSanitize or lfm3_omni_copies_codec'` to check that oQ writes LFM3-Omni weights under the names mlx-vlm loads (eager sanitize and streaming discovery), keeps the speech modules in floating point, copies the speech codec, and walks the conv layers with the native mask. They use a small config and need no model download.
 
 # Qwen3-ASR audio quantization tests
 
@@ -263,3 +269,9 @@ For a real-server comparison, use the same model, prompts and cache state on mai
 # GPU power limit tests
 
 Run `python -m pytest -q tests/test_gpu_power.py` to check the GPU power limiter with a fake registry entry: the lowest active cap applies, the cap is removed after the release delay unless a new request arrives first, a raised or removed cap is rewritten on a 1, 1, 2, 3 check-interval backoff while a stricter thermal limit stays, a marker left by a dead server removes the cap on the next start (a live owner's marker is kept), a benchmark start drops a cap that only waits out the release delay, and a GPU that rejects the cap leaves requests uncapped. No GPU cap is written.
+
+# Prefill Accelerator helper tests
+
+Run `python -m pytest -q tests/test_prefill_helper.py` for the host side: splits against an unsplit prefill on small models of each family, the SSH and control-channel transports with fake helpers, GPU budgets, and the link-aware layer choice. `test_payload_matches_the_contract_fixture` compares each family's boundary, state and prefix arrays with the recorded fixture in `tests/fixtures/prefill_contract/<family>/`. When it fails because the arrays changed on purpose, raise the adapter's `contract` and record again with `python tests/fixtures/record_prefill_contract.py <family> --force`; a Linux helper is then refused for the family until its own contract is raised too.
+
+Run `python -m pytest -q apps/omlx-cuda-helper/tests` for the Linux helper. `test_protocol.py` pairs the helper with a real `PairingManager` and drives its control channel with the host's `agent` module, `test_chain.py` runs two stage processes with a fake family, and the per-family files replay the same contract fixtures through the helper's own implementation. They need no NVIDIA GPU: on a Mac the stages run on Metal, and on the helper machine the same files run on CUDA. CI does not run this folder.

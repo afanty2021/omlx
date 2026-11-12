@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -488,7 +488,7 @@ def _filter_uploaded_settings(
 def _setting_feature_flags(
     model_settings: Any, model_type: str | None, *, helper_a8: bool = False
 ) -> list[dict]:
-    """Speed features that are on by default or belong to one model family.
+    """Speed features this model runs with.
 
     A8 counts only where it runs: on this Mac's kernels or the helper's layers.
     """
@@ -2017,9 +2017,29 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         force_lm = request.force_lm_engine or not (
             external_vlm_mtp_active or lightning_mtp_active
         )
+        # Splash fixes its context window at launch and rejects longer
+        # requests, so grow a saved window that this run outgrows.
+        runtime_settings = None
+        saved_window = getattr(model_settings, "max_context_window", None)
+        if saved_window and engine_pool.external_engine_id(
+            request.model_id, model_settings
+        ):
+            needed_window = max(
+                max(_single_prompt_lengths(request)) + request.generation_length,
+                _warmup_prompt_tokens(request.warmup_mode) + 8,
+            )
+            if saved_window < needed_window:
+                runtime_settings = replace(
+                    model_settings, max_context_window=needed_window
+                )
+                logger.info(
+                    f"Benchmark: launching Splash with a {needed_window}-token "
+                    f"context (saved {saved_window})"
+                )
         engine = await engine_pool.get_engine(
             request.model_id,
             force_lm=force_lm,
+            runtime_settings=runtime_settings,
         )
         logger.info(f"Benchmark: loaded {request.model_id}")
         if model_settings is not None:
@@ -2246,9 +2266,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             metrics["system_metrics"] = _sample_window(run, window_start)
             logger.info(
                 "[benchmark-pp-result] pp=%d processing_tps=%.3f "
-                "ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
+                "gen_tps=%.3f ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
                 pp_len,
                 float(metrics.get("processing_tps", 0.0) or 0.0),
+                float(metrics.get("gen_tps", 0.0) or 0.0),
                 float(metrics.get("ttft_ms", 0.0) or 0.0),
                 float(metrics.get("e2e_latency_s", 0.0) or 0.0) * 1000.0,
                 int(metrics.get("cached_tokens", 0) or 0),

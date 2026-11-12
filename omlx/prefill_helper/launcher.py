@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from ..cluster.registry import get_device_registry
 from ..cluster.ssh_policy import cluster_ssh_options
 from ..cluster.staging import scp_push, sidecar_files
@@ -44,6 +45,8 @@ COPY_DIR = "~/.omlx/prefill-helper/models"
 _READY_TIMEOUT_S = 900.0
 _PARALLEL_COPIES = 4
 _FAST_LINKS = ("thunderbolt", "rdma")
+# The row name of the first accelerator check, and what it shows.
+VIA = "ssh"
 # Reaching sshd on a link-local address tells which local interface the cable is.
 _SSH_PORT = 22
 
@@ -54,6 +57,12 @@ _PYTHON_PATH = re.compile(r"[~\w./-]+")
 
 class LaunchError(RuntimeError):
     """The helper cannot start; the message is shown to the user."""
+
+
+class UnreachableError(LaunchError):
+    """The helper cannot be reached right now: asleep, unplugged, or off the
+    network. Worth retrying with backoff, unlike a version, memory, disk, or
+    pairing problem."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +85,10 @@ class HelperTarget:
     def __post_init__(self) -> None:
         if not _PYTHON_PATH.fullmatch(self.python):
             raise ValueError(f"unsupported helper interpreter path: {self.python!r}")
+
+    @property
+    def endpoint(self) -> str:
+        return self.ssh_target
 
 
 def _ssh(target: str, command: str, *, runner: Runner = subprocess.run, timeout=30):
@@ -111,7 +124,7 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
         except (OSError, subprocess.SubprocessError):
             continue
     if target is None:
-        raise LaunchError(f"{device['friendly_name']} does not answer over SSH.")
+        raise UnreachableError(f"{device['friendly_name']} does not answer over SSH.")
     local, peer = probe_host_interfaces("localhost"), probe_host_interfaces(target)
     link = shared_link_addresses(local, peer)
     cable = None if link.kind in _FAST_LINKS else thunderbolt_link_local(local, peer)
@@ -125,7 +138,7 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
             bind_address=cable[1],
         )
     if not link.ok:
-        raise LaunchError(link.reason or "No network link to the helper Mac.")
+        raise UnreachableError(link.reason or "No network link to the helper Mac.")
     wifi = (
         link.source.interface in local.wifi_interfaces
         or link.peer.interface in peer.wifi_interfaces
@@ -224,6 +237,14 @@ def remote_info(
         return json.loads(lines[-1])
     except (IndexError, ValueError):
         raise LaunchError(f"oMLX is not installed on {target.name}.") from None
+
+
+def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | None:
+    """Why this Mac cannot help, or None: it runs the helper from its own
+    oMLX, so the versions must be equal."""
+    if info.get("version") != __version__:
+        return f"{name} runs oMLX {info.get('version')}; update it to {__version__}."
+    return None
 
 
 def required_files(
