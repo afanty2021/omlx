@@ -690,12 +690,14 @@ class TestMaxTokensOverride:
         "bench_cls, thinking, override, expected",
         [
             (MMLUBenchmark, False, None, 128),
-            (LiveCodeBenchBenchmark, True, None, 16384),
+            # The fork budget is 8192 (c7212894 local eval speedup), not
+            # upstream's 16384.
+            (LiveCodeBenchBenchmark, True, None, 8192),
             # Lifts the thinking cap (32768) and thinking-off defaults.
             (LiveCodeBenchBenchmark, True, 65536, 65536),
             (MMLUBenchmark, False, 4096, 4096),
             # Never lowers a benchmark's own budget.
-            (LiveCodeBenchBenchmark, False, 8192, 16384),
+            (LiveCodeBenchBenchmark, False, 4096, 8192),
         ],
     )
     def test_question_max_tokens(self, bench_cls, thinking, override, expected):
