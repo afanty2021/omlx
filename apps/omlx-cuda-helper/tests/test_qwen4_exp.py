@@ -42,12 +42,17 @@ def _group(arrays, tag):
 
 @needs_fixture
 @pytest.mark.parametrize(
-    "bounds",
-    [(0, 3), (0, 2, 3), (0, 4)],
-    ids=["one-stage", "two-stages", "fewer-layers-than-held"],
+    ("bounds", "mrope_prefix"),
+    [((0, 3), False), ((0, 2, 3), False), ((0, 4), False), ((0, 3), True)],
+    ids=["one-stage", "two-stages", "fewer-layers-than-held", "mrope-prefix"],
 )
-def test_stages_reproduce_the_contract_fixture(bounds):
+def test_stages_reproduce_the_contract_fixture(bounds, mrope_prefix):
     meta, arrays = _case()
+    if mrope_prefix:
+        # A host cache that decoded sends its QSA positions as MRoPE [3, 1, n].
+        for name, (data, dtype) in list(arrays.items()):
+            if name.startswith("p:") and name.endswith(".ip"):
+                arrays[name] = (np.broadcast_to(data, (3, *data.shape)).copy(), dtype)
     k, sizes, skip = meta["layers"], meta["sizes"], meta["prefix_chunks"]
     assert meta["contract"] == qwen4_exp.CONTRACT
     assert all(a >= qwen4_exp.FIRST_STAGE_MIN for a in bounds[1:-1])
@@ -55,6 +60,10 @@ def test_stages_reproduce_the_contract_fixture(bounds):
         load_stage(FIXTURE / "model", first, last)
         for first, last in zip(bounds, bounds[1:])
     ]
+    for stage in stages:
+        # A layer loaded again after a long prompt runs as at the first load.
+        stage.drop_layer()
+        stage.add_layer()
     jobs = [s.new_job(min(s.last, k) - s.first) for s in stages]
     for stage in stages:
         # On CUDA the replay then runs through the self-checked kernels.

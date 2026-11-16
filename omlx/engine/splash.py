@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
 from ..gguf import SPLIT_VARIANT
+from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
 from .base import BaseEngine, GenerationOutput
@@ -989,6 +990,7 @@ class _LiveRequest:
     first_token_at: float | None = None
     last_token_at: float | None = None
     generated_tokens: int = 0
+    decode_marks: DecodeMarks = ()
 
     def add_progress(self, progress: dict[str, Any]) -> None:
         self.prompt_tokens = int(progress.get("total", self.prompt_tokens))
@@ -997,6 +999,9 @@ class _LiveRequest:
         self.prefill_ms = float(progress.get("time_ms", self.prefill_ms))
 
     def add_tokens(self, count: int, now: float) -> None:
+        self.decode_marks = add_decode_mark(
+            self.decode_marks, self.generated_tokens, self.last_token_at, now
+        )
         self.first_token_at = self.first_token_at or now
         self.last_token_at = now
         self.generated_tokens += count
@@ -1022,7 +1027,13 @@ class _LiveRequest:
             "request_id": request_id,
             "elapsed_seconds": elapsed,
             "generated_tokens": self.generated_tokens,
-            "tokens_per_second": self.generated_tokens / elapsed if elapsed else 0.0,
+            "tokens_per_second": live_decode_rate(
+                self.decode_marks,
+                self.generated_tokens,
+                self.last_token_at,
+                self.first_token_at,
+                now,
+            ),
             "last_activity_age_seconds": max(0.0, now - self.last_token_at),
             "prompt_tokens": self.prompt_tokens,
             "max_tokens": self.max_tokens,
@@ -1784,7 +1795,8 @@ class SplashEngine(BaseEngine):
     def benchmark_endpoint(self) -> dict[str, Any]:
         """Splash's own API, for the admin benchmark's chat-endpoint path.
 
-        Thinking is off so the benchmark measures plain prefill and decode.
+        Thinking is off so the benchmark measures plain prefill and decode, and
+        EOS is ignored so each test decodes its full token budget.
         """
         if self._process is None or self._process.poll() is not None:
             raise RuntimeError("Splash engine is not started")
@@ -1792,7 +1804,7 @@ class SplashEngine(BaseEngine):
             "base_url": f"{self._base_url}/v1",
             "api_key": self._api_key,
             "model": self._repo_id,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
     def reserved_bytes(self) -> int:

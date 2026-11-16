@@ -3,7 +3,12 @@
 
 import logging
 
-from omlx.logging_config import AdminStatsAccessFilter, apply_logger_levels
+from omlx.logging_config import (
+    AdminStatsAccessFilter,
+    apply_logger_levels,
+    console_log_level,
+    is_console_handler,
+)
 
 
 class TestApplyLoggerLevels:
@@ -126,3 +131,16 @@ class TestAdminStatsAccessFilter:
             '127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200'
         )
         assert self.filter.filter(record) is True
+
+
+def test_supervised_console_keeps_warnings_only(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMLX_SUPERVISED", raising=False)
+    assert console_log_level(logging.DEBUG) == logging.DEBUG
+
+    monkeypatch.setenv("OMLX_SUPERVISED", "launchd")
+    assert console_log_level(logging.DEBUG) == logging.WARNING
+    assert console_log_level(logging.ERROR) == logging.ERROR
+
+    file_handler = logging.FileHandler(tmp_path / "server.log", delay=True)
+    assert is_console_handler(logging.StreamHandler())
+    assert not is_console_handler(file_handler)

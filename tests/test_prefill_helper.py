@@ -3,6 +3,8 @@
 import itertools
 import json
 import os
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,8 +22,9 @@ import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from mlx.utils import tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
+from test_inkling_vlm_mtp import _inkling2_tiny
 from test_mlx_vlm_minimax_m3_compat import _tiny_text_config
 from test_scheduler_chunked_prefill import (
     _tiny_glm5_next,
@@ -55,6 +58,7 @@ DSV41 = adapter_for("deepseek_v41")
 GLM = adapter_for("glm5_next")
 QWEN4 = adapter_for("qwen4_exp")
 MINIMAX = adapter_for("minimax_m3_vl")
+INKLING2 = adapter_for("inkling2")
 QWEN35 = adapter_for("qwen3_5")
 _TABLES = tempfile.TemporaryDirectory(prefix="omlx-prefill-helper-")
 _TABLE_IDS = itertools.count()
@@ -110,8 +114,12 @@ def _finish(model, cache, last):
 def _run(config, k, sizes, prefix=0):
     """Whole-model reference vs split prefill over the same chunks.
 
-    ``prefix`` chunks run on this Mac alone first, like a cached prefix.
+    ``prefix`` chunks run on this Mac alone first, like a cached prefix. A list
+    ``k`` splits each chunk at its own layer, as a helper that drops its last
+    layers during a long prompt.
     """
+    splits = k if isinstance(k, list) else [k] * (len(sizes) - prefix)
+    k = splits[0]
     host, helper = _model(config), _model(config)
     DSV41.keep_first(helper, k)
     ids = mx.array(np.random.default_rng(7).integers(3, 60, (1, sum(sizes) + 1)))
@@ -137,7 +145,11 @@ def _run(config, k, sizes, prefix=0):
     )
     for index, (chunk, nxt) in enumerate(zip(rest, nexts[prefix:])):
         inputs = feed(index) if feed else {}
-        boundary, state = DSV41.run_first(helper, helper_cache, chunk, nxt, inputs)
+        k = splits[index]
+        with DSV41.use_first(helper, k):
+            boundary, state = DSV41.run_first(
+                helper, helper_cache[:k], chunk, nxt, inputs
+            )
         DSV41.run_rest(
             host._omlx_prefill,
             host,
@@ -162,13 +174,13 @@ def test_split_matches_whole_model(k):
     _run(tiny(), k, [7, 5, 3])
 
 
-@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("k", [1, 3, [3, 2, 1]])
 def test_split_matches_whole_model_with_ced(k):
     # Chunks wider than the window skip the decoder tail, then replay it.
     _run(tiny_ced(), k, [9, 6, 7])
 
 
-@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("k", [1, 3, [3, 1, 1]])
 def test_split_matches_whole_model_with_engram(k):
     _run(tiny(**_ENGRAM), k, [7, 5, 3])
 
@@ -202,12 +214,17 @@ def _dsv41_contract():
 TOKEN = b"session-token"
 
 
-def _serve(lm, k, *, once=True, adapter=DSV41):
+def _serve(lm, k, *, once=True, adapter=DSV41, memory_limit=0):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     server = HelperServer(
-        lm, adapter, k, TOKEN, {"protocol": wire.PROTOCOL, "layers": k}
+        lm,
+        adapter,
+        k,
+        TOKEN,
+        {"protocol": wire.PROTOCOL, "layers": k},
+        memory_limit=memory_limit,
     )
     thread = threading.Thread(
         target=server.serve, args=(listener,), kwargs={"once": once}, daemon=True
@@ -257,6 +274,23 @@ def test_helper_over_a_socket_matches_whole_model():
     thread.join(10)
     listener.close()
     _assert_same_cache(reference, cache)
+
+
+def test_a_prompt_past_the_helpers_memory_is_handed_back_as_out_of_memory():
+    config, k, sizes = tiny(**_ENGRAM), 2, [6, 5]
+    host = _model(config)
+    listener, thread = _serve(_helper_model(config, k), k, memory_limit=1)
+    client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
+    tokens = np.arange(3, 3 + sum(sizes))
+    job = client.submit(
+        tokens, sizes, feed=DSV41.job_feed(host, None, tokens, sizes, k)
+    )
+    with pytest.raises(HelperError, match="no GPU memory left"):
+        job.take(timeout=60)
+    assert client.out_of_memory
+    client.close()
+    thread.join(10)
+    listener.close()
 
 
 def test_client_notices_a_helper_that_stops_sending():
@@ -609,6 +643,11 @@ _REMOTE = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt"
 
 
 def _remote(home):
+    shim = home / ".omlx" / "bin" / "omlx-cluster-python"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    shim.chmod(0o755)
+
     def runner(argv, **kwargs):
         # Run the remote command here, with HOME pointing at the fake Mac.
         command = argv[-1]
@@ -760,8 +799,9 @@ class _FakeLauncher:
         free=1 << 40,
         copies=(),
         hold=None,
+        fits=None,
     ):
-        self.lm, self.k = lm, k
+        self.lm, self.k, self.fits, self.launched = lm, k, fits, []
         self.version = version or launcher_version()
         self.budget, self.missing = budget, list(missing)
         self.free, self.copies, self.hold = free, list(copies), hold
@@ -818,6 +858,13 @@ class _FakeLauncher:
         warm_tokens,
         a8_min_tokens=None,
     ):
+        self.launched.append(layers)
+        if self.fits is not None and layers > self.fits:
+            raise launcher.LaunchError(
+                "The helper on M5max did not start: RuntimeError: [METAL] Command "
+                "buffer execution failed: Insufficient Memory "
+                "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+            )
         listener, thread = _serve(_helper_model(tiny(), layers), layers)
         server = SimpleNamespace(
             listener=listener, thread=thread, layers=layers, a8=a8_min_tokens
@@ -1113,6 +1160,29 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypat
     attached[-1].client.close()
     status = _wait_state(manager, "stopped", reason="now helping another model")
     assert status["reason"] == "M5max is now helping another model"
+    manager.close()
+
+
+def test_auto_starts_with_a_layer_fewer_after_running_out_of_memory(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    attached = []
+    fake = _FakeLauncher(None, fits=1)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    assert _wait_state(manager, "ready")["held"] == 1 and fake.launched == [2, 1]
+    # A prompt went past the helper's memory and ran here: the status says so.
+    attached[-1].client.out_of_memory = True
+    assert manager.status()["out_of_memory"]
+    # A fixed count is not changed.
+    manager.configure("node-1", 2)
+    _wait_state(manager, "offline", reason="Insufficient Memory")
+    assert set(fake.launched[2:]) == {2}
+    # Not even one layer: waits for the user instead of retrying.
+    fake.fits = 0
+    manager.configure("node-1", None)
+    _wait_state(manager, "error", reason="Not even one layer")
     manager.close()
 
 
@@ -1445,6 +1515,13 @@ def test_agent_transport_drives_a_helper_daemon(tmp_path, monkeypatch):
     # The memory of a session already running there counts as free.
     info = agent.remote_info(target)
     assert manager_module.helper_budget(info) == [44 << 30, 44 << 30]
+    # An integrated GPU leaves the OS its share of the RAM.
+    spark = {"name": "NVIDIA GB10", "total": 121 << 30, "free": 119 << 30}
+    with monkeypatch.context() as patch:
+        patch.setattr(agent, "_call", lambda sock, meta: {"gpus": [spark]})
+        assert manager_module.helper_budget(agent.remote_info(target)) == [119 << 30]
+        spark["integrated"] = True
+        assert manager_module.helper_budget(agent.remote_info(target)) == [105 << 30]
     assert info["device"] == "2x NVIDIA RTX A6000"
     assert info["lending"] == {"host": "Studio", "model": "Other"}
     assert agent.incompatible(info, DSV41, "nvidia1") is None
@@ -1622,11 +1699,14 @@ def _glm_state(cache):
 
 
 def _logits(lm, cache, last):
-    logits = lm(last, cache=cache).logits[:, -1]
+    def step(tokens):
+        out = lm(tokens, cache=cache)
+        return getattr(out, "logits", out)[:, -1]
+
+    logits = step(last)
     out = [np.asarray(logits)]
     for _ in range(3):
-        token = mx.argmax(logits, -1)[:, None]
-        logits = lm(token, cache=cache).logits[:, -1]
+        logits = step(mx.argmax(logits, -1)[:, None])
         out.append(np.asarray(logits))
     return out
 
@@ -1676,6 +1756,14 @@ def test_glm_split_matches_whole_model(k, prefix):
 # ---------------------------------------------------------------------------
 
 
+def test_glm_helper_drops_the_mtp_head():
+    lm = _glm()
+    # What an MTP checkpoint attaches, also when the helper lacks its files.
+    lm.mtp = [lm.model.layers[-1]]
+    GLM.keep_first(lm, 1)
+    assert "mtp" not in lm
+
+
 def _qwen4(layers=2):
     """The tiny Qwen4 stack; four layers put PLE on layer 1 and QSA on 2."""
     mx.random.seed(7)
@@ -1716,6 +1804,17 @@ def test_qwen4_split_matches_whole_model(layers, k, prefix):
     _split_matches(
         QWEN4, lambda: _qwen4(layers), ids, [9, 6, 7], k, prefix, _qwen4_state
     )
+
+
+def test_qwen4_prefix_of_a_decoded_cache_sends_text_positions():
+    lm = _qwen4(4)
+    cache = lm.make_cache()
+    lm(mx.array(np.random.default_rng(5).integers(3, 58, (1, 9))), cache=cache)
+    text = cache[2].index_position_ids
+    # A decode step leaves the ids in MRoPE form.
+    cache[2].index_position_ids = mx.broadcast_to(text[None], (3, *text.shape))
+    sent = QWEN4.prefix_state(cache, 3)["2.ip"]
+    np.testing.assert_array_equal(np.asarray(sent), np.asarray(text))
 
 
 # ---------------------------------------------------------------------------
@@ -1856,14 +1955,83 @@ def test_qwen35_keeps_a_yarn_prompt_off_the_helpers_attention_layers():
         QWEN35.job_feed(host, None, tokens, [8], 4)
 
 
+# ---------------------------------------------------------------------------
+# Inkling 2: attention-residual blocks and conv windows on either side.
+# ---------------------------------------------------------------------------
+
+
+def _inkling2():
+    """The tiny Inkling 2 stack: NVFP4 experts in layers 0-5 and MXFP8 in
+    6-11, block boundaries at 0 and 6, full attention at 5 and 11."""
+    lm = _inkling2_tiny(formats=("nvfp4",) * 6 + ("mxfp8",) * 6)
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _inkling2_contract():
+    """Eight narrower layers (the helper takes NVFP4 0-5 and MXFP8 6) with
+    norm gains near one and NVFP4 block scales and tensor amax of the size the
+    checkpoint ships. 32 experts take the router kernel; MLX CUDA's NVFP4
+    matmul is exact from 64 inputs per row on."""
+    lm = _inkling2_tiny(
+        formats=("nvfp4",) * 6 + ("mxfp8",) * 2,
+        hidden_size=64,
+        head_dim=16,
+        swa_head_dim=16,
+        intermediate_size=64,
+        n_routed_experts=32,
+        num_experts_per_tok=4,
+    )
+    rng = np.random.default_rng(11)
+    for layer in lm.model.layers:
+        for proj in (layer.mlp.experts.w13, layer.mlp.experts.w2):
+            if proj.mode == "nvfp4":
+                scales = rng.integers(0x30, 0x41, proj.scales.shape)
+                proj.scales = mx.array(scales.astype(np.uint8))
+                amax = rng.uniform(20, 40, proj.global_scale.shape)
+                proj.global_scale = mx.array(amax.astype(np.float32))
+    gains = [
+        (name, value + 1.0)
+        for name, value in tree_flatten(lm.parameters())
+        if name.endswith("norm.weight")
+    ]
+    lm.update(tree_unflatten(gains))
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _inkling2_state(cache):
+    out = []
+    for item in cache:
+        kv = item[0]
+        rows = [a[..., : kv.offset, :] for a in (kv.keys, kv.values)]
+        out += [*rows, *[a for a in item[1].cache if a is not None]]
+    return [np.asarray(a) for a in out]
+
+
+@pytest.mark.parametrize("k,prefix", [(1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (7, 1)])
+def test_inkling2_split_matches_whole_model(k, prefix):
+    # Chunks past the 8-key window; cuts before, at and after a block
+    # boundary (6) and a full-attention layer (5).
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
+    _split_matches(INKLING2, _inkling2, ids, [12, 10, 8], k, prefix, _inkling2_state)
+
+
 @pytest.mark.parametrize(
     "factory,make,adapter,k,state_of",
     [
         (_tiny_glm5_next, _glm, GLM, 2, _glm_state),
         (_tiny_qwen4_exp, _qwen4, QWEN4, 1, _qwen4_state),
         (_tiny_qwen35, _qwen35, QWEN35, 4, _qwen35_state),
+        (
+            lambda: (_inkling2(), SimpleNamespace(model_type="inkling2")),
+            _inkling2,
+            INKLING2,
+            7,
+            _inkling2_state,
+        ),
     ],
-    ids=["glm", "qwen4", "qwen35"],
+    ids=["glm", "qwen4", "qwen35", "inkling2"],
 )
 def test_scheduler_family_helper_prefill_matches_local(
     factory, make, adapter, k, state_of
@@ -1973,22 +2141,34 @@ class _Drafter:
         pass
 
 
-def test_scheduler_seeds_a_block_drafter_from_both_macs():
-    k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 100)]
+@pytest.mark.parametrize(
+    "make,model_type,adapter,k,layers",
+    [
+        (_minimax, "minimax_m3_vl", MINIMAX, 2, [0, 3]),
+        # Inkling 2 taps the partial sum entering a layer, and the final norm
+        # as layer 12.
+        (_inkling2, "inkling2", INKLING2, 5, [3, 9, 12]),
+    ],
+    ids=["minimax", "inkling2"],
+)
+def test_scheduler_seeds_a_block_drafter_from_both_macs(
+    make, model_type, adapter, k, layers
+):
+    tokens = [int(t) for t in np.random.default_rng(3).integers(3, 60, 100)]
 
     def drive(helper_k):
         host = _tiny_vlm_adapter(
-            lambda: (_minimax(), SimpleNamespace(model_type="minimax_m3_vl"))
+            lambda: (make(), SimpleNamespace(model_type=model_type))
         )
-        drafter = _Drafter([0, 3], window=40)
+        drafter = _Drafter(layers, window=40)
         host._language_model._omlx_drafter = drafter
         sched = _scheduler(host, 32)
         session = None
         if helper_k:
-            helper = _minimax()
-            MINIMAX.keep_first(helper, helper_k)
+            helper = make()
+            adapter.keep_first(helper, helper_k)
             session, listener, thread = _session(
-                host._language_model, helper, helper_k, adapter=MINIMAX
+                host._language_model, helper, helper_k, adapter=adapter
             )
             sched.attach_prefill_helper(session)
         state = _drive(sched, _request(tokens), tokens)
@@ -2000,8 +2180,8 @@ def test_scheduler_seeds_a_block_drafter_from_both_macs():
         return drafter.seeds
 
     local, split = drive(0), drive(k)
-    # Layer 0 runs on the helper and layer 3 here; the window starts in the
-    # second chunk.
+    # The first tap runs on the helper and the others here; the window starts
+    # in the second chunk.
     assert [p for p, _ in split] == [p for p, _ in local] == [60, 64, 96]
     for (_, a), (_, b) in zip(local, split):
         for x, y in zip(a, b):
@@ -2022,6 +2202,7 @@ _CONTRACT_CASES = {
     "qwen3_5": (QWEN35, _qwen35_contract, 5, "language_model."),
     "glm5_next": (GLM, _glm_contract, 3, "language_model."),
     "deepseek_v41": (DSV41, _dsv41_contract, 6, "language_model."),
+    "inkling2": (INKLING2, _inkling2_contract, 7, ""),
 }
 
 
@@ -2090,6 +2271,28 @@ def test_payload_matches_the_contract_fixture(family):
             )
         else:
             np.testing.assert_array_equal(data, expected[name], err_msg=hint)
+
+
+def test_inkling2_helper_loads_only_its_layers(tmp_path):
+    source = _CONTRACT_DIR / "inkling2" / "model"
+    weights = mx.load(str(source / "model.safetensors"))
+    shutil.copy(source / "config.json", tmp_path / "config.json")
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    lm = INKLING2.load_first(str(tmp_path), 3)
+    assert len(lm.model.layers) == 3 and "lm_head" not in lm
+    host = _inkling2_contract()
+    host.update(tree_unflatten(list(weights.items())))
+    ids = mx.array([[5, 9, 11, 3, 7]])
+    boundary, _ = INKLING2.run_first(lm, lm.make_cache(), ids, 0)
+    INKLING2.keep_first(host, 3)
+    expected, _ = INKLING2.run_first(host, host.make_cache(), ids, 0)
+    np.testing.assert_array_equal(np.asarray(boundary["h"]), np.asarray(expected["h"]))
+    # Without a tensor of layer 1 a non-strict load would leave it at zero.
+    del weights["model.layers.1.mlp_norm.weight"]
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    assert len(INKLING2.load_first(str(tmp_path), 1).model.layers) == 1
+    with pytest.raises(ValueError, match="not in the checkpoint"):
+        INKLING2.load_first(str(tmp_path), 2)
 
 
 def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path, monkeypatch):

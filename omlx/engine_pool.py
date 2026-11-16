@@ -65,6 +65,7 @@ from .exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
     describe_ceiling_binding,
+    is_metal_out_of_memory,
 )
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
@@ -80,6 +81,10 @@ from .model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
+)
+from .patches.inkling2.dspark import (
+    bundled_inkling2_dspark_path,
+    load_inkling2_dspark_drafter,
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
@@ -309,22 +314,6 @@ def _settled_phys_footprint() -> int:
     return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
 
 
-def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
-    # Track visited exceptions: a cause chain can loop (an exception raised
-    # ``from`` itself), and this runs on the event loop during a failed load.
-    seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        text = str(exc)
-        if (
-            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
-            or "Insufficient Memory" in text
-        ):
-            return True
-        exc = exc.__cause__
-    return False
-
-
 def _set_concurrency_limits(config: object, value: int) -> None:
     config.max_num_seqs = value
     config.completion_batch_size = value
@@ -497,12 +486,25 @@ class EnginePool:
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
+        self._gpu_keep_warm_idle_window: float = _GPU_KEEP_WARM_IDLE_WINDOW_S
         self._gpu_keep_warm_task: asyncio.Task[None] | None = None
         self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
 
-    def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
-        """Set the idle keep-warm period in seconds (0 or less disables it)."""
+    def configure_gpu_keep_warm(
+        self, interval_seconds: float, idle_window_seconds: float | None = None
+    ) -> None:
+        """Set the idle keep-warm period in seconds (0 or less disables it).
+
+        ``idle_window_seconds`` is how long after the last request the ticks
+        keep running; None keeps the current window.
+        """
+        if idle_window_seconds is not None:
+            try:
+                window = float(idle_window_seconds)
+            except (TypeError, ValueError):
+                window = _GPU_KEEP_WARM_IDLE_WINDOW_S
+            self._gpu_keep_warm_idle_window = max(0.0, window)
         try:
             interval = float(interval_seconds or 0.0)
         except (TypeError, ValueError):
@@ -537,7 +539,7 @@ class EnginePool:
                 return False
             # Leases refresh last_access at both request start and completion.
             last_request = max(last_request, entry.last_access)
-        return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
+        return loaded and now - last_request < self._gpu_keep_warm_idle_window
 
     async def _gpu_keep_warm_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -720,6 +722,14 @@ class EnginePool:
             dspark_path = bundled_dspark_path(entry.model_path)
             if dspark_path is not None:
                 extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
+        elif (
+            getattr(runtime_settings, "mtp_enabled", False)
+            and entry.config_model_type == "inkling2"
+        ):
+            draft = bundled_inkling2_dspark_path(entry.model_path)
+            if draft is not None:
+                # BF16 draft weights plus the folded [vocab, rank] Markov head.
+                extra += draft.stat().st_size + 201024 * 256 * 2
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -4557,6 +4567,34 @@ class EnginePool:
                     else:
                         engine.set_dflash_drafter(drafter)
 
+            # Inkling 2 bundles its DSpark draft as mtp.safetensors.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type == "inkling2"
+                and hasattr(engine, "prepare_dflash_target")
+            ):
+                draft_path = bundled_inkling2_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+                if draft_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_inkling2_dspark_drafter,
+                            entry.model_path,
+                            engine.prepare_dflash_target(),
+                            depth,
+                            bool(fixed),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Inkling 2 DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
+
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
             if (
@@ -4686,7 +4724,7 @@ class EnginePool:
             if (
                 not entry.abort_loading
                 and not entry_detached
-                and _is_metal_out_of_memory(exc)
+                and is_metal_out_of_memory(exc)
             ):
                 # Depends on what else is resident, so do not cache it: a retry
                 # after memory is freed can succeed with the same files.

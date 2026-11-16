@@ -7076,6 +7076,10 @@ class Scheduler:
         helper = state.helper
         session = helper.session
         part, helper.chunk = helper.chunk, None
+        if part.layers is not None and part.layers < helper.layers:
+            # The helper dropped its last layers for a long prompt; this Mac
+            # holds their cache and runs them from this chunk on.
+            helper.layers = part.layers
         drafter = _block_drafter_for(self.model) if helper.capture else None
         capture = None
         if drafter is not None:
@@ -14219,6 +14223,7 @@ class Scheduler:
                 finished_ids.add(request_id)
                 continue
 
+            request.mark_decode_progress(step_now)
             request.last_activity_at = step_now
             self._note_memory_admission_progress(step_now)
             completion_tokens_before = request.num_output_tokens

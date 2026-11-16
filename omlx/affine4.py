@@ -450,19 +450,24 @@ METAL_FUNC void affine_attention_impl(
         if (tile_valid_start >= tile_valid_end)
             continue;
 
-        if (sg == 0) {
+        // Simdgroups score BK / QKWarps columns each; QKWarps is the largest of
+        // Warps, 2, 1 that divides the tile (3 warps for dim 96 -> 2 score).
+        constexpr int QKWarps = BK % Warps == 0 ? Warps : (Warps >= 2 ? 2 : 1);
+        if (int(sg) < QKWarps) {
+            constexpr int QKCols = BK / QKWarps;
             constexpr auto qk_desc = matmul2d_descriptor(
-                PaddedRows, BK, Dim, false, true, false);
+                PaddedRows, QKCols, Dim, false, true, false);
             matmul2d<qk_desc, execution_simdgroup> qk_op;
             auto q_slice = q_tensor.template slice<Dim, PaddedRows>(0, 0);
-            auto k_slice = k_tensor.template slice<Dim, BK>(0, token);
+            auto k_slice = k_tensor.template slice<Dim, QKCols>(
+                0, token + int(sg) * QKCols);
             auto score_tile = qk_op.template get_destination_cooperative_tensor<
                 decltype(q_slice), decltype(k_slice), float>();
             qk_op.run(q_slice, k_slice, score_tile);
             for (short i = 0; i < score_tile.get_capacity(); ++i) {
                 auto coord = score_tile.get_multidimensional_index(i);
                 if (score_tile.is_valid_element(i)) {
-                    int column = coord[0];
+                    int column = int(sg) * QKCols + coord[0];
                     int row = coord[1];
                     int absolute_token = token + column;
                     int position = row % QueryLength;
@@ -483,38 +488,56 @@ METAL_FUNC void affine_attention_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (int(tid) < ActiveRows) {
-            int row = int(tid);
-            float tile_m = -INFINITY;
-            for (int column = 0; column < BK; ++column)
-                tile_m = max(tile_m, scores[row * BK + column]);
-            float old_m = row_m[row];
-            if (isinf(tile_m)) {
-                row_factor[row] = 1.0f;
-                for (int column = 0; column < BK; ++column)
-                    probabilities[row * BK + column] = half(0.0f);
-            } else {
-                float new_m = max(old_m, tile_m);
-                float factor = isinf(old_m) ? 0.0f : fast::exp(old_m - new_m);
-                float l = row_l[row] * factor;
-                for (int column = 0; column < BK; ++column) {
-                    int absolute_token = token + column;
-                    bool active = !isinf(scores[row * BK + column]);
-                    float weight = active
-                        ? fast::exp(scores[row * BK + column] - new_m)
-                        : 0.0f;
-                    l += weight;
-                    probabilities[row * BK + column] = half(
-                        weight * (active ? float(value_scales[absolute_token * value_scale_stride]) / block_scale : 0.0f));
+        {
+            // Online softmax with SoftmaxLanes threads per row (half a simdgroup); the
+            // row max and sum are reduced with shuffles inside that half.
+            constexpr int SoftmaxLanes = 16;
+            constexpr int ColsPerLane = BK / SoftmaxLanes;
+            constexpr int RowsPerPass = (32 * Warps) / SoftmaxLanes;
+            static_assert(BK % SoftmaxLanes == 0, "tile width must split across lanes");
+            int lane = int(tid) % SoftmaxLanes;
+            int first_column = lane * ColsPerLane;
+            for (int row = int(tid) / SoftmaxLanes; row < PaddedRows; row += RowsPerPass) {
+                if (row >= ActiveRows) {
+                    for (int c = 0; c < ColsPerLane; ++c)
+                        probabilities[row * BK + first_column + c] = half(0.0f);
+                    continue;
                 }
-                row_m[row] = new_m;
-                row_l[row] = l;
-                row_factor[row] = factor;
+                float tile_m = -INFINITY;
+                for (int c = 0; c < ColsPerLane; ++c)
+                    tile_m = max(tile_m, scores[row * BK + first_column + c]);
+                for (ushort offset = SoftmaxLanes / 2; offset > 0; offset >>= 1)
+                    tile_m = max(tile_m, simd_shuffle_xor(tile_m, offset));
+                float old_m = row_m[row];
+                if (isinf(tile_m)) {
+                    for (int c = 0; c < ColsPerLane; ++c)
+                        probabilities[row * BK + first_column + c] = half(0.0f);
+                    if (lane == 0)
+                        row_factor[row] = 1.0f;
+                } else {
+                    float new_m = max(old_m, tile_m);
+                    float factor = isinf(old_m) ? 0.0f : fast::exp(old_m - new_m);
+                    float part = 0.0f;
+                    for (int c = 0; c < ColsPerLane; ++c) {
+                        int column = first_column + c;
+                        int absolute_token = token + column;
+                        float score = scores[row * BK + column];
+                        bool active = !isinf(score);
+                        float weight = active ? fast::exp(score - new_m) : 0.0f;
+                        part += weight;
+                        probabilities[row * BK + column] = half(
+                            weight * (active ? float(value_scales[absolute_token * value_scale_stride]) / block_scale : 0.0f));
+                    }
+                    for (ushort offset = SoftmaxLanes / 2; offset > 0; offset >>= 1)
+                        part += simd_shuffle_xor(part, offset);
+                    if (lane == 0) {
+                        row_m[row] = new_m;
+                        row_l[row] = row_l[row] * factor + part;
+                        row_factor[row] = factor;
+                    }
+                }
             }
         }
-        for (int i = int(tid) + ActiveRows * BK;
-             i < PaddedRows * BK; i += 32 * Warps)
-            probabilities[i] = half(0.0f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (short i = 0; i < output_tile.get_capacity(); ++i) {
@@ -1282,7 +1305,7 @@ class Affine4KVCache(TurboQuantKVCache):
         batch, heads, query_length, _ = queries.shape
         tokens = keys.shape[-2]
         step = max(1, _MAX_SCORE_ELEMENTS // max(1, batch * heads * tokens))
-        sinks = None if sinks is None else sinks.astype(mx.float32)
+        sinks = None if sinks is None else sinks.astype(queries.dtype)
         if query_length <= step:
             return mx.fast.scaled_dot_product_attention(
                 queries,
@@ -1355,9 +1378,11 @@ class Affine4KVCache(TurboQuantKVCache):
             and _state_length(keys_state) >= _MIN_NATIVE_TOKENS
             and self.key_codec.dim == self.value_codec.dim
             and self.key_codec.dim in (64, 72, 80, 96, 128, 256)
-            and sinks is None
             and (effective_mask is None or isinstance(effective_mask, str))
         ):
+            # Attention sinks add one logit per head to the softmax denominator. They
+            # do not depend on K/V, so the orthonormal rotation leaves them unchanged.
+            fused_sinks = None if sinks is None else sinks.astype(mx.bfloat16)
             rotated_queries = self.key_codec.prepare_queries(queries).astype(
                 mx.bfloat16
             )
@@ -1376,6 +1401,7 @@ class Affine4KVCache(TurboQuantKVCache):
                     rotated_values,
                     scale=scale,
                     mask=effective_mask,
+                    sinks=fused_sinks,
                     force_fused=True,
                 )
             else:
@@ -1385,7 +1411,7 @@ class Affine4KVCache(TurboQuantKVCache):
                     rotated_values,
                     scale,
                     effective_mask,
-                    None,
+                    fused_sinks,
                 )
             output = self.value_codec._rotate_inverse(
                 rotated_output.astype(mx.float32)
@@ -1478,6 +1504,10 @@ class BatchAffine4KVCache(BatchTurboQuantKVCache, Affine4KVCache):
             raise ValueError(
                 f"Unsupported {self.quantization_scheme} attention mask: {mask}"
             )
+        # Without left padding the plain mask is exact; keeping it a string lets the
+        # bf16 prefill use the fused kernel instead of a (query x cache) mask array.
+        if (mask is None or causal) and not mx.any(self.left_padding).item():
+            return mask
         columns = mx.arange(tokens)
         allowed = columns[None, None, None, :] >= self.left_padding[:, None, None, None]
         if causal:

@@ -13,6 +13,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -35,7 +36,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -63,6 +63,7 @@ from ..exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
+from ..logging_config import console_log_level, is_console_handler
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -95,6 +96,7 @@ from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.routes import helper_status as prefill_helper_status
 from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
+from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
@@ -355,6 +357,46 @@ def _draft_path_is_unusable(value: str) -> bool:
     ) and not (path / "config.json").is_file()
 
 
+# Features whose draft model is stored next to an on/off toggle.
+_DRAFT_FEATURES = ("dflash", "specprefill", "vlm_mtp")
+
+
+def _draft_usability_problem(
+    settings: dict[str, Any], touched: set[str]
+) -> str | None:
+    """Return why a draft in ``settings`` cannot be used, or None to proceed.
+
+    A draft may stay parked while its feature is off (#4217): every settings
+    save re-sends the whole payload, so a draft directory deleted from disk
+    must not reject changes that never enable the feature. The check fires
+    only when the resulting state has the feature on *and* the change touches
+    that feature or its draft. ``touched`` is the set of fields the caller's
+    request (or the profile being saved) names.
+    """
+    for feature in _DRAFT_FEATURES:
+        enabled_key = f"{feature}_enabled"
+        draft_key = f"{feature}_draft_model"
+        if enabled_key not in touched and draft_key not in touched:
+            continue
+        draft = settings.get(draft_key)
+        if settings.get(enabled_key) and draft and _draft_path_is_unusable(draft):
+            return f"Draft model has no config.json: {draft}"
+    return None
+
+
+def _profile_draft_problem(mgr, model_id: str, settings: dict, exposed) -> str | None:
+    """Check a profile's drafts in the state it will run with.
+
+    An exposed profile is merged over the base model's settings at request
+    time, so a draft it parks still loads when the base has the feature on.
+    """
+    merged = dict(settings)
+    if exposed:
+        base = mgr.get_settings(model_id).to_dict()
+        merged = {**base, **filter_profile_fields(settings)}
+    return _draft_usability_problem(merged, set(settings))
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -508,13 +550,13 @@ class ModelSettingsRequest(BaseModel):
         "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
     )
     @classmethod
-    def validate_draft_path(cls, value: str | None, info: ValidationInfo) -> str | None:
-        if not value:
-            return None
-        # A DFlash draft may stay parked while DFlash is off; the route checks it.
-        if info.field_name != "dflash_draft_model" and _draft_path_is_unusable(value):
-            raise ValueError(f"Draft model has no config.json: {value}")
-        return value
+    def validate_draft_path(cls, value: str | None) -> str | None:
+        # "" means "no draft"; usability depends on the feature toggle and on
+        # the state a save leaves behind, so the routes check it through
+        # _draft_usability_problem. Raising here would reject every
+        # whole-payload save, including saves that never touch the draft
+        # (#4217).
+        return value or None
 
 
 def _normalize_profile_settings(
@@ -641,7 +683,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -721,6 +762,7 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     gpu_keep_warm_interval: float | None = None
+    gpu_keep_warm_idle_window: float | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -1180,11 +1222,22 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_draft_block_size = None
 
 
-def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+_MTP_EXTERNAL_ENGINE_REASON = (
+    "MTP is not used when an external engine serves this model"
+)
+
+
+def _mtp_compat_for_model(
+    model_info: dict, external_engine: str | None = None
+) -> tuple[bool, str]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
     Returns ``(compatible, reason)``. Reason is empty on success and
     suitable for surfacing to users (admin UI shows it under the toggle).
+
+    ``external_engine`` is the engine that serves the model, if its settings
+    pick one. Lightning MTP runs in this process, so the external engine's own
+    speculation is used instead and the head is never read (issue #5146).
 
     The check is conservative: even when the config declares MTP layers
     we also peek at the safetensors weight index to verify that the
@@ -1203,6 +1256,9 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
         _has_mtp_heads,
         _is_mtp_compatible,
     )
+
+    if external_engine:
+        return False, _MTP_EXTERNAL_ENGINE_REASON
 
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
@@ -1227,6 +1283,12 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
         if bundled_dspark_path(model_path) is not None:
             return True, ""
         return False, "MiniMax checkpoint has no bundled dspark/ draft"
+    if model_type == "inkling2":
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        if bundled_inkling2_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "Inkling 2 checkpoint has no bundled mtp.safetensors draft"
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
@@ -1276,7 +1338,10 @@ def _apply_log_level_runtime(level: str) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     for handler in root_logger.handlers:
-        handler.setLevel(log_level)
+        if is_console_handler(handler):
+            handler.setLevel(console_log_level(log_level))
+        else:
+            handler.setLevel(log_level)
 
     # Update omlx-related loggers
     omlx_loggers = [
@@ -2456,7 +2521,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(
+            model_info, external_engine=getattr(settings, "external_engine", None)
+        )
         external_engines = _external_engines_for_model(
             engine_pool, model_info, settings
         )
@@ -3375,16 +3442,6 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
-    draft_model = current_settings.dflash_draft_model
-    if (
-        ("dflash_enabled" in sent or "dflash_draft_model" in sent)
-        and current_settings.dflash_enabled
-        and draft_model
-        and _draft_path_is_unusable(draft_model)
-    ):
-        raise HTTPException(
-            status_code=422, detail=f"Draft model has no config.json: {draft_model}"
-        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3459,6 +3516,16 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+
+    # Draft usability is only enforced for a feature that is on: the admin UI
+    # re-sends the whole payload, so a draft directory deleted from disk (or a
+    # path imported from another machine) must not reject saves that never
+    # enable the feature. The parked value is kept verbatim, exactly as #4217
+    # settled for DFlash. The profile routes apply the same rule through
+    # _draft_usability_problem.
+    draft_problem = _draft_usability_problem(current_settings.to_dict(), sent)
+    if draft_problem:
+        raise HTTPException(status_code=422, detail=draft_problem)
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -3812,9 +3879,17 @@ async def create_model_profile(
     entry = _require_model(model_id)
     # Profiles never carry the helper Mac; A8 checks need the model's own.
     helper = mgr.get_settings(model_id).prefill_helper_node_id
-    _validate_model_settings(
-        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+    settings = {"prefill_helper_node_id": helper, **(request.settings or {})}
+    _validate_model_settings(entry, settings)
+    # A profile that turns a feature on owns its draft: an exposed profile is
+    # applied at request time, so its content must be loadable too. A profile
+    # that only parks a draft stays editable unless it is exposed over a base
+    # model that has the feature on.
+    draft_problem = _profile_draft_problem(
+        mgr, model_id, settings, request.expose_as_model
     )
+    if draft_problem:
+        raise HTTPException(status_code=422, detail=draft_problem)
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3864,6 +3939,16 @@ async def update_model_profile(
     _validate_model_settings(
         entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
     )
+    stored = mgr.get_profile(model_id, name) or {}
+    draft_problem = _profile_draft_problem(
+        mgr,
+        model_id,
+        (stored.get("settings") or {}) if request.settings is None else request.settings,
+        stored.get("expose_as_model") if request.expose_as_model is None
+        else request.expose_as_model,
+    )
+    if draft_problem:
+        raise HTTPException(status_code=422, detail=draft_problem)
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3921,11 +4006,23 @@ async def apply_model_profile(
 ):
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    stored = mgr.get_profile(model_id, name)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    # The sanitizer sees the merged result, where every key is present, so the
+    # profile's own fields are what decide whether this apply turns a feature
+    # on. Without that gate an apply that never enables a feature would be
+    # rejected by a draft directory the profile does not even name.
+    touched = set(stored.get("settings") or {})
     is_diffusion_model = _entry_is_diffusion_model(entry)
+
     def sanitizer(settings):
         if is_diffusion_model:
             _sanitize_diffusion_settings_dict(settings)
         _validate_model_settings(entry, settings)
+        draft_problem = _draft_usability_problem(settings, touched)
+        if draft_problem:
+            raise HTTPException(status_code=422, detail=draft_problem)
 
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
@@ -4742,6 +4839,11 @@ def _global_settings_response(global_settings):
                 "gpu_keep_warm_interval",
                 0.5,
             ),
+            "gpu_keep_warm_idle_window": getattr(
+                global_settings.server,
+                "gpu_keep_warm_idle_window",
+                300.0,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -4935,6 +5037,12 @@ async def update_global_settings(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    # Infinity would persist and break JSON encoding of the settings response.
+    for name in ("gpu_keep_warm_interval", "gpu_keep_warm_idle_window"):
+        value = getattr(request, name)
+        if value is not None and not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"{name} must be finite")
+
     from ..utils.network import (
         is_loopback_bind,
         is_valid_bind_host,
@@ -5069,6 +5177,17 @@ async def update_global_settings(
             keep_warm_pool.configure_gpu_keep_warm(interval)
             keep_warm_pool._ensure_gpu_keep_warm_task()
         runtime_applied.append("gpu_keep_warm_interval")
+    if request.gpu_keep_warm_idle_window is not None:
+        from ..server import _server_state
+
+        window = max(0.0, float(request.gpu_keep_warm_idle_window))
+        global_settings.server.gpu_keep_warm_idle_window = window
+        window_pool = _server_state.engine_pool
+        if window_pool is not None:
+            window_pool.configure_gpu_keep_warm(
+                global_settings.server.gpu_keep_warm_interval, window
+            )
+        runtime_applied.append("gpu_keep_warm_idle_window")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -7186,8 +7305,13 @@ def _build_active_models_data() -> dict:
             last_activity_age = (
                 max(0.0, now - last_activity_at) if last_activity_at else None
             )
-            tokens_per_second = (
-                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            # Recent speed, so a row shows a speed change within seconds.
+            tokens_per_second = live_decode_rate(
+                getattr(req, "decode_marks", ()),
+                generated_tokens,
+                last_activity_at,
+                started_at,
+                now,
             )
             generating.append(
                 {

@@ -113,8 +113,9 @@ The same families as the Mac helper. A helper and a Mac work together when they 
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | 22 of 60 |
 | GLM-5.3 Flash | `glm5_next` | 21 of 45 |
 | DeepSeek V4.1 | `deepseek_v41` | 12 of 40 (10 for oQ4e) |
+| Inkling 2 Small | `inkling2` | 10 of 48 |
 
-Layer counts are for the oQ4e checkpoints (oQ3e for DeepSeek V4.1). How many of them a prompt uses is chosen per prompt from the measured speed of both machines and of the link.
+Layer counts are for the oQ4e checkpoints (oQ3e for DeepSeek V4.1, the published NVFP4 checkpoint for Inkling 2). Inkling 2 oQ conversions below 4 bits keep their experts in affine 2- or 3-bit codes, 4.2 to 5.2 GiB a layer, so more layers fit. How many of them a prompt uses is chosen per prompt from the measured speed of both machines and of the link.
 
 ## Two GPUs
 
@@ -134,6 +135,7 @@ The helper computes in the checkpoint's 16-bit float type like the Mac does, but
 - At most two GPUs per model.
 - INT8 Activation Prefill is not available on the helper.
 - A model's layers must fit in GPU memory: the number of layers the helper can take, and with it the speedup, is set by the GPU memory.
+- A long prompt's cache takes GPU memory too. When the next chunk would not fit, the helper drops its last layers one at a time and the Mac runs them from that chunk on. The helper loads them again while no prompt waits. On a GPU that shares the system RAM (DGX Spark) the helper leaves the OS 16 GiB.
 
 ## Third-party code
 
