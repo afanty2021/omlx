@@ -147,9 +147,9 @@ if __name__ == "__main__":
 
 ### 实现位置
 
-- **配置**：`omlx/config.py`、`omlx/scheduler.py`
+- **配置**：`omlx/settings.py`（`CacheSettings.clear_on_unload`）、`omlx/scheduler.py`
 - **CLI**：`omlx/cli.py`
-- **执行**：`omlx/engine_pool.py::_unload_engine()`
+- **执行**：`omlx/engine_pool.py::_stop_and_unload_engine()`
 
 ### 清理时机
 

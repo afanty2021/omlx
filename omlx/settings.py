@@ -411,6 +411,10 @@ class CacheSettings:
     hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" reserves half of available cache space
+    # Benchmarking knob (docs/CLEAR_SSD_CACHE_ON_UNLOAD.md): clear the SSD
+    # cache when a model unloads. Off by default — cross-load persistence is
+    # the normal behavior.
+    clear_on_unload: bool = False
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     # When True (and the hot cache is enabled), every saved block is kept in
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
@@ -526,6 +530,7 @@ class CacheSettings:
             "gdn_sidecar_precision": self.gdn_sidecar_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
+            "clear_on_unload": self.clear_on_unload,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
             "ane_compile_cache": self.ane_compile_cache,
@@ -574,6 +579,7 @@ class CacheSettings:
             ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
+            clear_on_unload=bool(data.get("clear_on_unload", False)),
             hot_cache_max_size=hot_cache_max_size,
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
@@ -1319,6 +1325,12 @@ class GlobalSettings:
             self.cache.ssd_cache_dir = ssd_cache_dir
         if ssd_cache_max := os.getenv("OMLX_SSD_CACHE_MAX_SIZE"):
             self.cache.ssd_cache_max_size = ssd_cache_max
+        if clear_on_unload := os.getenv("OMLX_PAGED_SSD_CACHE_CLEAR_ON_UNLOAD"):
+            self.cache.clear_on_unload = clear_on_unload.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
         if hot_cache_wt := os.getenv("OMLX_HOT_CACHE_WRITE_THROUGH"):
@@ -1501,6 +1513,11 @@ class GlobalSettings:
             cache_max_size = getattr(args, "ssd_cache_max_size", None)
         if cache_max_size is not None:
             self.cache.ssd_cache_max_size = cache_max_size
+
+        # Escalate-only: the flag turns clearing on; an env/settings.json
+        # `true` survives when the flag is absent (no --no- variant exists).
+        if getattr(args, "paged_ssd_cache_clear_on_unload", False):
+            self.cache.clear_on_unload = True
 
         if hasattr(args, "hot_cache_max_size") and args.hot_cache_max_size is not None:
             self.cache.hot_cache_max_size = args.hot_cache_max_size
@@ -2027,6 +2044,7 @@ class GlobalSettings:
                 self.base_path
             ),
             paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
+            clear_ssd_cache_on_unload=self.cache.clear_on_unload,
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),

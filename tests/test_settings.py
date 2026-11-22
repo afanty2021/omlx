@@ -504,6 +504,7 @@ class TestCacheSettings:
             "gdn_sidecar_precision": "fp32",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
+            "clear_on_unload": False,
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
@@ -2330,6 +2331,44 @@ class TestGlobalSettings:
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.gdn_ssd_split_enabled is True
         assert scheduler_config.gdn_sidecar_state_dtype == "rht_int8"
+
+
+class TestClearSsdCacheOnUnload:
+    """The clear-on-unload knob must flow through every documented channel."""
+
+    def test_round_trip(self):
+        settings = CacheSettings(clear_on_unload=True)
+        assert settings.to_dict()["clear_on_unload"] is True
+        assert CacheSettings.from_dict(settings.to_dict()).clear_on_unload is True
+        assert CacheSettings.from_dict({}).clear_on_unload is False
+
+    def test_scheduler_config_mapping(self):
+        settings = GlobalSettings()
+        assert settings.to_scheduler_config().clear_ssd_cache_on_unload is False
+
+        settings.cache.clear_on_unload = True
+        assert settings.to_scheduler_config().clear_ssd_cache_on_unload is True
+
+    def test_cli_flag_escalates_only(self):
+        settings = GlobalSettings()
+        settings._apply_cli_overrides(
+            Namespace(paged_ssd_cache_clear_on_unload=True)
+        )
+        assert settings.cache.clear_on_unload is True
+
+        # An absent flag must not unset a value configured via env/settings.
+        settings._apply_cli_overrides(Namespace())
+        assert settings.cache.clear_on_unload is True
+
+    def test_env_var_enables(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OMLX_PAGED_SSD_CACHE_CLEAR_ON_UNLOAD", "true")
+        # Env overrides run in GlobalSettings.load(), not the bare ctor.
+        settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.cache.clear_on_unload is True
+
+    def test_env_var_off_values_keep_default(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OMLX_PAGED_SSD_CACHE_CLEAR_ON_UNLOAD", "0")
+        assert GlobalSettings.load(base_path=tmp_path).cache.clear_on_unload is False
 
 
 class TestInitSettings:

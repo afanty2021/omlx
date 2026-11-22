@@ -3840,7 +3840,12 @@ class EnginePool:
                         if scheduler is not None:
                             ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
                             if ssd_manager is not None:
-                                deleted = ssd_manager.clear()
+                                # Off the event loop: clear() deletes files
+                                # synchronously and can take seconds on a
+                                # large cache.
+                                deleted = await asyncio.to_thread(
+                                    ssd_manager.clear
+                                )
                                 logger.info(
                                     f"Cleared SSD cache for {model_id}: {deleted} files"
                                 )
