@@ -25,8 +25,10 @@ from omlx.api.openai_models import (
 )
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
+    _clean_quoted_keys,
     _coerce_param_value,
     _gemma4_args_to_json_robust,
+    _has_quoted_keys,
     _json_value_end,
     _marker_payloads,
     _parse_attribute_function_tool_calls,
@@ -3807,6 +3809,60 @@ class TestSerializeToolCallArguments:
             result = _serialize_tool_call_arguments("[1, 2]")
         assert result == "{}"
         assert any("non-dict" in r.message for r in caplog.records)
+
+    def test_non_dict_int_coerced_to_empty(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            assert _serialize_tool_call_arguments(123) == "{}"
+
+    # --- fork: quoted-key artifact cleanup (mlx-vlm Gemma 4 parser) ---
+
+    def test_has_quoted_keys_detection(self):
+        assert _has_quoted_keys({r'"action"': "add"}) is True
+        assert _has_quoted_keys({r'"key"': "value", "normal": "test"}) is True
+        assert _has_quoted_keys({"normal": "test"}) is False
+        assert _has_quoted_keys({}) is False
+
+    def test_clean_quoted_keys_basic_and_mixed(self):
+        assert _clean_quoted_keys({r'"action"': "add"}) == {"action": "add"}
+        assert _clean_quoted_keys(
+            {r'"key"': "value", "normal": "test"}
+        ) == {"key": "value", "normal": "test"}
+
+    def test_quoted_keys_in_dict_cleaned_on_serialize(self):
+        """A parser dict whose keys literally embed quotes is cleaned."""
+        result = _serialize_tool_call_arguments(
+            {r'"action"': "add", r'"content"': "test"}
+        )
+        assert json.loads(result) == {"action": "add", "content": "test"}
+
+    def test_quoted_keys_in_json_string_cleaned_on_serialize(self):
+        """The Gemma 4 parser artifact: a JSON-object string whose keys decode
+        to embedded-quote strings is cleaned before re-serialization."""
+        raw = json.dumps(
+            {r'"action"': "add", r'"content"': "2026-04-25 > 本地环境"},
+            ensure_ascii=True,
+        )
+        result = _serialize_tool_call_arguments(raw)
+        assert json.loads(result) == {
+            "action": "add",
+            "content": "2026-04-25 > 本地环境",
+        }
+
+    def test_nested_structures_roundtrip(self):
+        result = _serialize_tool_call_arguments({"config": {"enabled": True, "level": 5}})
+        parsed = json.loads(result)
+        assert parsed["config"]["enabled"] is True
+        assert parsed["config"]["level"] == 5
+
+    def test_array_parameter_and_quoted_key_coexist(self):
+        """Locks the pipeline order at the serialization exit: array parameters
+        merged from string fragments upstream (628a786b) arrive here as plain
+        lists, and the fork's top-level quoted-key cleanup must not disturb
+        them. Cleanup stays top-level on purpose — nested keys are payload
+        data, not parser artifacts."""
+        arguments = {r'"v"': ["a", "b"], "note": "x"}
+        result = _serialize_tool_call_arguments(arguments)
+        assert json.loads(result) == {"v": ["a", "b"], "note": "x"}
 
 
 class TestToolCallStreamFilterGemma4StrayClose:
