@@ -2947,9 +2947,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
-            specprefill_draft = getattr(
-                self._model_settings, "specprefill_draft_model", None
-            )
+            from ..utils.model_loading import specprefill_draft_for
+
+            specprefill_draft = specprefill_draft_for(self._model_settings)
             specprefill_enabled = getattr(
                 self._model_settings, "specprefill_enabled", False
             )

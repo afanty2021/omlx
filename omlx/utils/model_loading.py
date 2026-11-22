@@ -1448,6 +1448,14 @@ def dflash_batched_requested(
     return dflash_draft_for(model_settings, model_path) is not None
 
 
+def specprefill_draft_for(model_settings: Any | None) -> str | None:
+    """The configured SpecPrefill draft, with a ~ path expanded (dflash parity)."""
+    configured = getattr(model_settings, "specprefill_draft_model", None)
+    if configured and configured.startswith("~"):
+        configured = str(Path(configured).expanduser())
+    return configured
+
+
 def _nax_available() -> bool:
     try:
         from ..custom_kernels.nax import is_nax_available

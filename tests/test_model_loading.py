@@ -17,6 +17,7 @@ from omlx.utils.model_loading import (
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
     preflight_text_remote_code,
+    specprefill_draft_for,
 )
 
 
@@ -1455,3 +1456,12 @@ def test_dflash_draft_for_expands_a_home_relative_path(tmp_path, monkeypatch):
     assert dflash_draft_for(settings, None) == str(tmp_path / "d")
     settings.dflash_draft_model = "z-lab/d"
     assert dflash_draft_for(settings, None) == "z-lab/d"
+
+
+def test_specprefill_draft_for_expands_a_home_relative_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings = types.SimpleNamespace(specprefill_draft_model="~/d")
+    assert specprefill_draft_for(settings) == str(tmp_path / "d")
+    settings.specprefill_draft_model = "z-lab/d"
+    assert specprefill_draft_for(settings) == "z-lab/d"
+    assert specprefill_draft_for(None) is None

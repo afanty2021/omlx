@@ -4637,6 +4637,10 @@ class EnginePool:
                 and hasattr(engine, "set_vlm_mtp_drafter")
             ):
                 drafter_id = model_settings.vlm_mtp_draft_model
+                if drafter_id.startswith("~"):
+                    # dflash parity: expand before the entry lookup, which
+                    # registers local models under their resolved path.
+                    drafter_id = str(Path(drafter_id).expanduser())
                 drafter_entry = self._entries.get(drafter_id)
                 drafter_path = drafter_entry.model_path if drafter_entry else drafter_id
 
