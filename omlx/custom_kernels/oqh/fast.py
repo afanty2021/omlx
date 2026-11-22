@@ -130,10 +130,21 @@ def gather_qmm(
     sorted_indices: bool = False,
     stream=None,
 ) -> mx.array:
-    """Routed experts for many rows through the stock gather_qmm. w: [E, N, ...], rscale: [E, N]."""
+    """Routed experts for many rows through the stock gather_qmm. w: [E, N, ...], rscale: [E, N].
+
+    A 2-D ``x`` routes per row (row ``i`` uses expert ``indices[i]``) and
+    returns ``[P, N]``. A 3-D ``x`` keeps the stock kernel's batched pairing:
+    each batch slab runs against its gathered expert, giving ``[S, R, N]``.
+    """
+    # The stock kernel cross-multiplies a 2-D x against every gathered expert
+    # ([P, P, N]); lift it to one row per batch so the routing matches the
+    # docstring instead of silently producing the cross product.
+    squeeze = x.ndim == 2
+    if squeeze:
+        x = mx.expand_dims(x, -2)
     if bits <= _FOLD_MAX_BITS:
         s, b, gs = _row_view(w, rscale, bits, x.dtype)
-        return mx.gather_qmm(
+        y = mx.gather_qmm(
             x,
             w,
             s,
@@ -145,20 +156,22 @@ def gather_qmm(
             sorted_indices=sorted_indices,
             stream=stream,
         )
-    s1, b1, gs = unit_view(w, bits, x.dtype)
-    y = mx.gather_qmm(
-        x,
-        w,
-        s1,
-        b1,
-        rhs_indices=indices,
-        transpose=True,
-        group_size=gs,
-        bits=bits,
-        sorted_indices=sorted_indices,
-        stream=stream,
-    )
-    return y * mx.expand_dims(rscale[indices], -2)
+    else:
+        s1, b1, gs = unit_view(w, bits, x.dtype)
+        y = mx.gather_qmm(
+            x,
+            w,
+            s1,
+            b1,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=gs,
+            bits=bits,
+            sorted_indices=sorted_indices,
+            stream=stream,
+        )
+        y = y * mx.expand_dims(rscale[indices], -2)
+    return y.squeeze(-2) if squeeze else y
 
 
 def rmsnorm_had(x, weight, signs, eps: float, stream=None):

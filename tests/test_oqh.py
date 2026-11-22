@@ -87,6 +87,76 @@ def test_matmuls_match_the_dequantized_weight(bits):
     assert mx.array_equal(paired, mx.concatenate(single, -1))
 
 
+@pytest.mark.parametrize("bits", [4, 6, 8])
+def test_gather_qmm_matches_one_expert_matmul(bits):
+    """The routed many-rows path returns [P, N] — not a broadcast cube — and
+    matches per-expert dequantized references on both scale strategies
+    (group-scale folding at <=5 bits, the output multiply above it)."""
+    rows, cols, experts = 64, 512, 3
+    mx.random.seed(bits)
+    sg = _signs("w", cols)
+    gram = mx.eye(cols)[None]
+    we = mx.random.normal((experts, rows, cols)) * 0.05
+    pe, re, _, _ = quantize.quantize(
+        we, mx.broadcast_to(gram, (experts, cols, cols)), bits, sg, 512
+    )
+    x = mx.random.normal((4, cols)).astype(mx.bfloat16)
+    xr = quantize.rotate(x, sg, 512).astype(mx.bfloat16)
+    idx = mx.array([2, 0, 1, 2])
+
+    got = fast.gather_qmm(xr, pe, re, idx, bits)
+    assert got.shape == (4, rows)
+    for i, e in enumerate((2, 0, 1, 2)):
+        ref_e = (
+            x[i : i + 1].astype(mx.float32)
+            @ quantize.dequantize(pe[e], re[e], bits, sg, 512).T
+        )
+        assert _rel(got[i : i + 1], ref_e) < 0.02
+
+
+def test_gather_qmm_batched_conventions():
+    """3-D x keeps the stock kernel's batch pairing: one row per expert slot
+    for sorted decode ([P, 1, K] -> [P, 1, N]) and multi-row slabs for sorted
+    prefill ([S, R, K] -> [S, R, N], R != S so a wrong row-scale broadcast
+    cannot pass by accident)."""
+    rows, cols, experts = 64, 512, 3
+    bits = 6
+    mx.random.seed(9)
+    sg = _signs("w", cols)
+    gram = mx.eye(cols)[None]
+    we = mx.random.normal((experts, rows, cols)) * 0.05
+    pe, re, _, _ = quantize.quantize(
+        we, mx.broadcast_to(gram, (experts, cols, cols)), bits, sg, 512
+    )
+    x = mx.random.normal((4, cols)).astype(mx.bfloat16)
+    xr = quantize.rotate(x, sg, 512).astype(mx.bfloat16)
+    idx = mx.array([2, 0, 1, 2])
+
+    per_row = fast.gather_qmm(xr[:, None, :], pe, re, idx, bits)
+    assert per_row.shape == (4, 1, rows)
+    for i, e in enumerate((2, 0, 1, 2)):
+        ref_e = (
+            x[i : i + 1].astype(mx.float32)
+            @ quantize.dequantize(pe[e], re[e], bits, sg, 512).T
+        )
+        assert _rel(per_row[i], ref_e) < 0.02
+
+    # Sorted prefill: slot s runs R=3 rows against expert idx[s].
+    slab_idx = mx.array([1, 2])
+    xs = mx.random.normal((2, 3, cols)).astype(mx.bfloat16)
+    xs_rot = quantize.rotate(xs.reshape(-1, cols), sg, 512).astype(mx.bfloat16)
+    xs_rot = xs_rot.reshape(2, 3, cols)
+    slabs = fast.gather_qmm(xs_rot, pe, re, slab_idx, bits)
+    assert slabs.shape == (2, 3, rows)
+    for s, e in enumerate((1, 2)):
+        for r in range(3):
+            ref = (
+                xs[s, r : r + 1].astype(mx.float32)
+                @ quantize.dequantize(pe[e], re[e], bits, sg, 512).T
+            )
+            assert _rel(slabs[s, r : r + 1], ref) < 0.02
+
+
 def test_decode_batches_take_the_batched_affine_kernels():
     from omlx.oqh.modules import OqhLinear
     from omlx.patches import batched_decode_qmm
