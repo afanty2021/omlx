@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from packaging.version import InvalidVersion, Version
 
 from ..cluster.identity import get_node_identity
 from ..cluster.pairing import get_pairing_manager
@@ -43,6 +44,9 @@ __all__ = ["LaunchError", "required_files"]
 # The row name of the first accelerator check, and what it shows.
 VIA = "control"
 CONTROL_VERSION = 1
+# The helper release in this source tree (apps/omlx-cuda-helper). An older
+# helper still serves the families it reports, but its check warns.
+MIN_HELPER_VERSION = "0.1.7"
 _READY_TIMEOUT_S = 900.0
 # The helper ends its workers within 10 s, by force if it must.
 _STOP_TIMEOUT_S = 15.0
@@ -328,6 +332,7 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
         "version": info.get("version"),
         "data_protocol": info.get("data_protocol"),
         "contracts": info.get("contracts") or {},
+        "oqh": info.get("oqh") or {},
         "budgets": budgets,
         "budget": sum(budgets),
         "memory": sum(int(gpu["total"]) for gpu in gpus),
@@ -344,8 +349,13 @@ def remote_info(target: AgentTarget, *, host: dict | None = None) -> dict:
     }
 
 
-def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | None:
-    """Why this helper cannot serve the family, or None when it can."""
+def incompatible(
+    info: dict, adapter: StageAdapter | None, name: str, oqh: int | None = None
+) -> str | None:
+    """Why this helper cannot serve the family, or None when it can.
+
+    ``oqh`` is the model's oQh format version, None for other checkpoints.
+    """
     if info.get("data_protocol") != wire.PROTOCOL:
         return (
             f"{name} speaks another prefill protocol; update the older of "
@@ -360,7 +370,27 @@ def incompatible(info: dict, adapter: StageAdapter | None, name: str) -> str | N
     if theirs != adapter.contract:
         older = "the helper" if theirs < adapter.contract else "oMLX on this Mac"
         return f"{name} and this Mac disagree on this model family; update {older}."
+    if oqh is not None:
+        reads = info.get("oqh") or {}
+        if not any(reads.get(t) == oqh for t in adapter.model_types):
+            return f"{name} does not read oQh weights of this model family yet."
     return None
+
+
+def outdated(info: dict) -> str | None:
+    """How to update a helper older than MIN_HELPER_VERSION, or None."""
+    version = info.get("version")
+    try:
+        if Version(str(version)) >= Version(MIN_HELPER_VERSION):
+            return None
+    except InvalidVersion:
+        pass
+    return (
+        f"This oMLX comes with helper {MIN_HELPER_VERSION}; this helper runs "
+        f"{version}. To update, run docker pull jundot/omlx-cuda-helper, then "
+        "remove the omlx-helper container and start it again with the same "
+        "docker run command."
+    )
 
 
 def locate_files(
